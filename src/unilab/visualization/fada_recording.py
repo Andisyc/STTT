@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,10 +28,13 @@ class FADAVideoRecordingConfig:
     fps: int = 30
     width: int = 1280
     height: int = 720
+    progress_interval_s: float = 1.0
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.duration_s) or self.duration_s <= 0.0:
             raise ValueError("video_recording.duration_s must be finite and positive")
+        if not math.isfinite(self.progress_interval_s) or self.progress_interval_s <= 0.0:
+            raise ValueError("video_recording.progress_interval_s must be finite and positive")
         for name in ("fps", "width", "height"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -45,12 +50,14 @@ def record_fada_playback(
     args: Any,
     config: FADAVideoRecordingConfig,
     *,
-    log: Callable[[str], None] = print,
+    log: Callable[[str], None] = partial(print, flush=True),
 ) -> str:
     """Advance simulation without wall-clock pacing and stream frames to FFmpeg.
 
     Frame timestamps use simulation time, not the time spent adapting the policy.
     Only the current RGB frame is retained, regardless of recording duration.
+    Progress is flushed at completed-step boundaries on a wall-clock interval;
+    a single long-running adaptation step cannot report completion until it returns.
     """
     ctrl_dt = float(session.env.cfg.ctrl_dt)
     if not math.isfinite(ctrl_dt) or ctrl_dt <= 0.0:
@@ -79,6 +86,17 @@ def record_fada_playback(
     session.reset()
     log(f"Recording {config.duration_s:g}s simulation to {output} ({config.width}x{config.height}, {config.fps} fps); no viewer or realtime pacing")
     frame_index = 0
+    started = time.monotonic()
+    last_progress = started
+
+    def report_progress(step: int, now: float) -> None:
+        log(
+            f"Progress: step={step}/{num_steps} ({100.0 * step / num_steps:.1f}%) "
+            f"sim_time={step * ctrl_dt:.2f}/{config.duration_s:g}s "
+            f"frames={frame_index}/{num_frames} wall_time={now - started:.1f}s"
+        )
+
+    report_progress(0, started)
     with mujoco.Renderer(model, height=config.height, width=config.width) as renderer:
         with media.VideoWriter(str(output), shape=(config.height, config.width), fps=config.fps) as writer:
             for step_index in range(num_steps + 1):
@@ -90,19 +108,25 @@ def record_fada_playback(
                         log(f"sim_time={step_index * ctrl_dt:.3f}s Payload attached: {session.info['runtime_payload_added_mass_kg']} kg")
 
                 elapsed = step_index * ctrl_dt
-                if frame_index >= num_frames or frame_index / config.fps > elapsed + 1e-9:
-                    continue
-                physics = np.asarray(session.physics_state()[0], dtype=np.float64)
-                mujoco.mj_setState(model, data, physics, mujoco.mjtState.mjSTATE_FULLPHYSICS)
-                mujoco.mj_forward(model, data)
-                if args.camera_follow_body:
-                    camera.lookat[:] = data.xpos[focus_body_id]
-                    camera.lookat[2] += args.camera_height_offset
-                renderer.update_scene(data, camera=camera)
-                image = renderer.render()
-                while frame_index < num_frames and frame_index / config.fps <= elapsed + 1e-9:
-                    writer.add_image(image)
-                    frame_index += 1
+                if frame_index < num_frames and frame_index / config.fps <= elapsed + 1e-9:
+                    physics = np.asarray(session.physics_state()[0], dtype=np.float64)
+                    mujoco.mj_setState(model, data, physics, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+                    mujoco.mj_forward(model, data)
+                    if args.camera_follow_body:
+                        camera.lookat[:] = data.xpos[focus_body_id]
+                        camera.lookat[2] += args.camera_height_offset
+                    renderer.update_scene(data, camera=camera)
+                    image = renderer.render()
+                    while frame_index < num_frames and frame_index / config.fps <= elapsed + 1e-9:
+                        writer.add_image(image)
+                        frame_index += 1
+
+                now = time.monotonic()
+                if now - last_progress >= config.progress_interval_s or step_index == num_steps:
+                    report_progress(step_index, now)
+                    last_progress = now
+
+            log("Finalizing MP4 encoding...")
 
     log(f"Video saved: {output} ({frame_index} frames, {num_steps} control steps)")
     return str(output)
