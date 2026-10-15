@@ -1,0 +1,56 @@
+# @package _global_
+# Use with task=g1_walk_flat/mujoco. Override payload/online flags for the clean baseline.
+interactive:
+  action_mode: policy
+  keyboard: false
+  camera_follow_body: true
+  camera_focus_body_name: pelvis
+  camera_distance: 3.0
+  camera_elevation: -20.0
+  camera_azimuth: 135.0  # Side-rear view of the nominal +X walking direction.
+  camera_height_offset: 0.15
+
+env:
+  # Longer than this profile's recording; retain genuine termination/autoreset.
+  max_episode_seconds: 180.0
+  reset_base_qvel_limit: 0.0
+  standing_reset_base_qvel_limit: 0.0
+  noise_config:
+    level: 0.0
+  domain_rand:
+    randomize_reset_pose: false
+    randomize_kp: false
+    randomize_kd: false
+    randomize_base_mass: false
+    randomize_body_mass: false
+    random_com: false
+    randomize_gravity: false
+    randomize_ground_friction: false
+    randomize_dof_armature: false
+    randomize_dof_position_bias: false
+    randomize_control_delay: false
+    torque_rfi_fraction: 0.0
+    push_robots: false
+    actuator_strength:
+      enabled: false
+      group_curriculum_enabled: false
+  commands:
+    vel_limit: [[0.4, 0.0, 0.0], [0.4, 0.0, 0.0]]
+    resampling_time: 0.0
+    heading_command: false  # Do not add a heading controller that conceals policy drift.
+    rel_standing_envs: 0.0
+    rel_transition_envs: 0.0
+    rel_straight_envs: 0.0
+  runtime_payload:
+    enabled: true
+    body_name: pelvis
+    added_mass_kg: 3.0
+    com_offset_m: [0.0, 0.0, 0.0]
+    attach_time_s: 30.0
+
+online_adaptation:
+  enabled: true
+
+video_recording:
+  duration_s: 120.0  # 30 seconds before payload, then 90 seconds with payload.
+  show_status_overlay: true

@@ -29,8 +29,11 @@ Progress:
 - [x] 负重步骤 2: G1 环境负重事件 — Done when: 按环境定时挂载负重，并在 episode reset 前恢复标称质量与质心
   - Evidence: `G1RuntimePayload`、`env.runtime_payload` 配置与 `G1WalkEnv` 生命周期接入完成；`uv run --frozen --no-sync pytest tests/envs/locomotion/g1/test_runtime_payload.py -q` → 4 passed
 - [x] 服务器录制入口：`video_recording` 配置时长/FPS/分辨率/路径，逐帧编码、不按墙钟 sleep、不累积整段 RGB；Linux 默认 EGL，允许通过 `MUJOCO_GL` 指定其他后端；`video_recording.enabled=false` 保留本地 Viewer
+- [x] 直行评估录制：`recording_profile=straight_payload` 固定标称 reset、零初速度与 `[0.4, 0, 0]` 命令，关闭随机扰动，侧后方 135° 跟随相机；episode 上限 180s，120s 视频在 30s 加载 3kg，负重后观察 90s；真实 termination/reset 保留并在画面和日志标记
+  - Evidence: 本地 CPU + 真实 checkpoint 录制 0.8s / 40 步（仅为 smoke，将负重时间缩为 0.2s），输出 640x360 H.264；已查看视频，确认无负重/负重状态切换、挂载提示、横向位移/航向偏差、reset 次数和侧后方视角
+  - Protocol: 先用同一 profile 覆盖 `online_adaptation.enabled=false env.runtime_payload.enabled=false video_recording.duration_s=30`，检查原策略无负重直行；通过后再录 120s 的在线适应视频。后者保持现有从开局在线更新的行为；要判断适应的因果效果，还需同样负重、关闭更新的对照
 Blockers:
-- Linux/EGL 与服务器长时录制尚未验证；短视频只证明链路可运行，不证明负重后的策略效果
+- 服务器 30s / 1500 步录制已完成（已从 tmux 日志确认）；需使用 `LD_PRELOAD=/lib/x86_64-linux-gnu/libgcc_s.so.1` 避免 mujoco-uni 异常展开符号冲突。新 profile 的 30s 基线及 120s 负重行为效果尚未验证
 
 Next:
-- 将 checkpoint 一并复制到服务器，使用 nohup 启动 30 秒仿真时间的无窗口录制，检查输出视频与更新日志
+- 上传新 profile 与叠字录制代码；先检查 30s 无负重、无更新基线的横向/航向偏差和 reset 次数，再决定是否运行长时负重适应对照

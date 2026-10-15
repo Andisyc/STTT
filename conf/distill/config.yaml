@@ -3,6 +3,7 @@ defaults:
   - task: g1_walk_height/mujoco
   - optional workflow: null
   - optional calibration_playback: null
+  - optional recording_profile: null
 
 algo:
   algo_log_name: distill
@@ -273,6 +274,7 @@ video_recording:
   width: 1280
   height: 720
   progress_interval_s: 1.0  # Wall-clock seconds; report after completed control steps.
+  show_status_overlay: true
 
 hydra:
   run:

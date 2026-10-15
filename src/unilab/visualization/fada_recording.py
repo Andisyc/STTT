@@ -12,6 +12,9 @@ from typing import Any, Callable
 import mediapy as media
 import mujoco
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+from unilab.envs.common.rotation import np_wrap_to_pi, np_yaw_from_quat
 
 from unilab.visualization.playback_viewer import (
     _default_viewer_camera_distance,
@@ -29,6 +32,7 @@ class FADAVideoRecordingConfig:
     width: int = 1280
     height: int = 720
     progress_interval_s: float = 1.0
+    show_status_overlay: bool = True
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.duration_s) or self.duration_s <= 0.0:
@@ -43,6 +47,31 @@ class FADAVideoRecordingConfig:
             raise ValueError("MP4 recording width and height must be even")
         if not self.output_path or Path(self.output_path).suffix.lower() != ".mp4":
             raise ValueError("video_recording.output_path must name an MP4 file")
+
+
+def _annotate_frame(
+    image: np.ndarray,
+    *,
+    title: str,
+    details: tuple[str, ...],
+    alert: str | None,
+    loaded: bool,
+    font: Any,
+) -> np.ndarray:
+    """Draw a screen-space status panel; never add physical payload geometry."""
+    frame = Image.fromarray(image)
+    draw = ImageDraw.Draw(frame)
+    line_height = font.getbbox("Ag")[3] + 8
+    lines = (title, *details, *((alert,) if alert else ()))
+    panel_height = 12 + len(lines) * line_height
+    draw.rectangle((6, 6, frame.width - 6, panel_height), fill=(20, 23, 28))
+    draw.rectangle((6, 6, 12, panel_height), fill=(255, 165, 40) if loaded else (70, 210, 120))
+    for index, text in enumerate(lines):
+        color = (255, 200, 80) if index == 0 else (240, 240, 240)
+        if alert and index == len(lines) - 1:
+            color = (255, 105, 90)
+        draw.text((20, 10 + index * line_height), text, fill=color, font=font)
+    return np.asarray(frame)
 
 
 def record_fada_playback(
@@ -84,6 +113,17 @@ def record_fada_playback(
         camera.azimuth = args.camera_azimuth
 
     session.reset()
+    reset_count = 0
+    last_reset_time: float | None = None
+    last_attach_time: float | None = None
+    update_count = 0
+    last_loss: float | None = None
+    origin_xy: np.ndarray | None = None
+    origin_yaw = 0.0
+    font = (
+        ImageFont.load_default(size=max(12, config.height // 40))
+        if config.show_status_overlay else None
+    )
     log(f"Recording {config.duration_s:g}s simulation to {output} ({config.width}x{config.height}, {config.fps} fps); no viewer or realtime pacing")
     frame_index = 0
     started = time.monotonic()
@@ -104,9 +144,22 @@ def record_fada_playback(
                     session.step_once()
                     if session.last_update_stats is not None:
                         log(f"sim_time={step_index * ctrl_dt:.3f}s Update: {session.last_update_stats}")
+                        update_count += 1
+                        last_loss = float(session.last_update_stats["loss"])
                     if np.any(session.info.get("runtime_payload_attached_this_step", False)):
                         log(f"sim_time={step_index * ctrl_dt:.3f}s Payload attached: {session.info['runtime_payload_added_mass_kg']} kg")
+                        last_attach_time = step_index * ctrl_dt
 
+                    state = session.env.state
+                    assert state is not None
+                    if np.any(state.terminated | state.truncated):
+                        reset_count += 1
+                        last_reset_time = step_index * ctrl_dt
+                        reason = "terminated" if np.any(state.terminated) else "timeout"
+                        log(
+                            f"sim_time={last_reset_time:.3f}s EPISODE RESET ({reason}); "
+                            f"reset_count={reset_count}. Do not treat the trajectory as uninterrupted walking."
+                        )
                 elapsed = step_index * ctrl_dt
                 if frame_index < num_frames and frame_index / config.fps <= elapsed + 1e-9:
                     physics = np.asarray(session.physics_state()[0], dtype=np.float64)
@@ -117,6 +170,35 @@ def record_fada_playback(
                         camera.lookat[2] += args.camera_height_offset
                     renderer.update_scene(data, camera=camera)
                     image = renderer.render()
+                    if config.show_status_overlay:
+                        position = data.xpos[focus_body_id]
+                        yaw = float(np_yaw_from_quat(data.xquat[focus_body_id:focus_body_id + 1])[0])
+                        if origin_xy is None:
+                            origin_xy = position[:2].copy()
+                            origin_yaw = yaw
+                        dx, dy = position[:2] - origin_xy
+                        forward = math.cos(origin_yaw) * dx + math.sin(origin_yaw) * dy
+                        lateral = -math.sin(origin_yaw) * dx + math.cos(origin_yaw) * dy
+                        yaw_error = math.degrees(float(np_wrap_to_pi(yaw - origin_yaw)))
+                        active = bool(np.asarray(session.info.get("runtime_payload_active", [False])).reshape(-1)[0])
+                        added_mass = float(np.asarray(session.info.get("runtime_payload_added_mass_kg", [0.0])).reshape(-1)[0])
+                        status = f"PAYLOAD +{added_mass:g} kg" if active else "NO PAYLOAD"
+                        alert = None
+                        if last_attach_time is not None and elapsed - last_attach_time < 2.0:
+                            alert = f"PAYLOAD ATTACHED +{added_mass:g} kg"
+                        if last_reset_time is not None and elapsed - last_reset_time < 2.0:
+                            alert = "EPISODE RESET - trajectory interrupted"
+                        loss_text = f" loss={last_loss:.4g}" if last_loss is not None else ""
+                        image = _annotate_frame(
+                            image,
+                            title=f"t={elapsed:.2f}s | {status}",
+                            details=(
+                                f"forward={forward:+.2f}m lateral={lateral:+.2f}m",
+                                f"yaw error={yaw_error:+.1f}deg resets={reset_count}",
+                                f"LoRA updates={update_count}{loss_text}",
+                            ),
+                            alert=alert, loaded=active, font=font,
+                        )
                     while frame_index < num_frames and frame_index / config.fps <= elapsed + 1e-9:
                         writer.add_image(image)
                         frame_index += 1
