@@ -126,6 +126,9 @@ def test_fada_history_ignores_timeout_done_when_interactive_autoreset_is_disable
         def act(self, _observation, _commands):
             return torch.zeros((1, 2))
 
+        def on_env_step(self, **_kwargs):
+            return None
+
     env = FakeEnv()
     controller = FakeController()
     session = FADAPlaybackSession(

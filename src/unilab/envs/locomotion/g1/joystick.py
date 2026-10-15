@@ -127,6 +127,7 @@ from unilab.envs.locomotion.g1.walk_reward import (
 )
 from unilab.envs.locomotion.g1.walk_reward_bindings import G1WalkRewardBindings
 from unilab.envs.locomotion.g1.walk_runtime_bindings import G1WalkRuntimeBindings
+from unilab.envs.locomotion.g1.walk_runtime_payload import G1RuntimePayload
 
 LEFT_FOOT_CONTACT_SENSORS = [f"left_foot_contact_{i}" for i in range(4)]
 RIGHT_FOOT_CONTACT_SENSORS = [f"right_foot_contact_{i}" for i in range(4)]
@@ -208,6 +209,12 @@ class G1WalkEnv(
         super().__init__(cfg, backend, num_envs)
         self._enable_reward_log = True
         self._reward_cfg = cfg.reward_config
+        self._runtime_payload = G1RuntimePayload(
+            backend,
+            num_envs,
+            cfg.runtime_payload,
+            ctrl_dt=cfg.ctrl_dt,
+        )
 
         self._gait_phase_delta = float(
             2.0 * math.pi * self._reward_cfg.gait_frequency * cfg.ctrl_dt
@@ -293,6 +300,23 @@ class G1WalkEnv(
         )
         self._fada_dr_provider = dr_provider
         self._init_domain_randomization(dr_provider)
+
+    def init_state(self) -> NpEnvState:
+        state = super().init_state()
+        self._runtime_payload.init_info(state.info)
+        return state
+
+    def apply_action(self, actions: np.ndarray, state: NpEnvState) -> np.ndarray:
+        self._runtime_payload.reconcile_info(state.info)
+        self._runtime_payload.before_physics(state.info)
+        return super().apply_action(actions, state)
+
+    def reset(self, env_indices: np.ndarray) -> tuple[dict[str, np.ndarray], dict]:
+        if self._state is not None:
+            self._runtime_payload.restore_before_reset(self._state.info, env_indices)
+        obs, reset_info = super().reset(env_indices)
+        reset_info.update(self._runtime_payload.reset_info_updates(env_indices))
+        return obs, reset_info
 
 
 registry.register_env("G1WalkFlat", G1WalkEnv, sim_backend="mujoco")

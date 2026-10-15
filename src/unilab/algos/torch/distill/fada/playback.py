@@ -58,11 +58,27 @@ class FADAPlaybackController:
             )
         self._pending_reset = mask
 
+    def project_observation(self, observation: Any) -> torch.Tensor:
+        """Project a raw actor observation batch to the FADA policy contract."""
+
+        return self._observation_tensor(observation)
+
+    def on_env_step(
+        self,
+        *,
+        executed_action: Any,
+        next_observation: Any,
+        done: Any | None = None,
+    ) -> dict[str, float] | None:
+        """Uniform post-step hook; offline playback performs no collection or update."""
+
+        return None
+
     @torch.no_grad()
     def act(self, observation: Any, command: Any) -> torch.Tensor:
         """Project a raw actor observation and execute one receding-horizon action."""
 
-        return self._act(self._observation_tensor(observation), command)
+        return self._act(self.project_observation(observation), command)
 
     @torch.no_grad()
     def act_projected(self, observation: Any, command: Any) -> torch.Tensor:

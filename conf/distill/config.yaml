@@ -255,6 +255,24 @@ interactive:
 env: {}
 reward: {}
 
+online_adaptation:
+  enabled: false
+  lambda_forget: 0.99
+  update_interval: 10
+  learning_rate: 1.0e-4
+  max_grad_norm: 1.0
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+
+video_recording:
+  enabled: true
+  output_path: logs/fada_online/online_adaptation.mp4
+  duration_s: 30.0
+  fps: 30
+  width: 1280
+  height: 720
+
 hydra:
   run:
     dir: .

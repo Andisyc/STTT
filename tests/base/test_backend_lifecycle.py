@@ -518,6 +518,110 @@ def test_mujoco_isolated_pool_matches_primary_dr_fields_and_next_transition() ->
     backend.close()
 
 
+def test_mujoco_runtime_body_mass_and_com_preserves_state() -> None:
+    mujoco = pytest.importorskip("mujoco", reason="mujoco not installed")
+    from mujoco.batch_env import BatchEnvPool
+
+    from unilab.base.backend.mujoco.backend import MuJoCoBackend
+
+    model = mujoco.MjModel.from_xml_string(
+        """
+        <mujoco>
+          <worldbody>
+            <body name="link">
+              <joint name="hinge" type="hinge"/>
+              <geom type="capsule" size="0.05 0.2" mass="1"/>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+    )
+    num_envs = 2
+    nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+    backend = object.__new__(MuJoCoBackend)
+    backend._model = model
+    backend._model_variants = (model,)
+    backend._model_assignments = np.zeros((num_envs,), dtype=np.int32)
+    backend._pool = BatchEnvPool(model, nbatch=num_envs, nthread=1)
+    backend._isolated_rollout_pool = None
+    backend._isolated_rollout_active = False
+    backend._isolated_rollout_failure = None
+    backend._reset_transaction_count = 0
+    backend._num_envs = num_envs
+    backend._n_threads = 1
+    backend._np_dtype = np.dtype(np.float32)
+    backend._physics_state = np.zeros((num_envs, nstate), dtype=np.float32)
+    backend._sensor_data = np.zeros((num_envs, model.nsensordata), dtype=np.float32)
+    backend._pending_xfrc_applied = np.zeros(
+        (num_envs, 6 * model.nbody), dtype=np.float64
+    )
+    backend._pre_step_control_fn = None
+    backend._post_step_forward_sensor = False
+    backend._idx_qpos = 1
+    backend._idx_qvel = 1 + model.nq
+    backend.nq = model.nq
+    backend.nv = model.nv
+    backend._base_name = "link"
+    backend._base_body_id = 1
+    backend._base_body_mass = np.asarray(model.body_mass).copy()
+    backend._base_body_ipos = np.asarray(model.body_ipos).copy()
+    backend._scene_cleanup_handle = None
+    backend._pool.forward(backend._physics_state)
+    backend.prepare_isolated_rollout_branch()
+
+    primary = backend._pool
+    sibling = backend._isolated_rollout_pool
+    assert sibling is not None
+    body_id = backend._base_body_id
+    original_mass = [primary.get_field(i, "body_mass").copy() for i in range(num_envs)]
+    original_com = [
+        primary.get_field(i, "body_ipos").reshape(model.nbody, 3).copy()
+        for i in range(num_envs)
+    ]
+    physics_state = backend._physics_state.copy()
+    reset_count = backend._reset_transaction_count
+    updated_mass = np.asarray([[original_mass[0][body_id] + 2.0]], dtype=np.float64)
+    updated_com = np.asarray(
+        [[original_com[0][body_id] + np.array([0.01, -0.02, 0.03])]],
+        dtype=np.float64,
+    )
+
+    try:
+        backend.set_body_mass_and_com(
+            np.asarray([0], dtype=np.int32),
+            np.asarray([body_id], dtype=np.int32),
+            mass=updated_mass,
+            center_of_mass=updated_com,
+        )
+
+        np.testing.assert_allclose(primary.get_field(0, "body_mass")[body_id], updated_mass[0, 0])
+        np.testing.assert_allclose(
+            primary.get_field(0, "body_ipos").reshape(model.nbody, 3)[body_id],
+            updated_com[0, 0],
+        )
+        np.testing.assert_array_equal(primary.get_field(1, "body_mass"), original_mass[1])
+        np.testing.assert_array_equal(
+            primary.get_field(1, "body_ipos").reshape(model.nbody, 3), original_com[1]
+        )
+        np.testing.assert_array_equal(sibling.get_field(0, "body_mass"), primary.get_field(0, "body_mass"))
+        np.testing.assert_array_equal(sibling.get_field(0, "body_ipos"), primary.get_field(0, "body_ipos"))
+        np.testing.assert_array_equal(backend._physics_state, physics_state)
+        assert backend._reset_transaction_count == reset_count
+
+        backend.set_body_mass_and_com(
+            np.asarray([0], dtype=np.int32),
+            np.asarray([body_id], dtype=np.int32),
+            mass=np.asarray([[original_mass[0][body_id]]], dtype=np.float64),
+            center_of_mass=np.asarray([[original_com[0][body_id]]], dtype=np.float64),
+        )
+        np.testing.assert_array_equal(primary.get_field(0, "body_mass"), original_mass[0])
+        np.testing.assert_array_equal(
+            primary.get_field(0, "body_ipos").reshape(model.nbody, 3), original_com[0]
+        )
+    finally:
+        backend.close()
+
+
 def test_mujoco_backend_rejects_invalid_thread_count_before_loading_scene() -> None:
     pytest.importorskip("mujoco", reason="mujoco not installed")
     from unilab.base.backend.mujoco.backend import MuJoCoBackend

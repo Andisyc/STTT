@@ -27,6 +27,12 @@ env:
     scale_joint_angle: 0.01
     scale_joint_vel: 0.1
     scale_linvel: 0.0
+  runtime_payload:
+    enabled: false
+    body_name: pelvis
+    added_mass_kg: 0.0
+    com_offset_m: [0.0, 0.0, 0.0]
+    attach_time_s: 10.0
 reward:
   scales:
     tracking_lin_vel: 2.0

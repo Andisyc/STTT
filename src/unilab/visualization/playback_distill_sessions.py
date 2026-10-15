@@ -348,6 +348,25 @@ def create_fada_playback_session(
     """Create a stateful FADA Planner-IDM playback session."""
 
     # B1: policy 模式先严格恢复 checkpoint, 避免加载失败后遗留已创建的环境资源.
+    from omegaconf import OmegaConf
+
+    online_node = getattr(cfg, "online_adaptation", None)
+    online_enabled = bool(getattr(online_node, "enabled", False))
+    online = None
+    if online_enabled:
+        from unilab.algos.torch.distill.fada.online_controller import (
+            FADAOnlineAdaptationConfig,
+        )
+
+        online = FADAOnlineAdaptationConfig(**(
+            OmegaConf.to_container(online_node, resolve=True)
+            if OmegaConf.is_config(online_node) else vars(online_node)
+        ))
+        if playback_cfg.action_mode != "policy":
+            raise ValueError("FADA online adaptation requires policy action mode")
+        if int(playback_cfg.num_envs) != 1:
+            raise ValueError("FADA online adaptation requires exactly one env")
+
     resolved_deps = dict(_default_fada_playback_deps(root_dir) if deps is None else deps)
     device_name = select_torch_device() if device is None else str(device)
     checkpoint = resolved_deps["resolve_checkpoint"](playback_cfg, cfg, root_dir)
@@ -365,8 +384,37 @@ def create_fada_playback_session(
         from unilab.algos.torch.distill.fada_playback import FADAPlaybackController
 
         loaded = resolved_deps["load_fada_policy"](checkpoint, device=device_name)
-        controller = FADAPlaybackController(loaded.policy, device=device_name)
         architecture = loaded.policy.config
+
+        if online is not None:
+            from unilab.algos.torch.distill.fada.adaptation import FADALoRAConfig
+            from unilab.algos.torch.distill.fada.online_controller import (
+                OnlineAdaptationController,
+            )
+
+            lora_config = FADALoRAConfig(
+                rank=online.lora_rank,
+                alpha=online.lora_alpha,
+                dropout=online.lora_dropout,
+            )
+            controller = OnlineAdaptationController(
+                loaded.policy,
+                lora_config,
+                lambda_forget=online.lambda_forget,
+                update_interval=online.update_interval,
+                lr=online.learning_rate,
+                max_grad_norm=online.max_grad_norm,
+                device=device_name,
+            )
+            log(
+                "Online adaptation enabled: "
+                f"lambda_forget={online.lambda_forget}, update_interval={online.update_interval}, "
+                f"learning_rate={online.learning_rate}, max_grad_norm={online.max_grad_norm}, "
+                f"lora_rank={lora_config.rank}, lora_alpha={lora_config.alpha}, "
+                f"lora_dropout={lora_config.dropout}"
+            )
+        else:
+            controller = FADAPlaybackController(loaded.policy, device=device_name)
         log(f"Loading FADA Planner-IDM checkpoint: {checkpoint}")
         completed_name = (
             "completed_steps" if "completed_steps" in loaded.checkpoint else "completed_iterations"

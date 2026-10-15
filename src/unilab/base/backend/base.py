@@ -224,6 +224,25 @@ class SimBackend(abc.ABC):
         """Return the backend body inertial-position table."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose body ipos")
 
+    def set_body_mass_and_com(
+        self,
+        env_indices: np.ndarray,
+        body_ids: np.ndarray,
+        *,
+        mass: np.ndarray,
+        center_of_mass: np.ndarray | None = None,
+    ) -> None:
+        """Set absolute body mass and center of mass without resetting simulation state.
+
+        ``mass`` has shape ``(len(env_indices), len(body_ids))`` in kilograms.
+        ``center_of_mass``, when provided, has shape
+        ``(len(env_indices), len(body_ids), 3)`` in each body's local frame and
+        is expressed in meters. Changes take effect on the next physics step.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support runtime body mass updates"
+        )
+
     def get_dof_armature(self) -> np.ndarray:
         """Return the backend dof-armature table."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose dof armature")

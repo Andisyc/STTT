@@ -4,8 +4,13 @@ dist/
 .eggs/
 *.egg-info/
 
-# uv
+# Virtual environments and uv
 .venv/
+venv/
+env/
+ENV/
+.virtualenv/
+.conda/
 .python-version
 
 # Local secrets and credentials
@@ -83,7 +88,14 @@ src/unilab/assets/checkpoints/**/*.pt
 src/unilab/assets/checkpoints/**/*.onnx
 
 # Local training and evaluation checkpoints
+# Ignore weights wherever they are saved; keep checkpoint-handling source code.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
 /checkpoints/
+/models/
 
 
 # Local tool/runtime artifacts (any subfolder)

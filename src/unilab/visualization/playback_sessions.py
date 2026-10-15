@@ -344,6 +344,7 @@ class FADAPlaybackSession(RslRlPlaybackSession):
 
     def __init__(self, *, controller: Any | None, **kwargs: Any) -> None:
         self.controller = None
+        self.last_update_stats: dict[str, float] | None = None
         super().__init__(policy=None, **kwargs)
         if controller is not None:
             self.bind_controller(controller)
@@ -362,6 +363,7 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         # B1: 环境 reset 与 FADA history reset 共享一个 lifecycle boundary.
         if self.controller is not None:
             self.controller.reset()
+        self.last_update_stats = None
         return super().reset()
 
     def step_once(self) -> Any:
@@ -369,9 +371,16 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         actions = self._build_actions()
         self.actions = actions
         self.obs, _reward, done, _info = self.wrapped_env.step(actions)
-        # B2: 将 episode 边界交回 history owner, 下一查询按 reset observation 初始化对应行.
-        if self.controller is not None and self.autoreset_enabled:
-            self.controller.reset(done)
+        # B2: post-step 回调拿到真实执行动作与下一 observation, 在 autoreset history
+        # reset 之前完成在线收集/更新; autoreset 关闭时不传 done, 由 controller 保留历史.
+        if self.controller is not None:
+            self.last_update_stats = self.controller.on_env_step(
+                executed_action=self.info.get("current_actions"),
+                next_observation=self.obs,
+                done=done if self.autoreset_enabled else None,
+            )
+            if self.autoreset_enabled:
+                self.controller.reset(done)
         self.step_count += 1
         return self.obs
 

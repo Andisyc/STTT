@@ -414,6 +414,30 @@ class ForwardProgressTerminationConfig:
 
 
 @dataclass
+class G1RuntimePayloadConfig:
+    """Deterministic mid-episode payload attached to one body, per environment."""
+
+    enabled: bool = False
+    body_name: str = "pelvis"
+    added_mass_kg: float = 0.0
+    com_offset_m: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    attach_time_s: float = 10.0
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        if not str(self.body_name).strip():
+            raise ValueError("env.runtime_payload.body_name must be non-empty")
+        if not math.isfinite(float(self.added_mass_kg)) or float(self.added_mass_kg) <= 0.0:
+            raise ValueError("env.runtime_payload.added_mass_kg must be finite and positive")
+        offset = np.asarray(self.com_offset_m, dtype=np.float64)
+        if offset.shape != (3,) or not np.isfinite(offset).all():
+            raise ValueError("env.runtime_payload.com_offset_m must be a finite 3D vector")
+        if not math.isfinite(float(self.attach_time_s)) or float(self.attach_time_s) < 0.0:
+            raise ValueError("env.runtime_payload.attach_time_s must be finite and non-negative")
+
+
+@dataclass
 class G1WalkCommandsConfig(Commands):
     """Optional command-only dead zone, independent of gait scheduling."""
 
@@ -475,12 +499,23 @@ class G1WalkEnvCfg(G1BaseCfg):
     fada_privileged_observation: G1FADAPrivilegedObservationConfig = field(
         default_factory=G1FADAPrivilegedObservationConfig
     )
+    runtime_payload: G1RuntimePayloadConfig = field(default_factory=G1RuntimePayloadConfig)
 
     def validate(self) -> None:
         super().validate()
         self.commands.validate()
         self.domain_rand.validate()
         self.command_gated_phase_contact.validate()
+        self.runtime_payload.validate()
+        if self.runtime_payload.enabled and (
+            self.domain_rand.randomize_base_mass
+            or self.domain_rand.randomize_body_mass
+            or self.domain_rand.random_com
+        ):
+            raise ValueError(
+                "env.runtime_payload is deterministic and forbids "
+                "domain_rand.randomize_base_mass, randomize_body_mass, and random_com"
+            )
         if self.gait_clock_mode not in {"continuous", "command_fixed"}:
             raise ValueError("unsupported gait_clock_mode")
         if self.gait_clock_mode == "command_fixed" and (

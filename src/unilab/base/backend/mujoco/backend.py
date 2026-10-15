@@ -767,6 +767,70 @@ class MuJoCoBackend(SimBackend):
     def get_body_ipos(self) -> np.ndarray:
         return np.asarray(self._model.body_ipos, dtype=np.float64).copy()
 
+    def set_body_mass_and_com(
+        self,
+        env_indices: np.ndarray,
+        body_ids: np.ndarray,
+        *,
+        mass: np.ndarray,
+        center_of_mass: np.ndarray | None = None,
+    ) -> None:
+        """Set per-environment MuJoCo inertial fields without resetting state."""
+        self._raise_if_isolated_rollout_poisoned()
+        if self._isolated_rollout_active:
+            raise RuntimeError("cannot update body mass during an isolated rollout branch")
+
+        primary = self._pool
+        if primary is None:
+            raise RuntimeError("MuJoCo backend pool must be materialized before body mass updates")
+
+        env_ids = np.asarray(env_indices, dtype=np.int64).reshape(-1)
+        body_ids_np = np.asarray(body_ids, dtype=np.int64).reshape(-1)
+        if np.unique(env_ids).size != env_ids.size:
+            raise ValueError("env_indices must not contain duplicates")
+        if np.unique(body_ids_np).size != body_ids_np.size:
+            raise ValueError("body_ids must not contain duplicates")
+        if np.any(env_ids < 0) or np.any(env_ids >= self._num_envs):
+            raise IndexError(f"env_indices must be in [0, {self._num_envs})")
+        if np.any(body_ids_np < 0) or np.any(body_ids_np >= self._model.nbody):
+            raise IndexError(f"body_ids must be in [0, {self._model.nbody})")
+
+        expected_mass_shape = (env_ids.size, body_ids_np.size)
+        mass_np = np.asarray(mass, dtype=np.float64)
+        if mass_np.shape != expected_mass_shape:
+            raise ValueError(f"mass must have shape {expected_mass_shape}, got {mass_np.shape}")
+        if not np.all(np.isfinite(mass_np)) or np.any(mass_np <= 0.0):
+            raise ValueError("mass must contain only finite positive values")
+
+        com_np = None
+        if center_of_mass is not None:
+            expected_com_shape = (*expected_mass_shape, 3)
+            com_np = np.asarray(center_of_mass, dtype=np.float64)
+            if com_np.shape != expected_com_shape:
+                raise ValueError(
+                    f"center_of_mass must have shape {expected_com_shape}, got {com_np.shape}"
+                )
+            if not np.all(np.isfinite(com_np)):
+                raise ValueError("center_of_mass must contain only finite values")
+
+
+        sibling = self._isolated_rollout_pool
+        pools = (primary,) if sibling is None else (primary, sibling)
+        try:
+            for pool in pools:
+                for row, env_id in enumerate(env_ids):
+                    pool.set_field_indexed(
+                        int(env_id), "body_mass", body_ids_np, mass_np[row]
+                    )
+                    if com_np is not None:
+                        pool.set_field_indexed(
+                            int(env_id), "body_ipos", body_ids_np, com_np[row]
+                        )
+        except BaseException as exc:
+            if sibling is not None:
+                self._isolated_rollout_failure = f"{type(exc).__name__}: {exc}"
+            raise
+
     def get_dof_armature(self) -> np.ndarray:
         return np.asarray(self._model.dof_armature, dtype=np.float64).copy()
 
