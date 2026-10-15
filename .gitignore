@@ -109,3 +109,4 @@ src/unilab/assets/robots/**/tmp*.xml
 /logs/
 /artifacts/
 /model/
+/video/
