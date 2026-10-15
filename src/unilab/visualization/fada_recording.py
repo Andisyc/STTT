@@ -103,6 +103,16 @@ def record_fada_playback(
     camera = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(camera)
     focus_body_id = _resolve_focus_body_id(model, session.env, args.camera_focus_body_name)
+    payload_config = getattr(session.env.cfg, "runtime_payload", None)
+    payload_body_id = -1
+    payload_position = payload_half_size = None
+    payload_rgba = np.asarray([1.0, 0.35, 0.05, 1.0], dtype=np.float32)
+    if payload_config is not None and payload_config.enabled:
+        payload_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, payload_config.body_name)
+        if payload_body_id < 0:
+            raise ValueError(f"Payload body is absent from recording model: {payload_config.body_name}")
+        payload_position = np.asarray(payload_config.attachment_pos_m, dtype=np.float64)
+        payload_half_size = np.asarray(payload_config.half_size_m, dtype=np.float64)
     camera.distance = (
         args.camera_distance if args.camera_distance is not None
         else _default_viewer_camera_distance(model, session.env, follow_body=args.camera_follow_body)
@@ -169,6 +179,19 @@ def record_fada_playback(
                         camera.lookat[:] = data.xpos[focus_body_id]
                         camera.lookat[2] += args.camera_height_offset
                     renderer.update_scene(data, camera=camera)
+                    active = bool(np.asarray(session.info.get("runtime_payload_active", [False])).reshape(-1)[0])
+                    if active and payload_body_id >= 0:
+                        scene = renderer.scene
+                        if scene.ngeom >= scene.maxgeom:
+                            raise RuntimeError("Recording scene has no room for the payload marker")
+                        rotation = data.xmat[payload_body_id].reshape(3, 3)
+                        center = data.xpos[payload_body_id] + rotation @ payload_position
+                        # Visualize the same rigid box used in inertia composition; no extra physics mass.
+                        mujoco.mjv_initGeom(
+                            scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_BOX,
+                            payload_half_size, center, rotation.reshape(9), payload_rgba,
+                        )
+                        scene.ngeom += 1
                     image = renderer.render()
                     if config.show_status_overlay:
                         position = data.xpos[focus_body_id]
@@ -180,9 +203,10 @@ def record_fada_playback(
                         forward = math.cos(origin_yaw) * dx + math.sin(origin_yaw) * dy
                         lateral = -math.sin(origin_yaw) * dx + math.cos(origin_yaw) * dy
                         yaw_error = math.degrees(float(np_wrap_to_pi(yaw - origin_yaw)))
-                        active = bool(np.asarray(session.info.get("runtime_payload_active", [False])).reshape(-1)[0])
                         added_mass = float(np.asarray(session.info.get("runtime_payload_added_mass_kg", [0.0])).reshape(-1)[0])
                         status = f"PAYLOAD +{added_mass:g} kg" if active else "NO PAYLOAD"
+                        if active and payload_config is not None:
+                            status += f" @ {payload_config.body_name}"
                         alert = None
                         if last_attach_time is not None and elapsed - last_attach_time < 2.0:
                             alert = f"PAYLOAD ATTACHED +{added_mass:g} kg"

@@ -578,6 +578,12 @@ def test_mujoco_runtime_body_mass_and_com_preserves_state() -> None:
         primary.get_field(i, "body_ipos").reshape(model.nbody, 3).copy()
         for i in range(num_envs)
     ]
+    original_inertia = [
+        primary.get_field(i, "body_inertia").copy() for i in range(num_envs)
+    ]
+    original_iquat = [primary.get_field(i, "body_iquat").copy() for i in range(num_envs)]
+    nominal_tensor = backend.get_body_inertia_tensor()[body_id]
+    updated_tensor = np.asarray([[[[0.2, 0.03, 0.0], [0.03, 0.3, 0.01], [0.0, 0.01, 0.4]]]])
     physics_state = backend._physics_state.copy()
     reset_count = backend._reset_transaction_count
     updated_mass = np.asarray([[original_mass[0][body_id] + 2.0]], dtype=np.float64)
@@ -592,6 +598,7 @@ def test_mujoco_runtime_body_mass_and_com_preserves_state() -> None:
             np.asarray([body_id], dtype=np.int32),
             mass=updated_mass,
             center_of_mass=updated_com,
+            inertia_tensor=updated_tensor,
         )
 
         np.testing.assert_allclose(primary.get_field(0, "body_mass")[body_id], updated_mass[0, 0])
@@ -605,6 +612,15 @@ def test_mujoco_runtime_body_mass_and_com_preserves_state() -> None:
         )
         np.testing.assert_array_equal(sibling.get_field(0, "body_mass"), primary.get_field(0, "body_mass"))
         np.testing.assert_array_equal(sibling.get_field(0, "body_ipos"), primary.get_field(0, "body_ipos"))
+        np.testing.assert_array_equal(primary.get_field(1, "body_inertia"), original_inertia[1])
+        np.testing.assert_array_equal(primary.get_field(1, "body_iquat"), original_iquat[1])
+        np.testing.assert_array_equal(sibling.get_field(0, "body_inertia"), primary.get_field(0, "body_inertia"))
+        np.testing.assert_array_equal(sibling.get_field(0, "body_iquat"), primary.get_field(0, "body_iquat"))
+        rotation = np.empty(9, dtype=np.float64)
+        mujoco.mju_quat2Mat(rotation, primary.get_field(0, "body_iquat").reshape(model.nbody, 4)[body_id])
+        axes = rotation.reshape(3, 3)
+        principal = primary.get_field(0, "body_inertia").reshape(model.nbody, 3)[body_id]
+        np.testing.assert_allclose((axes * principal) @ axes.T, updated_tensor[0, 0], atol=1e-12)
         np.testing.assert_array_equal(backend._physics_state, physics_state)
         assert backend._reset_transaction_count == reset_count
 
@@ -613,6 +629,7 @@ def test_mujoco_runtime_body_mass_and_com_preserves_state() -> None:
             np.asarray([body_id], dtype=np.int32),
             mass=np.asarray([[original_mass[0][body_id]]], dtype=np.float64),
             center_of_mass=np.asarray([[original_com[0][body_id]]], dtype=np.float64),
+            inertia_tensor=nominal_tensor[None, None],
         )
         np.testing.assert_array_equal(primary.get_field(0, "body_mass"), original_mass[0])
         np.testing.assert_array_equal(

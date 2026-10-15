@@ -767,6 +767,15 @@ class MuJoCoBackend(SimBackend):
     def get_body_ipos(self) -> np.ndarray:
         return np.asarray(self._model.body_ipos, dtype=np.float64).copy()
 
+    def get_body_inertia_tensor(self) -> np.ndarray:
+        tensors = np.empty((self._model.nbody, 3, 3), dtype=np.float64)
+        rotation = np.empty(9, dtype=np.float64)
+        for body_id in range(self._model.nbody):
+            mujoco.mju_quat2Mat(rotation, self._model.body_iquat[body_id])
+            axes = rotation.reshape(3, 3)
+            tensors[body_id] = (axes * self._model.body_inertia[body_id]) @ axes.T
+        return tensors
+
     def set_body_mass_and_com(
         self,
         env_indices: np.ndarray,
@@ -774,8 +783,9 @@ class MuJoCoBackend(SimBackend):
         *,
         mass: np.ndarray,
         center_of_mass: np.ndarray | None = None,
+        inertia_tensor: np.ndarray | None = None,
     ) -> None:
-        """Set per-environment MuJoCo inertial fields without resetting state."""
+        """Set per-environment inertial fields, converting body-frame tensors to principal axes."""
         self._raise_if_isolated_rollout_poisoned()
         if self._isolated_rollout_active:
             raise RuntimeError("cannot update body mass during an isolated rollout branch")
@@ -813,6 +823,32 @@ class MuJoCoBackend(SimBackend):
             if not np.all(np.isfinite(com_np)):
                 raise ValueError("center_of_mass must contain only finite values")
 
+        moments = orientations = None
+        if inertia_tensor is not None:
+            tensors = np.asarray(inertia_tensor, dtype=np.float64)
+            expected_shape = (*expected_mass_shape, 3, 3)
+            if tensors.shape != expected_shape:
+                raise ValueError(f"inertia_tensor must have shape {expected_shape}, got {tensors.shape}")
+            if not np.isfinite(tensors).all() or not np.allclose(
+                tensors, np.swapaxes(tensors, -1, -2), rtol=0.0, atol=1e-12
+            ):
+                raise ValueError("inertia_tensor must contain finite symmetric tensors")
+            moments, axes = np.linalg.eigh(tensors)
+            tolerance = 1e-10 * np.maximum(1.0, moments[..., -1])
+            if np.any(moments <= 0.0) or np.any(
+                moments[..., -1] > moments[..., 0] + moments[..., 1] + tolerance
+            ):
+                raise ValueError("inertia_tensor must have positive physically valid principal moments")
+            orientations = np.empty((*expected_mass_shape, 4), dtype=np.float64)
+            for row in range(env_ids.size):
+                for column in range(body_ids_np.size):
+                    principal_axes = axes[row, column]
+                    if np.linalg.det(principal_axes) < 0.0:
+                        principal_axes[:, 0] *= -1.0
+                    mujoco.mju_mat2Quat(
+                        orientations[row, column], np.ascontiguousarray(principal_axes).reshape(9)
+                    )
+
 
         sibling = self._isolated_rollout_pool
         pools = (primary,) if sibling is None else (primary, sibling)
@@ -825,6 +861,13 @@ class MuJoCoBackend(SimBackend):
                     if com_np is not None:
                         pool.set_field_indexed(
                             int(env_id), "body_ipos", body_ids_np, com_np[row]
+                        )
+                    if moments is not None:
+                        pool.set_field_indexed(
+                            int(env_id), "body_inertia", body_ids_np, moments[row]
+                        )
+                        pool.set_field_indexed(
+                            int(env_id), "body_iquat", body_ids_np, orientations[row]
                         )
         except BaseException as exc:
             if sibling is not None:

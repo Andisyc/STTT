@@ -415,12 +415,13 @@ class ForwardProgressTerminationConfig:
 
 @dataclass
 class G1RuntimePayloadConfig:
-    """Deterministic mid-episode payload attached to one body, per environment."""
+    """Rigid box payload; position and half sizes are in the target body's local axes."""
 
     enabled: bool = False
-    body_name: str = "pelvis"
+    body_name: str = "torso_link"
     added_mass_kg: float = 0.0
-    com_offset_m: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    attachment_pos_m: list[float] = field(default_factory=lambda: [0.004, 0.22, 0.15])
+    half_size_m: list[float] = field(default_factory=lambda: [0.08, 0.06, 0.12])
     attach_time_s: float = 10.0
 
     def validate(self) -> None:
@@ -430,9 +431,12 @@ class G1RuntimePayloadConfig:
             raise ValueError("env.runtime_payload.body_name must be non-empty")
         if not math.isfinite(float(self.added_mass_kg)) or float(self.added_mass_kg) <= 0.0:
             raise ValueError("env.runtime_payload.added_mass_kg must be finite and positive")
-        offset = np.asarray(self.com_offset_m, dtype=np.float64)
-        if offset.shape != (3,) or not np.isfinite(offset).all():
-            raise ValueError("env.runtime_payload.com_offset_m must be a finite 3D vector")
+        position = np.asarray(self.attachment_pos_m, dtype=np.float64)
+        if position.shape != (3,) or not np.isfinite(position).all():
+            raise ValueError("env.runtime_payload.attachment_pos_m must be a finite 3D vector")
+        half_size = np.asarray(self.half_size_m, dtype=np.float64)
+        if half_size.shape != (3,) or not np.isfinite(half_size).all() or np.any(half_size <= 0.0):
+            raise ValueError("env.runtime_payload.half_size_m must be a finite positive 3D vector")
         if not math.isfinite(float(self.attach_time_s)) or float(self.attach_time_s) < 0.0:
             raise ValueError("env.runtime_payload.attach_time_s must be finite and non-negative")
 

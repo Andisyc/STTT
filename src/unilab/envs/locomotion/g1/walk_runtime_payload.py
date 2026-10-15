@@ -42,9 +42,12 @@ class G1RuntimePayload:
         self._baseline_mass = 0.0
         self._baseline_com = np.zeros(3, dtype=np.float64)
         self._target_com = np.zeros(3, dtype=np.float64)
+        self._baseline_inertia = np.zeros((3, 3), dtype=np.float64)
+        self._target_inertia = np.zeros((3, 3), dtype=np.float64)
         self._scratch = np.zeros((self._num_envs,), dtype=bool)
         if not self._enabled:
             return
+        config.validate()
         if backend.backend_type != "mujoco":
             raise ValueError("runtime payload currently requires the MuJoCo backend")
         if not math.isfinite(ctrl_dt) or ctrl_dt <= 0.0:
@@ -59,12 +62,27 @@ class G1RuntimePayload:
         self._baseline_com = (
             np.asarray(backend.get_body_ipos(), dtype=np.float64)[body_id].copy()
         )
+        self._baseline_inertia = np.asarray(
+            backend.get_body_inertia_tensor(), dtype=np.float64
+        )[body_id].copy()
         if not math.isfinite(self._baseline_mass) or self._baseline_mass <= 0.0:
             raise ValueError("runtime payload baseline body mass must be finite and positive")
         target_mass = self._baseline_mass + self._added_mass_kg
         if target_mass <= 0.0:
             raise ValueError("runtime payload total body mass must be positive")
-        self._target_com = self._baseline_com + np.asarray(config.com_offset_m, dtype=np.float64)
+        # Rigidly combine the original body and an axis-aligned finite-size box.
+        position = np.asarray(config.attachment_pos_m, dtype=np.float64)
+        half_size = np.asarray(config.half_size_m, dtype=np.float64)
+        displacement = position - self._baseline_com
+        self._target_com = self._baseline_com + (self._added_mass_kg / target_mass) * displacement
+        hx2, hy2, hz2 = half_size * half_size
+        box_inertia = np.diag(
+            (self._added_mass_kg / 3.0) * np.asarray([hy2 + hz2, hx2 + hz2, hx2 + hy2])
+        )
+        reduced_mass = self._baseline_mass * self._added_mass_kg / target_mass
+        self._target_inertia = self._baseline_inertia + box_inertia + reduced_mass * (
+            np.dot(displacement, displacement) * np.eye(3) - np.outer(displacement, displacement)
+        )
 
     @property
     def enabled(self) -> bool:
@@ -120,6 +138,7 @@ class G1RuntimePayload:
             self._body_ids,
             mass=np.full((num_attach, 1), self._baseline_mass + self._added_mass_kg),
             center_of_mass=np.tile(self._target_com, (num_attach, 1, 1)),
+            inertia_tensor=np.broadcast_to(self._target_inertia, (num_attach, 1, 3, 3)),
         )
         active[env_ids] = True
         event[env_ids] = True
@@ -156,6 +175,7 @@ class G1RuntimePayload:
                 self._body_ids,
                 mass=np.full((num_restore, 1), self._baseline_mass),
                 center_of_mass=np.tile(self._baseline_com, (num_restore, 1, 1)),
+                inertia_tensor=np.broadcast_to(self._baseline_inertia, (num_restore, 1, 3, 3)),
             )
             active[env_ids] = False
         info[TRUTH_KEY_ATTACHED][reset_rows] = False

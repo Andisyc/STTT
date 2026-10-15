@@ -29,9 +29,10 @@ env:
     scale_linvel: 0.0
   runtime_payload:
     enabled: false
-    body_name: pelvis
+    body_name: torso_link
     added_mass_kg: 0.0
-    com_offset_m: [0.0, 0.0, 0.0]
+    attachment_pos_m: [0.004, 0.22, 0.15]
+    half_size_m: [0.08, 0.06, 0.12]
     attach_time_s: 10.0
 reward:
   scales:

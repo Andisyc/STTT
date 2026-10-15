@@ -12,7 +12,7 @@ Confirmed decisions:
 - 数据收集: 跨相位轨迹窗口，非单步 streaming
 - 更新机制: 指数加权最小二乘，非 RLS
 - Planner 冻结，仅更新 IDM LoRA
-- 仿真负重通过 `SimBackend.set_body_mass_and_com` 设置每个环境的绝对质量与 body-local 质心；事件 owner 负责在 episode reset 时显式恢复基线
+- 仿真负重改为躯干左肩外侧刚性小包：质量加权合成 COM，有限尺寸箱体惯量加平行轴项；通过 `SimBackend.set_body_mass_and_com(..., inertia_tensor=...)` 同时写入质量、body-local COM 与完整惯性张量，reset 恢复三项基线。新配置为 `attachment_pos_m` / `half_size_m`，不再使用 `com_offset_m`
 Progress:
 - [x] 步骤 1: 接口定义 — Done when: $A_{real}$ 来源与轨迹窗口格式明确
   - Evidence: $A_{real}$ 从 `env.step()` → `info["current_actions"]` 获取；轨迹窗口复用 `FADACausalWindow` 结构
@@ -32,8 +32,10 @@ Progress:
 - [x] 直行评估录制：`recording_profile=straight_payload` 固定标称 reset、零初速度与 `[0.4, 0, 0]` 命令，关闭随机扰动，侧后方 135° 跟随相机；episode 上限 180s，120s 视频在 30s 加载 3kg，负重后观察 90s；真实 termination/reset 保留并在画面和日志标记
   - Evidence: 本地 CPU + 真实 checkpoint 录制 0.8s / 40 步（仅为 smoke，将负重时间缩为 0.2s），输出 640x360 H.264；已查看视频，确认无负重/负重状态切换、挂载提示、横向位移/航向偏差、reset 次数和侧后方视角
   - Protocol: 先用同一 profile 覆盖 `online_adaptation.enabled=false env.runtime_payload.enabled=false video_recording.duration_s=30`，检查原策略无负重直行；通过后再录 120s 的在线适应视频。后者保持现有从开局在线更新的行为；要判断适应的因果效果，还需同样负重、关闭更新的对照
+- [x] 左肩负重：`torso_link` 局部中心 `[0.004,0.22,0.15]` m、半尺寸 `[0.08,0.06,0.12]` m、3kg；随躯干刚性携带，不加自由度/碰撞，不模拟摆绳。录制以同位置/尺寸橙色箱体可视化，不重复添加物理质量；profile 仍先无负重 30s
+  - Evidence: `uv run --frozen --no-sync pytest tests/envs/locomotion/g1/test_runtime_payload.py -q` → 7 passed（手算质量/COM/惯量、左右镜像、逐行触发与 reset 恢复）；真实 G1 + checkpoint 录制 0.8s / 40 步（挂载时间缩为 0.2s），视频已目视确认橙色小包在事件后出现，并完成一次在线更新
 Blockers:
-- 服务器 30s / 1500 步录制已完成（已从 tmux 日志确认）；需使用 `LD_PRELOAD=/lib/x86_64-linux-gnu/libgcc_s.so.1` 避免 mujoco-uni 异常展开符号冲突。新 profile 的 30s 基线及 120s 负重行为效果尚未验证
+- 旧扰动模型的 120s 视频中，用户观察到 25s 无负重偏转；已有日志确认 25s 前更新 121 次、30.02s 才挂载、无 reset。尚未定因；左肩扰动模型切换不代表解决该偏转，也不证明适应有效。服务器需保留进程级 `LD_PRELOAD=/lib/x86_64-linux-gnu/libgcc_s.so.1`
 
 Next:
-- 上传新 profile 与叠字录制代码；先检查 30s 无负重、无更新基线的横向/航向偏差和 reset 次数，再决定是否运行长时负重适应对照
+- 同步左肩负重代码后，仍优先用关闭更新/负重的无负重基线区分原策略偏转和在线更新退化；不要把扰动位置变化当成已有闭环问题的修复

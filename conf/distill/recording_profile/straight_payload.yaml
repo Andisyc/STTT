@@ -43,9 +43,11 @@ env:
     rel_straight_envs: 0.0
   runtime_payload:
     enabled: true
-    body_name: pelvis
+    body_name: torso_link
     added_mass_kg: 3.0
-    com_offset_m: [0.0, 0.0, 0.0]
+    # Box center: left/outboard and below the shoulder, rigidly carried by the torso.
+    attachment_pos_m: [0.004, 0.22, 0.15]
+    half_size_m: [0.08, 0.06, 0.12]
     attach_time_s: 30.0
 
 online_adaptation:

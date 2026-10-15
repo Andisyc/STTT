@@ -224,6 +224,10 @@ class SimBackend(abc.ABC):
         """Return the backend body inertial-position table."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose body ipos")
 
+    def get_body_inertia_tensor(self) -> np.ndarray:
+        """Return nominal COM-centered inertia tensors in body-local axes, (nbody, 3, 3)."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not expose body inertia")
+
     def set_body_mass_and_com(
         self,
         env_indices: np.ndarray,
@@ -231,6 +235,7 @@ class SimBackend(abc.ABC):
         *,
         mass: np.ndarray,
         center_of_mass: np.ndarray | None = None,
+        inertia_tensor: np.ndarray | None = None,
     ) -> None:
         """Set absolute body mass and center of mass without resetting simulation state.
 
@@ -238,6 +243,9 @@ class SimBackend(abc.ABC):
         ``center_of_mass``, when provided, has shape
         ``(len(env_indices), len(body_ids), 3)`` in each body's local frame and
         is expressed in meters. Changes take effect on the next physics step.
+        ``inertia_tensor``, when provided, has shape
+        ``(len(env_indices), len(body_ids), 3, 3)`` in kg*m^2. It is a full
+        symmetric tensor about the new COM, expressed in body-local axes.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support runtime body mass updates"
