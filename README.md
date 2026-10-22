@@ -31,13 +31,17 @@ ICE-Cal 路径不同：Planner 和 IDM 基础权重冻结，只有 IDM LoRA 接�
 - 在 t 保存实际推理的历史输入、Planner 标称未来和首动作，在 t+1 用标称未来第一帧
   与真实关节位置偏移的差值构造固定动作标签。两边均为相对默认姿态的弧度偏移；
   用环境实际 `action_scale` 换算动作修正，不使用执行后的动作作为监督标签。
-- 默认 `window_size=100`、`gamma=0.05`、`sigma=1e-4`、`update_interval=10`。
-  窗口满后按有效步数更新；控制周期为 0.02s 时首次更新在 2s，不等待负重挂载。
+- 默认 `window_size=10`、`warmup_steps=40`、`update_interval=10`，
+  `gamma=0.05`、`sigma=1e-4`。控制周期为 0.02s 时，第 40 步 (0.8s) 首次更新，
+  使用启动阶段最后 10 条样本；之后第 50、60……步 (每 0.2s) 使用 10 条新样本更新。
+  成功后仅清空训练样本，不重置推理历史或已学状态；失败则保留样本并抛出异常。
+  非默认配置须同时满足 warmup、更新周期和满批条件；不等待负重挂载。
   这些数值是试验初值，不代表已证实的稳定性或适应效果。
 - 损失为窗口内首动作误差平方范数的 `1/(2T)` 均值，加相对部署初始 LoRA 参数的
   显式 L2 锚定；不对动作维再平均。更新时关闭 dropout 但开启梯度，使用 Adam，
   不通过 AdamW 的默认权重衰减替代非零参数锚点。
-- reset 清空历史、待闭合样本和滑动窗口，但保留已学 LoRA、锚点与优化器状态。
+- reset 清空历史、待闭合样本和训练窗口，并重新计算 warmup，但保留已学 LoRA、
+  锚点与优化器状态。
   关闭 autoreset 时，终止后仍可继续物理步进，但暂停采集/更新，直到显式 reset。
 - 旧在线 `lambda_forget` 配置和 `scripts/test_online_adaptation.py` 手动入口已移除。
   使用 `uv run --frozen --no-sync python scripts/play_fada_online.py`，启动日志应包含

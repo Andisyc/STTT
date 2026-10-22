@@ -258,7 +258,8 @@ reward: {}
 
 online_adaptation:
   enabled: false
-  window_size: 100
+  window_size: 10
+  warmup_steps: 40
   gamma: 0.05
   sigma: 1.0e-4
   update_interval: 10

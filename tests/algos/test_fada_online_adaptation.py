@@ -72,6 +72,24 @@ def test_window_keeps_latest_samples_and_requires_reset_after_terminal(config):
     assert sample is not None and (sample.episode_id, sample.timestep) == (old_episode + 1, 0)
 
 
+def test_clear_window_preserves_pending_sample_and_episode_timestep(config):
+    collector = OnlineSnapshotCollector(config, window_size=1, gamma=0.05, action_scale=0.5)
+    collector.begin(_snapshot())
+    first = collector.complete(torch.zeros(1, 66))
+    assert first is not None and collector.ready
+    collector.begin(_snapshot())
+    collector.clear_window()
+    assert collector.get_window() == () and not collector.ready
+    following = collector.complete(torch.zeros(1, 66))
+    assert following is not None
+    assert (following.episode_id, following.timestep) == (first.episode_id, first.timestep + 1)
+    collector.begin(_snapshot())
+    collector.complete(torch.zeros(1, 66), done=True)
+    collector.clear_window()
+    with pytest.raises(RuntimeError):
+        collector.begin(_snapshot())
+
+
 def test_regression_uses_squared_action_norm_and_only_first_action(config):
     with torch.random.fork_rng():
         torch.manual_seed(0)

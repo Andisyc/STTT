@@ -136,6 +136,10 @@ class OnlineSnapshotCollector:
         """Return samples oldest first without clearing or rebuilding labels."""
         return tuple(self._samples)
 
+    def clear_window(self) -> None:
+        """Consume completed samples without resetting inference or episode state."""
+        self._samples.clear()
+
     def reset(self) -> None:
         """Start a new episode without carrying pending or completed samples."""
         self._pending = None

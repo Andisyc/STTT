@@ -21,7 +21,8 @@ from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
 @dataclass(frozen=True)
 class FADAOnlineAdaptationConfig:
     enabled: bool = False
-    window_size: int = 100
+    window_size: int = 10
+    warmup_steps: int = 40
     gamma: float = 0.05
     sigma: float = 1e-4
     update_interval: int = 10
@@ -36,6 +37,12 @@ class FADAOnlineAdaptationConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
                 raise ValueError(f"online_adaptation.{name} must be a positive integer")
+        if (
+            isinstance(self.warmup_steps, bool)
+            or not isinstance(self.warmup_steps, Integral)
+            or self.warmup_steps < 0
+        ):
+            raise ValueError("online_adaptation.warmup_steps must be a non-negative integer")
         for name in ("gamma", "sigma"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
@@ -58,7 +65,8 @@ class OnlineAdaptationController:
         lora_config: FADALoRAConfig,
         *,
         action_scale: float | Sequence[float] | np.ndarray | torch.Tensor,
-        window_size: int = 100,
+        window_size: int = 10,
+        warmup_steps: int = 40,
         gamma: float = 0.05,
         sigma: float = 1e-4,
         update_interval: int = 10,
@@ -68,7 +76,7 @@ class OnlineAdaptationController:
     ) -> None:
         FADAOnlineAdaptationConfig(
             enabled=True, window_size=window_size, gamma=gamma, sigma=sigma,
-            update_interval=update_interval, learning_rate=lr,
+            warmup_steps=warmup_steps, update_interval=update_interval, learning_rate=lr,
             max_grad_norm=max_grad_norm, lora_rank=lora_config.rank,
             lora_alpha=lora_config.alpha, lora_dropout=lora_config.dropout,
         )
@@ -83,6 +91,7 @@ class OnlineAdaptationController:
         self.policy.eval()
         self.playback = FADAPlaybackController(self.policy, device=self.device)
         self.update_interval = int(update_interval)
+        self.warmup_steps = int(warmup_steps)
         self._step_count = 0
         self._collection_suspended = False
 
@@ -116,8 +125,14 @@ class OnlineAdaptationController:
             return None
         self.collector.complete(self.project_observation(next_observation))
         self._step_count += 1
-        if self.collector.ready and self._step_count % self.update_interval == 0:
-            return self.updater.update(self.collector.get_window())
+        if (
+            self._step_count >= self.warmup_steps
+            and self._step_count % self.update_interval == 0
+            and self.collector.ready
+        ):
+            stats = self.updater.update(self.collector.get_window())
+            self.collector.clear_window()
+            return stats
         return None
 
     def reset(self, done: Any | None = None) -> None:

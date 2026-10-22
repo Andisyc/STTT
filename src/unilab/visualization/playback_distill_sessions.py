@@ -467,6 +467,7 @@ def create_fada_playback_session(
                 lora_config,
                 action_scale=env.cfg.control_config.action_scale,
                 window_size=online.window_size,
+                warmup_steps=online.warmup_steps,
                 gamma=online.gamma,
                 sigma=online.sigma,
                 update_interval=online.update_interval,
@@ -477,7 +478,8 @@ def create_fada_playback_session(
             log(
                 "Online adaptation enabled: objective=snapshot_regression, "
                 f"window_size={online.window_size}, gamma={online.gamma}, sigma={online.sigma}, "
-                f"update_interval={online.update_interval}, learning_rate={online.learning_rate}, "
+                f"warmup_steps={online.warmup_steps}, update_interval={online.update_interval}, "
+                f"learning_rate={online.learning_rate}, "
                 f"max_grad_norm={online.max_grad_norm}, lora_rank={lora_config.rank}, "
                 f"lora_alpha={lora_config.alpha}, lora_dropout={lora_config.dropout}"
             )

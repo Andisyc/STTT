@@ -187,6 +187,7 @@ def _make_session(policy, env, wrapped, online, ckpt: Path):
 _ONLINE = {
     "enabled": True,
     "window_size": 3,
+    "warmup_steps": 0,
     "gamma": 0.05,
     "sigma": 1e-4,
     "update_interval": 2,
@@ -250,7 +251,7 @@ def test_online_closes_next_step_labels_and_updates_only_on_full_window_tick(pol
     stats = session.last_update_stats
     assert stats is not None and stats["num_samples"] == 3
     assert stats["loss"] == pytest.approx(stats["regression_loss"] + stats["anchor_loss"])
-    assert [sample.timestep for sample in controller.collector.get_window()] == [1, 2, 3]
+    assert controller.collector.get_window() == ()
     torch.testing.assert_close(first.target_action, label, atol=0, rtol=0)
     changed = {name for name, p in policy.named_parameters() if not torch.equal(p, before[name])}
     trainable = {name for name, p in policy.named_parameters() if p.requires_grad}
@@ -259,6 +260,84 @@ def test_online_closes_next_step_labels_and_updates_only_on_full_window_tick(pol
     for name, value in controller.updater.theta_base.items():
         torch.testing.assert_close(value, anchors[name], atol=0, rtol=0)
     assert not policy.idm.training
+
+
+@pytest.mark.parametrize("warmup", [40, 17])
+def test_fresh_batches_wait_for_warmup_and_preserve_learning_across_consumption(
+    policy, checkpoint_file, warmup
+):
+    env = _FakeEnv(np.random.default_rng(4))
+    wrapped = _FakeWrappedEnv(env, env._rng)
+    online = dict(_ONLINE, window_size=10, warmup_steps=warmup, update_interval=10)
+    session, _, _ = _make_session(policy, env, wrapped, online, checkpoint_file)
+    session.reset()
+    controller = session.controller
+    optimizer = controller.updater.optimizer
+    anchors = {name: value.clone() for name, value in controller.updater.theta_base.items()}
+    first_update = ((warmup + 9) // 10) * 10
+    expected_ticks = [first_update + offset for offset in (0, 10, 20)]
+    ticks = []
+    episode = None
+    for step in range(1, expected_ticks[-1] + 1):
+        previous_action = session.actions.detach().clone() if step > 1 else None
+        session.step_once()
+        samples = controller.collector.get_window()
+        if step in expected_ticks:
+            ticks.append(step)
+            assert session.last_update_stats["num_samples"] == 10
+            assert samples == ()
+            assert controller.updater.optimizer is optimizer
+            assert {int(state["step"].item()) for state in optimizer.state.values()} == {len(ticks)}
+        else:
+            assert session.last_update_stats is None
+            if step == first_update - 1:
+                assert [sample.timestep for sample in samples] == list(range(step - 10, step))
+                episode = samples[-1].episode_id
+            if step - 1 in expected_ticks:
+                assert len(samples) == 1
+                assert (samples[0].episode_id, samples[0].timestep) == (episode, step - 1)
+                torch.testing.assert_close(samples[0].snapshot.action_history[:, -1], previous_action)
+        for name, value in controller.updater.theta_base.items():
+            torch.testing.assert_close(value, anchors[name], atol=0, rtol=0)
+    assert ticks == expected_ticks
+    learned = {name: p.detach().clone() for name, p in policy.named_parameters()}
+    session.reset()
+    for step in range(1, first_update):
+        session.step_once()
+        assert session.last_update_stats is None
+        assert {int(state["step"].item()) for state in optimizer.state.values()} == {3}
+        if step == 1:
+            sample = controller.collector.get_window()[0]
+            assert (sample.episode_id, sample.timestep) == (episode + 1, 0)
+            torch.testing.assert_close(
+                sample.snapshot.action_history, torch.zeros_like(sample.snapshot.action_history)
+            )
+    for name, parameter in policy.named_parameters():
+        torch.testing.assert_close(parameter, learned[name], atol=0, rtol=0)
+    session.step_once()
+    assert session.last_update_stats["num_samples"] == 10
+    assert controller.collector.get_window() == ()
+    assert {int(state["step"].item()) for state in optimizer.state.values()} == {4}
+
+
+def test_failed_real_update_does_not_consume_batch(policy, checkpoint_file):
+    env = _FakeEnv(np.random.default_rng(5))
+    wrapped = _FakeWrappedEnv(env, env._rng)
+    session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
+    session.reset()
+    session.step_once()
+    session.step_once()
+    controller = session.controller
+    # Simulate a corrupted stored label, exercising the real updater's finite-loss guard.
+    controller.collector.get_window()[-1].target_action.fill_(float("nan"))
+    session.step_once()
+    before = {name: p.detach().clone() for name, p in policy.named_parameters()}
+    with pytest.raises(ValueError, match="loss must be finite"):
+        session.step_once()
+    assert [sample.timestep for sample in controller.collector.get_window()] == [1, 2, 3]
+    assert controller.updater.optimizer.state == {}
+    for name, parameter in policy.named_parameters():
+        torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("autoreset", [True, False])
@@ -274,9 +353,9 @@ def test_terminal_and_manual_reset_keep_learning_state_but_isolate_samples(
     session.reset()
     session.set_autoreset(autoreset)
     session.step_once()
+    old_episode = session.controller.collector.get_window()[-1].episode_id
     session.step_once()
     controller = session.controller
-    old_episode = controller.collector.get_window()[-1].episode_id
     params = {name: p.detach().clone() for name, p in policy.named_parameters()}
     anchors = {name: value.clone() for name, value in controller.updater.theta_base.items()}
     optimizer = controller.updater.optimizer
