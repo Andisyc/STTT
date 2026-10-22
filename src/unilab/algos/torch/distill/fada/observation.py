@@ -11,22 +11,6 @@ FADA_G1_ACTION_DIM = 29
 FADA_G1_COMMAND_DIM = 3
 
 
-def fada_g1_joint_position_offsets(
-    observation: torch.Tensor,
-    *,
-    observation_contract: str,
-) -> torch.Tensor:
-    """Read radian joint offsets from the final axis of a projected G1 state."""
-    if observation_contract != FADA_G1_STATE_OBSERVATION_CONTRACT:
-        raise ValueError("joint position offsets require g1_fada_state_v2")
-    if observation.ndim < 1 or observation.shape[-1] != FADA_G1_STATE_DIM:
-        raise ValueError(
-            f"joint position offsets require a final state axis of {FADA_G1_STATE_DIM}, "
-            f"got {tuple(observation.shape)}"
-        )
-    return observation[..., 6:35]
-
-
 def project_fada_g1_state(source_obs: np.ndarray) -> np.ndarray:
     """Project one G1 actor-observation batch into the non-leaking FADA state."""
 

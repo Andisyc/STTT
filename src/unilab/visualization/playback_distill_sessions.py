@@ -465,7 +465,6 @@ def create_fada_playback_session(
             controller = OnlineAdaptationController(
                 loaded.policy,
                 lora_config,
-                action_scale=env.cfg.control_config.action_scale,
                 window_size=online.window_size,
                 warmup_steps=online.warmup_steps,
                 gamma=online.gamma,
@@ -476,7 +475,8 @@ def create_fada_playback_session(
                 device=device_name,
             )
             log(
-                "Online adaptation enabled: objective=snapshot_regression, "
+                "Online adaptation enabled: objective=expert_trajectory_difference, "
+                f"prediction_horizon={loaded.policy.config.prediction_horizon}, "
                 f"window_size={online.window_size}, gamma={online.gamma}, sigma={online.sigma}, "
                 f"warmup_steps={online.warmup_steps}, update_interval={online.update_interval}, "
                 f"learning_rate={online.learning_rate}, "

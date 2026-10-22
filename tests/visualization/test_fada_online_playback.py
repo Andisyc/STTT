@@ -18,6 +18,8 @@ from unilab.algos.torch.distill.fada.model import (
     FADAArchitectureConfig,
     FADAPlannerIDMPolicy,
 )
+from unilab.algos.torch.distill.fada.online_data import FADATrajectoryPair
+from unilab.algos.torch.distill.fada.online_updater import build_expert_samples
 from unilab.visualization.playback_distill_sessions import create_fada_playback_session
 from unilab.visualization.playback_sessions import RslRlPlaybackConfig
 
@@ -26,7 +28,7 @@ OBS_DIM = 66
 ACTION_DIM = 29
 COMMAND_DIM = 3
 HISTORY = 4
-HORIZON = 3
+HORIZON = 6
 
 
 @pytest.fixture
@@ -222,43 +224,110 @@ def test_disabled_preserves_checkpoint_actions_and_parameters(policy, checkpoint
     assert list(fada_adapter_parameters(policy)) == []
 
 
-def test_online_closes_next_step_labels_and_updates_only_on_full_window_tick(policy, checkpoint_file):
+def test_frozen_base_survives_real_online_update_and_reset(policy, checkpoint_file):
+    env = _FakeEnv(np.random.default_rng(6))
+    wrapped = _FakeWrappedEnv(env, env._rng)
+    session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
+    session.reset()
+    controller = session.controller
+    base = controller.base_idm
+    assert all(not module.training for module in base.modules())
+    assert all(not parameter.requires_grad for parameter in base.parameters())
+    base_tensors = tuple(base.parameters()) + tuple(base.buffers())
+    online_tensors = tuple(policy.idm.parameters()) + tuple(policy.idm.buffers())
+    assert {
+        tensor.untyped_storage().data_ptr() for tensor in base_tensors if tensor.numel()
+    }.isdisjoint({
+        tensor.untyped_storage().data_ptr() for tensor in online_tensors if tensor.numel()
+    })
+    optimizer_ids = {
+        id(parameter)
+        for group in controller.updater.optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert all(id(parameter) not in optimizer_ids for parameter in base.parameters())
+    base_state = {name: value.detach().clone() for name, value in base.state_dict().items()}
+    adapters = tuple(fada_adapter_parameters(policy))
+    before = tuple(parameter.detach().clone() for parameter in adapters)
+    realized = []
+    for _ in range(HORIZON):
+        session.step_once()
+        realized.append(controller.project_observation(session.obs).clone())
+        assert session.last_update_stats is None
+    pair = controller.collector.get_window()[0]
+    snapshot = pair.snapshot
+    inputs = (snapshot.observation_history, snapshot.action_history, snapshot.nominal_future)
+    with torch.no_grad():
+        expected = base(*inputs).clone()
+        torch.testing.assert_close(policy.idm(*inputs), expected)
+    torch.testing.assert_close(pair.realized_future, torch.stack(realized, dim=1))
+    for _ in range(2):  # K=6, T=3, interval=2: first full-window tick is step 8.
+        session.step_once()
+    assert session.last_update_stats["num_samples"] == 3
+    assert any(not torch.equal(parameter, old) for parameter, old in zip(adapters, before))
+    with torch.no_grad():
+        torch.testing.assert_close(base(*inputs), expected, atol=0, rtol=0)
+    for name, value in base.state_dict().items():
+        torch.testing.assert_close(value, base_state[name], atol=0, rtol=0)
+    assert all(parameter.grad is None for parameter in base.parameters())
+    optimizer = controller.updater.optimizer
+    anchors = {name: value.clone() for name, value in controller.updater.theta_base.items()}
+    learned = tuple(parameter.detach().clone() for parameter in adapters)
+    adam_steps = [state["step"].clone() for state in optimizer.state.values()]
+    session.reset()
+    assert controller.base_idm is base and controller.updater.optimizer is optimizer
+    for parameter, old in zip(adapters, learned):
+        torch.testing.assert_close(parameter, old, atol=0, rtol=0)
+    for state, old in zip(optimizer.state.values(), adam_steps):
+        torch.testing.assert_close(state["step"], old, atol=0, rtol=0)
+    for name, value in controller.updater.theta_base.items():
+        torch.testing.assert_close(value, anchors[name], atol=0, rtol=0)
+    with torch.no_grad():
+        torch.testing.assert_close(base(*inputs), expected, atol=0, rtol=0)
+
+
+def test_online_uses_full_realized_future_and_keeps_expert_labels_static(policy, checkpoint_file):
     env = _FakeEnv(np.random.default_rng(2))
-    env.action_offset = 7.0  # Execution-side values must not replace the model snapshot.
-    env.cfg.control_config.action_scale = [0.25] + [0.5] * (ACTION_DIM - 1)
+    env.action_offset = 7.0  # Execution-side action echoes are not the regression target.
     wrapped = _FakeWrappedEnv(env, env._rng)
     session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
     session.reset()
     controller = session.controller
     before = {name: p.detach().clone() for name, p in policy.named_parameters()}
-    anchors = {name: value.clone() for name, value in controller.updater.theta_base.items()}
-    session.step_once()
-    first = controller.collector.get_window()[0]
-    error = first.snapshot.nominal_joint_positions - torch.from_numpy(wrapped._obs[:, 6:35].copy())
-    torch.testing.assert_close(first.joint_position_error, error)
-    expected_target = first.snapshot.action_snapshot + 0.05 * error / torch.tensor(
-        env.cfg.control_config.action_scale
-    )
-    torch.testing.assert_close(first.target_action, expected_target)
-    torch.testing.assert_close(first.snapshot.action_snapshot, session.actions)
-    assert not torch.allclose(first.target_action, torch.from_numpy(env.state.info["current_actions"]))
-    label = first.target_action.clone()
-    for _ in range(2):
-        assert session.last_update_stats is None
+    states, actions = [], []
+    for _ in range(HORIZON):
         session.step_once()
-    assert controller.collector.ready and session.last_update_stats is None
-    session.step_once()  # Full T=3, first update at valid step 4 (interval 2).
+        assert session.last_update_stats is None
+        states.append(controller.project_observation(session.obs).clone())
+        actions.append(session.actions.clone())
+    first = controller.collector.get_window()[0]
+    torch.testing.assert_close(first.realized_future, torch.stack(states, dim=1))
+    torch.testing.assert_close(first.snapshot.action_snapshot, actions[0])
+    samples = build_expert_samples(controller.base_idm, (first,), gamma=controller.gamma)
+    label = samples[0].target_action.clone()
+    matched = FADATrajectoryPair(
+        first.snapshot, first.snapshot.nominal_future, first.episode_id, first.timestep
+    )
+    matched_sample, = build_expert_samples(controller.base_idm, (matched,), gamma=controller.gamma)
+    torch.testing.assert_close(matched_sample.target_action, actions[0], atol=0, rtol=0)
+    assert not torch.allclose(label, actions[0] + env.action_offset)
+    session.step_once()
+    assert [pair.timestep for pair in controller.collector.get_window()] == [0, 1]
+    assert not controller.collector.ready and session.last_update_stats is None
+    session.step_once()
     stats = session.last_update_stats
-    assert stats is not None and stats["num_samples"] == 3
+    assert stats["num_samples"] == 3
     assert stats["loss"] == pytest.approx(stats["regression_loss"] + stats["anchor_loss"])
     assert controller.collector.get_window() == ()
-    torch.testing.assert_close(first.target_action, label, atol=0, rtol=0)
+    controller.updater.compute_loss(samples)
+    torch.testing.assert_close(samples[0].target_action, label, atol=0, rtol=0)
+    rebuilt, = build_expert_samples(controller.base_idm, (first,), gamma=controller.gamma)
+    torch.testing.assert_close(rebuilt.target_action, label, atol=0, rtol=0)
+    assert not samples[0].target_action.requires_grad
     changed = {name for name, p in policy.named_parameters() if not torch.equal(p, before[name])}
     trainable = {name for name, p in policy.named_parameters() if p.requires_grad}
     assert changed and changed <= trainable
     assert all(name.startswith("idm.") for name in trainable)
-    for name, value in controller.updater.theta_base.items():
-        torch.testing.assert_close(value, anchors[name], atol=0, rtol=0)
     assert not policy.idm.training
 
 
@@ -278,9 +347,10 @@ def test_fresh_batches_wait_for_warmup_and_preserve_learning_across_consumption(
     expected_ticks = [first_update + offset for offset in (0, 10, 20)]
     ticks = []
     episode = None
+    actions = []
     for step in range(1, expected_ticks[-1] + 1):
-        previous_action = session.actions.detach().clone() if step > 1 else None
         session.step_once()
+        actions.append(session.actions.detach().clone())
         samples = controller.collector.get_window()
         if step in expected_ticks:
             ticks.append(step)
@@ -291,12 +361,14 @@ def test_fresh_batches_wait_for_warmup_and_preserve_learning_across_consumption(
         else:
             assert session.last_update_stats is None
             if step == first_update - 1:
-                assert [sample.timestep for sample in samples] == list(range(step - 10, step))
+                last_origin = step - HORIZON
+                assert [sample.timestep for sample in samples] == list(range(last_origin - 9, last_origin + 1))
                 episode = samples[-1].episode_id
             if step - 1 in expected_ticks:
                 assert len(samples) == 1
-                assert (samples[0].episode_id, samples[0].timestep) == (episode, step - 1)
-                torch.testing.assert_close(samples[0].snapshot.action_history[:, -1], previous_action)
+                origin = step - HORIZON
+                assert (samples[0].episode_id, samples[0].timestep) == (episode, origin)
+                torch.testing.assert_close(samples[0].snapshot.action_history[:, -1], actions[origin - 1])
         for name, value in controller.updater.theta_base.items():
             torch.testing.assert_close(value, anchors[name], atol=0, rtol=0)
     assert ticks == expected_ticks
@@ -306,7 +378,7 @@ def test_fresh_batches_wait_for_warmup_and_preserve_learning_across_consumption(
         session.step_once()
         assert session.last_update_stats is None
         assert {int(state["step"].item()) for state in optimizer.state.values()} == {3}
-        if step == 1:
+        if step == HORIZON:
             sample = controller.collector.get_window()[0]
             assert (sample.episode_id, sample.timestep) == (episode + 1, 0)
             torch.testing.assert_close(
@@ -325,16 +397,15 @@ def test_failed_real_update_does_not_consume_batch(policy, checkpoint_file):
     wrapped = _FakeWrappedEnv(env, env._rng)
     session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
     session.reset()
-    session.step_once()
-    session.step_once()
-    controller = session.controller
-    # Simulate a corrupted stored label, exercising the real updater's finite-loss guard.
-    controller.collector.get_window()[-1].target_action.fill_(float("nan"))
-    session.step_once()
-    before = {name: p.detach().clone() for name, p in policy.named_parameters()}
-    with pytest.raises(ValueError, match="loss must be finite"):
+    for _ in range(7):
         session.step_once()
-    assert [sample.timestep for sample in controller.collector.get_window()] == [1, 2, 3]
+    controller = session.controller
+    # Corrupt stored evidence; the real expert forward must fail without consuming the batch.
+    controller.collector.get_window()[-1].realized_future.fill_(float("nan"))
+    before = {name: p.detach().clone() for name, p in policy.named_parameters()}
+    with pytest.raises(ValueError, match="finite"):
+        session.step_once()
+    assert [sample.timestep for sample in controller.collector.get_window()] == [0, 1, 2]
     assert controller.updater.optimizer.state == {}
     for name, parameter in policy.named_parameters():
         torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
@@ -352,7 +423,8 @@ def test_terminal_and_manual_reset_keep_learning_state_but_isolate_samples(
     session, _, _ = _make_session(policy, env, wrapped, online, checkpoint_file)
     session.reset()
     session.set_autoreset(autoreset)
-    session.step_once()
+    for _ in range(HORIZON):
+        session.step_once()
     old_episode = session.controller.collector.get_window()[-1].episode_id
     session.step_once()
     controller = session.controller
@@ -372,7 +444,8 @@ def test_terminal_and_manual_reset_keep_learning_state_but_isolate_samples(
         assert controller.collector.get_window() == ()
         assert session.last_update_stats is None
         session.reset()
-    session.step_once()
+    for _ in range(HORIZON):
+        session.step_once()
     sample = controller.collector.get_window()[0]
     assert (sample.episode_id, sample.timestep) == (old_episode + 1, 0)
     torch.testing.assert_close(
@@ -392,14 +465,12 @@ def test_terminal_and_manual_reset_keep_learning_state_but_isolate_samples(
         torch.testing.assert_close(parameter, params[name], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("failure", ["scale", "wrapper", "io", "adapted"])
+@pytest.mark.parametrize("failure", ["wrapper", "io", "adapted"])
 def test_failed_online_construction_releases_environment(policy, checkpoint_file, failure):
     env = _FakeEnv(np.random.default_rng(4))
     wrapped = _FakeWrappedEnv(env, env._rng)
     deps = _deps(policy, env, wrapped, checkpoint_file)
-    if failure == "scale":
-        env.cfg.control_config.action_scale = 0.0
-    elif failure == "wrapper":
+    if failure == "wrapper":
         def fail_wrapper(*args, **kwargs):
             raise ValueError("wrapper construction failed")
         deps["wrapper_cls"] = fail_wrapper

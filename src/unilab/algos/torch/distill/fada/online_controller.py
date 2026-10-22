@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import math
-from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
 
-import numpy as np
 import torch
 
 from unilab.algos.torch.distill.fada.adaptation import FADALoRAConfig
 from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy
-from unilab.algos.torch.distill.fada.online_collector import OnlineSnapshotCollector
-from unilab.algos.torch.distill.fada.online_updater import OnlineSnapshotUpdater
+from unilab.algos.torch.distill.fada.online_collector import OnlineTrajectoryCollector
+from unilab.algos.torch.distill.fada.online_updater import OnlineSnapshotUpdater, build_expert_samples
 from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
 
 
@@ -64,7 +63,6 @@ class OnlineAdaptationController:
         policy: FADAPlannerIDMPolicy,
         lora_config: FADALoRAConfig,
         *,
-        action_scale: float | Sequence[float] | np.ndarray | torch.Tensor,
         window_size: int = 10,
         warmup_steps: int = 40,
         gamma: float = 0.05,
@@ -81,9 +79,8 @@ class OnlineAdaptationController:
             lora_alpha=lora_config.alpha, lora_dropout=lora_config.dropout,
         )
         self.device = torch.device(device)
-        self.collector = OnlineSnapshotCollector(
-            policy.config, window_size=window_size, gamma=gamma, action_scale=action_scale
-        )
+        self.collector = OnlineTrajectoryCollector(policy.config, window_size=window_size)
+        self.base_idm = copy.deepcopy(policy.idm).eval().requires_grad_(False)
         self.updater = OnlineSnapshotUpdater(
             policy, lora_config, sigma=sigma, lr=lr, max_grad_norm=max_grad_norm
         )
@@ -92,6 +89,7 @@ class OnlineAdaptationController:
         self.playback = FADAPlaybackController(self.policy, device=self.device)
         self.update_interval = int(update_interval)
         self.warmup_steps = int(warmup_steps)
+        self.gamma = float(gamma)
         self._step_count = 0
         self._collection_suspended = False
 
@@ -115,7 +113,6 @@ class OnlineAdaptationController:
         next_observation: Any,
         done: Any | None = None,
     ) -> dict[str, float | int] | None:
-        """Close t with t+1; the shared hook's executed action is not the label."""
         if self._collection_suspended:
             return None
         if done is not None and bool(torch.as_tensor(done).any().item()):
@@ -130,7 +127,10 @@ class OnlineAdaptationController:
             and self._step_count % self.update_interval == 0
             and self.collector.ready
         ):
-            stats = self.updater.update(self.collector.get_window())
+            samples = build_expert_samples(
+                self.base_idm, self.collector.get_window(), gamma=self.gamma
+            )
+            stats = self.updater.update(samples)
             self.collector.clear_window()
             return stats
         return None

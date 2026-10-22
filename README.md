@@ -27,25 +27,144 @@ question, its contracts, implementation evidence, and current design transition.
 `training.play_checkpoint_path` 指定真实 Planner-IDM checkpoint。它与下述冻结权重的
 ICE-Cal 路径不同：Planner 和 IDM 基础权重冻结，只有 IDM LoRA 接受在线更新。
 
-- `online_adaptation.enabled=false` 保持无在线更新的 baseline；`true` 启用快照标签回归。
-- 在 t 保存实际推理的历史输入、Planner 标称未来和首动作，在 t+1 用标称未来第一帧
-  与真实关节位置偏移的差值构造固定动作标签。两边均为相对默认姿态的弧度偏移；
-  用环境实际 `action_scale` 换算动作修正，不使用执行后的动作作为监督标签。
+- `online_adaptation.enabled=false` 保持无在线更新的 baseline；`true` 启用冻结基座轨迹差分标签。
+- 在 t 保存实际推理的历史输入、完整 Planner 标称未来 `Y_nom` 和在线首动作快照；
+  到 t+K 收齐同一时间段的真实状态轨迹 `Y_exec`。K 来自 checkpoint 的预测长度
+  (当前模型 K=6)，不是训练批量 T；终止/reset 或命令切换不能拼成跨边界轨迹。
+- 在更新批次形成时，冻结基座对同一历史分别输入 `Y_nom` 与 `Y_exec`，取首动作作
+  `nom-exec` 差分。固定目标为 `U_snapshot + gamma * delta`，不使用单步关节误差、
+  不除 `action_scale`，不随在线参数重算；环境执行端的动作缩放保持不变。
+- 基座在在线 LoRA 注入前独立复制，只复制 IDM，eval/关闭梯度，不进入优化器。
 - 默认 `window_size=10`、`warmup_steps=40`、`update_interval=10`，
-  `gamma=0.05`、`sigma=1e-4`。控制周期为 0.02s 时，第 40 步 (0.8s) 首次更新，
-  使用启动阶段最后 10 条样本；之后第 50、60……步 (每 0.2s) 使用 10 条新样本更新。
-  成功后仅清空训练样本，不重置推理历史或已学状态；失败则保留样本并抛出异常。
-  非默认配置须同时满足 warmup、更新周期和满批条件；不等待负重挂载。
+  `gamma=0.05`、`sigma=1e-4`。控制周期 0.02s、K=6 时，第 40 步 (0.8s) 首次更新，
+  使用最后 10 条成熟轨迹；此后第 50、60……步 (每 0.2s) 消费 10 条新成熟轨迹。
+  成功只清成熟训练批，不清在途轨迹或推理历史；失败保留批次并抛出异常。
+  非默认配置须同时满足 warmup、更新周期和满批条件，不等待负重挂载。
   这些数值是试验初值，不代表已证实的稳定性或适应效果。
 - 损失为窗口内首动作误差平方范数的 `1/(2T)` 均值，加相对部署初始 LoRA 参数的
   显式 L2 锚定；不对动作维再平均。更新时关闭 dropout 但开启梯度，使用 Adam，
   不通过 AdamW 的默认权重衰减替代非零参数锚点。
-- reset 清空历史、待闭合样本和训练窗口，并重新计算 warmup，但保留已学 LoRA、
-  锚点与优化器状态。
+- reset 清空推理历史、在途轨迹和成熟窗口，并重新计算 warmup，但保留已学 LoRA、
+  冻结基座、锚点与优化器状态。
   关闭 autoreset 时，终止后仍可继续物理步进，但暂停采集/更新，直到显式 reset。
 - 旧在线 `lambda_forget` 配置和 `scripts/test_online_adaptation.py` 手动入口已移除。
   使用 `uv run --frozen --no-sync python scripts/play_fada_online.py`，启动日志应包含
-  `objective=snapshot_regression`。视频录制、负重事件和离线 FADA 路径保持原接口。
+  `objective=expert_trajectory_difference`。视频录制、负重事件和离线 FADA 路径保持原接口。
+
+### Linux/CUDA 服务器后台录制
+
+以下沿用此前服务器的仓库和 checkpoint 示例路径，本轮未连接服务器核验。
+如实际路径不同，只调整 `cd` 和 `training.play_checkpoint_path`。
+命令使用已经配置好的 uv 环境，不创建环境、不安装依赖。
+`LD_PRELOAD` 沿用此前 Linux x86_64 服务器的进程级 libgcc 设置，不是跨平台通用配置。
+
+两组均从第 0 秒向左肩挂载 3kg，固定前进命令为 0.4m/s，侧后方跟随视角，
+录制 120 秒仿真时间。命令显式覆盖 profile 默认的 30 秒挂载延迟，不修改 profile。
+分别运行两组；除在线开关与产物命名外，checkpoint、物理和录制条件保持一致。
+视频和日志名带时间戳；重复启动前确认名称不同，避免覆盖已有结果。
+
+#### 开启基座轨迹差分在线更新
+
+```bash
+cd /ssd1/cyx/TTT
+mkdir -p video logs
+TTT_RUN_ID="$(date +%Y%m%d-%H%M%S)"
+
+nohup env \
+  LD_PRELOAD=/lib/x86_64-linux-gnu/libgcc_s.so.1 \
+  MUJOCO_GL=egl \
+  PYTHONUNBUFFERED=1 \
+  PYTHONPATH="$PWD/src" \
+  uv run --frozen --no-sync python scripts/play_fada_online.py \
+  task=g1_walk_flat/mujoco \
+  recording_profile=straight_payload \
+  training.device=cuda \
+  training.play_checkpoint_path=/ssd1/cyx/FADA_Unofficial/model/v024_checkpoint/planner_idm_close_some_dr_v001.pt \
+  env.runtime_payload.enabled=true \
+  env.runtime_payload.added_mass_kg=3.0 \
+  env.runtime_payload.attach_time_s=0.0 \
+  online_adaptation.enabled=true \
+  online_adaptation.window_size=10 \
+  online_adaptation.warmup_steps=40 \
+  online_adaptation.update_interval=10 \
+  online_adaptation.gamma=0.05 \
+  online_adaptation.sigma=1e-4 \
+  online_adaptation.learning_rate=1e-4 \
+  video_recording.enabled=true \
+  video_recording.duration_s=120.0 \
+  video_recording.progress_interval_s=1.0 \
+  video_recording.output_path="$PWD/video/left_shoulder_expert_${TTT_RUN_ID}.mp4" \
+  > "$PWD/logs/left_shoulder_expert_${TTT_RUN_ID}.log" 2>&1 &
+```
+
+在启动所在 shell 查看本次日志：
+
+```bash
+tail -f "/ssd1/cyx/TTT/logs/left_shoulder_expert_${TTT_RUN_ID}.log"
+```
+
+#### 相同负重、关闭在线更新的 baseline
+
+这里的 baseline 仍然挂载 3kg，不是无负重 baseline。
+
+```bash
+cd /ssd1/cyx/TTT
+mkdir -p video logs
+BASELINE_RUN_ID="$(date +%Y%m%d-%H%M%S)"
+
+nohup env \
+  LD_PRELOAD=/lib/x86_64-linux-gnu/libgcc_s.so.1 \
+  MUJOCO_GL=egl \
+  PYTHONUNBUFFERED=1 \
+  PYTHONPATH="$PWD/src" \
+  uv run --frozen --no-sync python scripts/play_fada_online.py \
+  task=g1_walk_flat/mujoco \
+  recording_profile=straight_payload \
+  training.device=cuda \
+  training.play_checkpoint_path=/ssd1/cyx/FADA_Unofficial/model/v024_checkpoint/planner_idm_close_some_dr_v001.pt \
+  env.runtime_payload.enabled=true \
+  env.runtime_payload.added_mass_kg=3.0 \
+  env.runtime_payload.attach_time_s=0.0 \
+  online_adaptation.enabled=false \
+  online_adaptation.window_size=10 \
+  online_adaptation.warmup_steps=40 \
+  online_adaptation.update_interval=10 \
+  online_adaptation.gamma=0.05 \
+  online_adaptation.sigma=1e-4 \
+  online_adaptation.learning_rate=1e-4 \
+  video_recording.enabled=true \
+  video_recording.duration_s=120.0 \
+  video_recording.progress_interval_s=1.0 \
+  video_recording.output_path="$PWD/video/left_shoulder_baseline_${BASELINE_RUN_ID}.mp4" \
+  > "$PWD/logs/left_shoulder_baseline_${BASELINE_RUN_ID}.log" 2>&1 &
+```
+
+在该启动 shell 查看本次日志：
+
+```bash
+tail -f "/ssd1/cyx/TTT/logs/left_shoulder_baseline_${BASELINE_RUN_ID}.log"
+```
+
+`Ctrl-C` 退出 `tail` 不会停止后台录制。产物分别位于仓库的 `video/` 和 `logs/`，
+以命令中的时间戳对应同一次运行。
+
+#### 启动、进度与完成标准
+
+- 新方法启动日志应包含 `objective=expert_trajectory_difference`，以及实际
+  `prediction_horizon`、`window_size`、`warmup_steps`、`update_interval`。
+  K 以加载 checkpoint 后的日志为准；在 K=6、0.02s 控制周期、没有提前终止的
+  episode 中，默认在第 40/50/60……步更新。
+- `Progress: step=当前步/总步` 同时显示仿真时间与帧数；`Update` 表示一次优化完成。
+  进度按墙钟间隔在控制步完成后报告，不保证长耗时步骤内部每秒打印。
+- baseline 应显示 `Online adaptation disabled`，视频更新计数保持 0，
+  但同样应显示 `PAYLOAD +3kg`。
+- 最后出现 `Video saved:` 才表示录制流程完成；文件已经存在或
+  `Finalizing MP4 encoding...` 都不代表编码已经结束。
+- 视频中的 `resets` 增长表示轨迹被终止/重置，不要把重置后的站立当成在线恢复。
+  更新次数增加或 loss 较低也不能单独证明负重适应成功。
+
+当前证据是第三步的真实小型网络与正式 factory/session 离线 smoke。
+本节命令尚未在服务器实际启动，真实 checkpoint 下的录制与负重效果仍未验证。
 
 
 ## Current status

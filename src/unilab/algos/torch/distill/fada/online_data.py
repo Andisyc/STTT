@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 
 import torch
 
-from unilab.algos.torch.distill.fada.observation import (
-    FADA_G1_STATE_OBSERVATION_CONTRACT,
-    fada_g1_joint_position_offsets,
-)
+from unilab.algos.torch.distill.fada.observation import FADA_G1_STATE_DIM
 
 
 @dataclass(frozen=True)
@@ -29,30 +27,58 @@ class FADAInferenceSnapshot:
         ):
             object.__setattr__(self, name, getattr(self, name).detach().clone())
 
-    @property
-    def nominal_joint_positions(self) -> torch.Tensor:
-        """Next-step joint offsets in radians, not absolute position commands."""
-        return fada_g1_joint_position_offsets(
-            self.nominal_future[:, 0],
-            observation_contract=FADA_G1_STATE_OBSERVATION_CONTRACT,
-        )
 
 
 @dataclass(frozen=True)
-class FADAOnlineSample:
-    """A snapshot closed by its next observation; labels are never recomputed."""
+class FADATrajectoryPair:
+    """Own a complete realized future aligned to an inference snapshot's origin.
+
+    Fields are frozen; consumers must also avoid in-place tensor mutation.
+    The collector owns causal alignment across the prediction horizon.
+    """
 
     snapshot: FADAInferenceSnapshot
-    joint_position_error: torch.Tensor
-    target_action: torch.Tensor
+    realized_future: torch.Tensor
     episode_id: int
     timestep: int
 
     def __post_init__(self) -> None:
-        for name in ("joint_position_error", "target_action"):
+        for name in ("episode_id", "timestep"):
             value = getattr(self, name)
-            if value.shape != self.snapshot.action_snapshot.shape:
-                raise ValueError(f"{name} must match the snapshot action shape")
-            object.__setattr__(self, name, value.detach().clone())
-        if self.episode_id < 0 or self.timestep < 0:
-            raise ValueError("online sample episode_id and timestep must be non-negative")
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+                raise ValueError(f"trajectory {name} must be a non-negative integer")
+        nominal = self.snapshot.nominal_future
+        if (
+            nominal.ndim != 3
+            or nominal.shape[0] != 1
+            or nominal.shape[1] < 1
+            or nominal.shape[2] != FADA_G1_STATE_DIM
+            or self.realized_future.shape != nominal.shape
+        ):
+            raise ValueError("trajectory futures must share shape (1, K, 66) with K > 0")
+        if (
+            self.realized_future.dtype != nominal.dtype
+            or self.realized_future.device != nominal.device
+        ):
+            raise ValueError("trajectory futures must share dtype and device")
+        if not bool(torch.isfinite(nominal).all()) or not bool(torch.isfinite(self.realized_future).all()):
+            raise ValueError("trajectory futures must be finite")
+        object.__setattr__(self, "realized_future", self.realized_future.detach().clone())
+
+
+@dataclass(frozen=True)
+class FADAOnlineSample:
+    """A trajectory pair with an owned, fixed action-space regression target."""
+
+    trajectory: FADATrajectoryPair
+    target_action: torch.Tensor
+
+    def __post_init__(self) -> None:
+        reference = self.trajectory.snapshot.action_snapshot
+        if self.target_action.shape != reference.shape:
+            raise ValueError("expert target must match the snapshot action shape")
+        if self.target_action.dtype != reference.dtype or self.target_action.device != reference.device:
+            raise ValueError("expert target must share the snapshot action dtype and device")
+        if not bool(torch.isfinite(self.target_action).all()):
+            raise ValueError("expert target must be finite")
+        object.__setattr__(self, "target_action", self.target_action.detach().clone())

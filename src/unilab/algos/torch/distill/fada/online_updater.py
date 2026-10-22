@@ -12,8 +12,42 @@ from unilab.algos.torch.distill.fada.adaptation import (
     fada_adapter_named_parameters,
     inject_fada_idm_lora,
 )
-from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy
-from unilab.algos.torch.distill.fada.online_data import FADAOnlineSample
+from unilab.algos.torch.distill.fada.model import FADAInverseDynamicsModel, FADAPlannerIDMPolicy
+from unilab.algos.torch.distill.fada.online_data import FADAOnlineSample, FADATrajectoryPair
+
+
+@torch.no_grad()
+def build_expert_samples(
+    base_idm: FADAInverseDynamicsModel,
+    trajectories: Sequence[FADATrajectoryPair],
+    *,
+    gamma: float,
+) -> tuple[FADAOnlineSample, ...]:
+    """Translate matched futures through the frozen base, preserving executed snapshots."""
+    if not trajectories:
+        raise ValueError("expert labels require a non-empty trajectory window")
+    if not math.isfinite(gamma) or gamma < 0.0:
+        raise ValueError("gamma must be finite and non-negative")
+    if any(module.training for module in base_idm.modules()) or any(
+        parameter.requires_grad for parameter in base_idm.parameters()
+    ):
+        raise ValueError("base IDM must be frozen and in eval mode")
+    reference = next(base_idm.parameters())
+    snapshots = tuple(pair.snapshot for pair in trajectories)
+    observations = torch.cat([snapshot.observation_history for snapshot in snapshots]).to(reference)
+    actions = torch.cat([snapshot.action_history for snapshot in snapshots]).to(reference)
+    nominal = torch.cat([snapshot.nominal_future for snapshot in snapshots]).to(reference)
+    realized = torch.cat([pair.realized_future for pair in trajectories]).to(reference)
+    executed = torch.cat([snapshot.action_snapshot for snapshot in snapshots]).to(reference)
+    base_nominal = base_idm(observations, actions, nominal)[:, 0]
+    base_realized = base_idm(observations, actions, realized)[:, 0]
+    if base_nominal.shape != executed.shape or base_realized.shape != executed.shape:
+        raise ValueError("expert predictions must match first-action snapshots")
+    targets = executed + gamma * (base_nominal - base_realized)
+    return tuple(
+        FADAOnlineSample(pair, target[None].to(pair.snapshot.action_snapshot))
+        for pair, target in zip(trajectories, targets)
+    )
 
 
 class OnlineSnapshotUpdater:
@@ -63,13 +97,13 @@ class OnlineSnapshotUpdater:
             raise ValueError("snapshot regression requires a non-empty sample window")
         reference = self._parameters[0]
         observations = torch.cat(
-            [sample.snapshot.observation_history for sample in samples], dim=0
+            [sample.trajectory.snapshot.observation_history for sample in samples], dim=0
         ).to(reference)
         actions = torch.cat(
-            [sample.snapshot.action_history for sample in samples], dim=0
+            [sample.trajectory.snapshot.action_history for sample in samples], dim=0
         ).to(reference)
         futures = torch.cat(
-            [sample.snapshot.nominal_future for sample in samples], dim=0
+            [sample.trajectory.snapshot.nominal_future for sample in samples], dim=0
         ).to(reference)
         targets = torch.cat(
             [sample.target_action for sample in samples], dim=0
