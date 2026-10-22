@@ -344,7 +344,7 @@ class FADAPlaybackSession(RslRlPlaybackSession):
 
     def __init__(self, *, controller: Any | None, **kwargs: Any) -> None:
         self.controller = None
-        self.last_update_stats: dict[str, float] | None = None
+        self.last_update_stats: dict[str, float | int] | None = None
         super().__init__(policy=None, **kwargs)
         if controller is not None:
             self.bind_controller(controller)
@@ -371,13 +371,13 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         actions = self._build_actions()
         self.actions = actions
         self.obs, _reward, done, _info = self.wrapped_env.step(actions)
-        # B2: post-step 回调拿到真实执行动作与下一 observation, 在 autoreset history
-        # reset 之前完成在线收集/更新; autoreset 关闭时不传 done, 由 controller 保留历史.
+        # Terminal observations are never labels, even when physics autoreset is off.
+        # Only an actual reset resumes collection after a terminal transition.
         if self.controller is not None:
             self.last_update_stats = self.controller.on_env_step(
                 executed_action=self.info.get("current_actions"),
                 next_observation=self.obs,
-                done=done if self.autoreset_enabled else None,
+                done=done,
             )
             if self.autoreset_enabled:
                 self.controller.reset(done)

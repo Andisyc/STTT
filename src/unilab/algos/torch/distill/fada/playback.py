@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, overload
 
 import torch
 
-from unilab.algos.torch.distill.fada.model import FADAArchitectureConfig
-from unilab.algos.torch.distill.fada.observation import project_fada_observation_tensor
+from unilab.algos.torch.distill.fada.model import FADAArchitectureConfig, PlannerIDMOutput
+from unilab.algos.torch.distill.fada.observation import (
+    FADA_G1_STATE_OBSERVATION_CONTRACT,
+    project_fada_observation_tensor,
+)
+from unilab.algos.torch.distill.fada.online_data import FADAInferenceSnapshot
 
 
 class FADAPlaybackActionOutput(Protocol):
@@ -86,7 +90,32 @@ class FADAPlaybackController:
 
         return self._act(self._projected_observation_tensor(observation), command)
 
-    def _act(self, obs: torch.Tensor, command: Any) -> torch.Tensor:
+    @torch.no_grad()
+    def act_projected_with_snapshot(
+        self, observation: Any, command: Any
+    ) -> tuple[torch.Tensor, FADAInferenceSnapshot]:
+        """Execute once and capture the same query without changing plain playback."""
+        return self._act(
+            self._projected_observation_tensor(observation),
+            command,
+            capture_snapshot=True,
+        )
+
+    @overload
+    def _act(
+        self, obs: torch.Tensor, command: Any, *, capture_snapshot: Literal[False] = False
+    ) -> torch.Tensor: ...
+
+    @overload
+    def _act(
+        self, obs: torch.Tensor, command: Any, *, capture_snapshot: Literal[True]
+    ) -> tuple[torch.Tensor, FADAInferenceSnapshot]: ...
+
+    def _act(
+        self, obs: torch.Tensor, command: Any, *, capture_snapshot: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, FADAInferenceSnapshot]:
+        if capture_snapshot and self.config.observation_contract != FADA_G1_STATE_OBSERVATION_CONTRACT:
+            raise ValueError("inference snapshots require g1_fada_state_v2")
         cmd = torch.as_tensor(command, dtype=torch.float32, device=self.device)
         if cmd.ndim == 1:
             cmd = cmd.unsqueeze(0)
@@ -105,7 +134,8 @@ class FADAPlaybackController:
         assert self._action_history is not None
 
         # B3: 查询 Planner-IDM 并仅记录/返回第一动作, 为下一 control step 形成执行 history.
-        action = self.policy(self._observation_history, self._action_history, cmd).action.detach()
+        output = self.policy(self._observation_history, self._action_history, cmd)
+        action = output.action.detach()
         expected_action_shape = (obs.shape[0], self.config.action_dim)
         if tuple(action.shape) != expected_action_shape:
             raise ValueError(
@@ -114,7 +144,19 @@ class FADAPlaybackController:
             )
         if not bool(torch.isfinite(action).all()):
             raise ValueError("FADA playback policy produced non-finite actions")
+        if capture_snapshot:
+            if not isinstance(output, PlannerIDMOutput):
+                raise TypeError("inference snapshots require native PlannerIDMOutput")
+            snapshot = FADAInferenceSnapshot(
+                observation_history=self._observation_history,
+                action_history=self._action_history,
+                command=cmd,
+                nominal_future=output.predicted_future,
+                action_snapshot=action,
+            )
         self._action_history = torch.cat((self._action_history[:, 1:], action.unsqueeze(1)), dim=1)
+        if capture_snapshot:
+            return action, snapshot
         return action
 
     def _observation_tensor(self, observation: Any) -> torch.Tensor:

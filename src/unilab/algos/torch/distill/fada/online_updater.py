@@ -2,123 +2,109 @@
 
 from __future__ import annotations
 
-from typing import Any
+import math
+from collections.abc import Sequence
 
-import numpy as np
 import torch
-from torch import nn
 
 from unilab.algos.torch.distill.fada.adaptation import (
     FADALoRAConfig,
-    fada_adaptation_loss,
-    fada_adapter_parameters,
+    fada_adapter_named_parameters,
     inject_fada_idm_lora,
 )
 from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy
-from unilab.algos.torch.distill.fada.target_data import FADATargetBatch
-from unilab.algos.torch.distill.fada.windows import FADACausalWindow
+from unilab.algos.torch.distill.fada.online_data import FADAOnlineSample
 
 
-class OnlineAdaptationUpdater:
-    """Update LoRA-IDM with exponential forgetting on streaming windows."""
+class OnlineSnapshotUpdater:
+    """Regress fixed snapshot labels with an explicit deployment-parameter anchor.
+
+    The collector owns the window. Each call consumes it without retaining,
+    draining, or rebuilding samples; only IDM LoRA parameters are optimized.
+    """
 
     def __init__(
         self,
         policy: FADAPlannerIDMPolicy,
         lora_config: FADALoRAConfig,
         *,
-        lambda_forget: float = 0.99,
+        sigma: float,
         lr: float = 1e-4,
         max_grad_norm: float | None = 1.0,
     ) -> None:
-        if not 0.0 < lambda_forget <= 1.0:
-            raise ValueError(f"lambda_forget must be in (0, 1], got {lambda_forget}")
-        
-        # Auto-discover LoRA targets if not provided
-        if not lora_config.target_modules:
-            from unilab.algos.torch.distill.fada.adaptation import _discover_lora_targets
-            discovered = _discover_lora_targets(policy)
-            from dataclasses import replace
-            lora_config = replace(lora_config, target_modules=discovered)
-        
+        if not math.isfinite(sigma) or sigma < 0.0:
+            raise ValueError("sigma must be finite and non-negative")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be finite and positive")
+        if max_grad_norm is not None and (
+            not math.isfinite(max_grad_norm) or max_grad_norm <= 0.0
+        ):
+            raise ValueError("max_grad_norm must be finite and positive or None")
+
         adapted = inject_fada_idm_lora(policy, lora_config)
         self.policy = adapted.policy
         self.lora_config = adapted.lora_config
-        self.lambda_forget = float(lambda_forget)
+        self.sigma = float(sigma)
         self.max_grad_norm = max_grad_norm
-        
-        adapter_params = list(fada_adapter_parameters(self.policy))
-        self.optimizer = torch.optim.Adam(adapter_params, lr=lr)
-        self._window_buffer: list[FADACausalWindow] = []
-
-    def append_window(self, window: FADACausalWindow) -> None:
-        """Add window to buffer."""
-        self._window_buffer.append(window)
-
-    def update(self) -> dict[str, float] | None:
-        """Perform one exponential-weighted update if buffer non-empty."""
-        if not self._window_buffer:
-            return None
-
-        was_training = self.policy.idm.training
-        self.policy.idm.train()
-        try:
-            self.optimizer.zero_grad(set_to_none=True)
-
-            total_loss = self._exponential_weighted_loss()
-            total_loss.backward()
-
-            if self.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    fada_adapter_parameters(self.policy),
-                    self.max_grad_norm
-                )
-
-            self.optimizer.step()
-        finally:
-            if not was_training:
-                self.policy.idm.eval()
-
-        stats = {
-            "loss": float(total_loss.detach()),
-            "num_windows": len(self._window_buffer),
+        self._adapters = dict(fada_adapter_named_parameters(self.policy))
+        self._parameters = tuple(self._adapters.values())
+        self.theta_base = {
+            name: parameter.detach().clone()
+            for name, parameter in self._adapters.items()
         }
-        self._window_buffer.clear()
-        return stats
+        self.optimizer = torch.optim.Adam(self._parameters, lr=lr, weight_decay=0.0)
 
-    def _exponential_weighted_loss(self) -> torch.Tensor:
-        """Compute exponential-weighted loss over buffered windows."""
-        n = len(self._window_buffer)
-        weights = [self.lambda_forget ** (n - 1 - i) for i in range(n)]
-        weight_sum = sum(weights)
-        
-        total_loss = torch.tensor(0.0, device=next(self.policy.parameters()).device)
-        for window, weight in zip(self._window_buffer, weights):
-            batch = self._window_to_batch(window)
-            loss = fada_adaptation_loss(self.policy, batch)
-            total_loss = total_loss + weight * loss
-        
-        return total_loss / weight_sum
+    @torch.enable_grad()
+    def compute_loss(
+        self, samples: Sequence[FADAOnlineSample]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return total, per-sample squared-norm regression, and L2 anchor losses."""
+        if not samples:
+            raise ValueError("snapshot regression requires a non-empty sample window")
+        reference = self._parameters[0]
+        observations = torch.cat(
+            [sample.snapshot.observation_history for sample in samples], dim=0
+        ).to(reference)
+        actions = torch.cat(
+            [sample.snapshot.action_history for sample in samples], dim=0
+        ).to(reference)
+        futures = torch.cat(
+            [sample.snapshot.nominal_future for sample in samples], dim=0
+        ).to(reference)
+        targets = torch.cat(
+            [sample.target_action for sample in samples], dim=0
+        ).to(reference)
 
-    def _window_to_batch(self, window: FADACausalWindow) -> FADATargetBatch:
-        """Convert single window to FADATargetBatch on the policy device/dtype."""
-        reference = next(self.policy.parameters())
-        device = reference.device
-        dtype = reference.dtype
+        modes = tuple((module, module.training) for module in self.policy.idm.modules())
+        self.policy.idm.eval()
+        try:
+            predicted = self.policy.idm(observations, actions, futures)[:, 0]
+            if predicted.shape != targets.shape:
+                raise ValueError("snapshot targets must match first-action predictions")
+            regression = 0.5 * (predicted - targets).square().sum(dim=-1).mean()
+            anchor = reference.new_zeros(())
+            for name, parameter in self._adapters.items():
+                anchor = anchor + (parameter - self.theta_base[name]).square().sum()
+            anchor = (0.5 * self.sigma) * anchor
+            return regression + anchor, regression, anchor
+        finally:
+            for module, training in modes:
+                module.training = training
 
-        def _tensor(values: np.ndarray) -> torch.Tensor:
-            return torch.as_tensor(
-                np.asarray(values), dtype=torch.float32
-            ).unsqueeze(0).to(device=device, dtype=dtype)
-
-        return FADATargetBatch(
-            observation_history=_tensor(window.observation_history),
-            action_history=_tensor(window.action_history),
-            command=_tensor(window.command),
-            realized_future=_tensor(window.realized_future),
-            executed_action_chunk=_tensor(window.executed_action_chunk),
-            episode_id=torch.tensor([window.episode_id], dtype=torch.int64, device=device),
-            start_timestep=torch.tensor(
-                [window.start_timestep], dtype=torch.int64, device=device
-            ),
-        )
+    @torch.enable_grad()
+    def update(self, samples: Sequence[FADAOnlineSample]) -> dict[str, float | int]:
+        """Take one Adam step, including when called from a no-grad playback loop."""
+        self.optimizer.zero_grad(set_to_none=True)
+        total, regression, anchor = self.compute_loss(samples)
+        if not bool(torch.isfinite(total)):
+            raise ValueError("snapshot adaptation loss must be finite")
+        total.backward()
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self._parameters, self.max_grad_norm)
+        self.optimizer.step()
+        return {
+            "loss": float(total.detach()),
+            "regression_loss": float(regression.detach()),
+            "anchor_loss": float(anchor.detach()),
+            "num_samples": len(samples),
+        }

@@ -258,7 +258,9 @@ reward: {}
 
 online_adaptation:
   enabled: false
-  lambda_forget: 0.99
+  window_size: 100
+  gamma: 0.05
+  sigma: 1.0e-4
   update_interval: 10
   learning_rate: 1.0e-4
   max_grad_norm: 1.0

@@ -387,32 +387,12 @@ def create_fada_playback_session(
         architecture = loaded.policy.config
 
         if online is not None:
-            from unilab.algos.torch.distill.fada.adaptation import FADALoRAConfig
-            from unilab.algos.torch.distill.fada.online_controller import (
-                OnlineAdaptationController,
+            from unilab.algos.torch.distill.fada.observation import (
+                FADA_G1_STATE_OBSERVATION_CONTRACT,
             )
 
-            lora_config = FADALoRAConfig(
-                rank=online.lora_rank,
-                alpha=online.lora_alpha,
-                dropout=online.lora_dropout,
-            )
-            controller = OnlineAdaptationController(
-                loaded.policy,
-                lora_config,
-                lambda_forget=online.lambda_forget,
-                update_interval=online.update_interval,
-                lr=online.learning_rate,
-                max_grad_norm=online.max_grad_norm,
-                device=device_name,
-            )
-            log(
-                "Online adaptation enabled: "
-                f"lambda_forget={online.lambda_forget}, update_interval={online.update_interval}, "
-                f"learning_rate={online.learning_rate}, max_grad_norm={online.max_grad_norm}, "
-                f"lora_rank={lora_config.rank}, lora_alpha={lora_config.alpha}, "
-                f"lora_dropout={lora_config.dropout}"
-            )
+            if architecture.observation_contract != FADA_G1_STATE_OBSERVATION_CONTRACT:
+                raise ValueError("Online snapshot adaptation requires g1_fada_state_v2")
         else:
             controller = FADAPlaybackController(loaded.policy, device=device_name)
         log(f"Loading FADA Planner-IDM checkpoint: {checkpoint}")
@@ -448,40 +428,74 @@ def create_fada_playback_session(
     )
     if env is None:
         raise RuntimeError("Playback env factory did not return an environment.")
-    wrapped_env = resolved_deps["wrapper_cls"](
-        env, device=device_name, policy_obs_mode=policy_obs_mode
-    )
-    if architecture is not None:
-        from unilab.algos.torch.distill.fada_observation import (
-            raw_observation_dim_for_fada_contract,
+    wrapped_env = None
+    try:
+        wrapped_env = resolved_deps["wrapper_cls"](
+            env, device=device_name, policy_obs_mode=policy_obs_mode
         )
-
-        observed_obs_dim = int(wrapped_env.num_obs)
-        observed_action_dim = int(env.action_space.shape[0])
-        expected_raw_obs_dim = raw_observation_dim_for_fada_contract(
-            architecture.observation_contract,
-            policy_observation_dim=architecture.obs_dim,
-        )
-        if (observed_obs_dim, observed_action_dim) != (
-            expected_raw_obs_dim,
-            architecture.action_dim,
-        ):
-            wrapped_env.close()
-            raise ValueError(
-                "FADA checkpoint/playback IO mismatch: "
-                f"checkpoint_raw=({expected_raw_obs_dim}, {architecture.action_dim}) "
-                f"environment=({observed_obs_dim}, {observed_action_dim})"
+        if architecture is not None:
+            from unilab.algos.torch.distill.fada_observation import (
+                raw_observation_dim_for_fada_contract,
             )
 
-    # B3: session 连接 done/reset lifecycle 与 history owner, 对 viewer 暴露标准 playback contract.
-    log(f"Policy obs mode: {policy_obs_mode}")
-    log(f"Action mode: {playback_cfg.action_mode}")
-    session = FADAPlaybackSession(
-        env=env,
-        wrapped_env=wrapped_env,
-        device=device_name,
-        action_mode=playback_cfg.action_mode,
-        controller=controller,
-        num_envs=playback_cfg.num_envs,
-    )
-    return session, policy_obs_mode, checkpoint_path
+            observed_obs_dim = int(wrapped_env.num_obs)
+            observed_action_dim = int(env.action_space.shape[0])
+            expected_raw_obs_dim = raw_observation_dim_for_fada_contract(
+                architecture.observation_contract,
+                policy_observation_dim=architecture.obs_dim,
+            )
+            if (observed_obs_dim, observed_action_dim) != (
+                expected_raw_obs_dim, architecture.action_dim,
+            ):
+                raise ValueError(
+                    "FADA checkpoint/playback IO mismatch: "
+                    f"checkpoint_raw=({expected_raw_obs_dim}, {architecture.action_dim}) "
+                    f"environment=({observed_obs_dim}, {observed_action_dim})"
+                )
+
+        if online is not None:
+            from unilab.algos.torch.distill.fada.adaptation import FADALoRAConfig
+            from unilab.algos.torch.distill.fada.online_controller import (
+                OnlineAdaptationController,
+            )
+
+            lora_config = FADALoRAConfig(
+                rank=online.lora_rank, alpha=online.lora_alpha, dropout=online.lora_dropout,
+            )
+            controller = OnlineAdaptationController(
+                loaded.policy,
+                lora_config,
+                action_scale=env.cfg.control_config.action_scale,
+                window_size=online.window_size,
+                gamma=online.gamma,
+                sigma=online.sigma,
+                update_interval=online.update_interval,
+                lr=online.learning_rate,
+                max_grad_norm=online.max_grad_norm,
+                device=device_name,
+            )
+            log(
+                "Online adaptation enabled: objective=snapshot_regression, "
+                f"window_size={online.window_size}, gamma={online.gamma}, sigma={online.sigma}, "
+                f"update_interval={online.update_interval}, learning_rate={online.learning_rate}, "
+                f"max_grad_norm={online.max_grad_norm}, lora_rank={lora_config.rank}, "
+                f"lora_alpha={lora_config.alpha}, lora_dropout={lora_config.dropout}"
+            )
+
+        log(f"Policy obs mode: {policy_obs_mode}")
+        log(f"Action mode: {playback_cfg.action_mode}")
+        session = FADAPlaybackSession(
+            env=env,
+            wrapped_env=wrapped_env,
+            device=device_name,
+            action_mode=playback_cfg.action_mode,
+            controller=controller,
+            num_envs=playback_cfg.num_envs,
+        )
+        return session, policy_obs_mode, checkpoint_path
+    except Exception:
+        if wrapped_env is not None:
+            wrapped_env.close()
+        else:
+            env.close()
+        raise

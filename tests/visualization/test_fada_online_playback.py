@@ -1,4 +1,4 @@
-"""Focused integration tests for FADA online playback controller selection."""
+"""Behavior checks for the official fixed-label FADA streaming session."""
 
 from __future__ import annotations
 
@@ -18,10 +18,8 @@ from unilab.algos.torch.distill.fada.model import (
     FADAArchitectureConfig,
     FADAPlannerIDMPolicy,
 )
-from unilab.algos.torch.distill.fada.online_controller import OnlineAdaptationController
-from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
 from unilab.visualization.playback_distill_sessions import create_fada_playback_session
-from unilab.visualization.playback_sessions import FADAPlaybackSession, RslRlPlaybackConfig
+from unilab.visualization.playback_sessions import RslRlPlaybackConfig
 
 
 OBS_DIM = 66
@@ -78,8 +76,12 @@ class _FakeEnv:
         self._rng = rng
         self.num_envs = 1
         self.action_space = _FakeActionSpace()
-        self.cfg = SimpleNamespace(ctrl_dt=0.02)
+        self.cfg = SimpleNamespace(
+            ctrl_dt=0.02, control_config=SimpleNamespace(action_scale=0.5)
+        )
         self._done = np.zeros(1, dtype=bool)
+        self.closed = False
+        self.action_offset = 0.0
         self.state = SimpleNamespace(
             info={
                 "commands": _command(),
@@ -93,6 +95,9 @@ class _FakeEnv:
     def set_next_done(self, done: bool) -> None:
         self._done = np.array([done], dtype=bool)
 
+    def close(self):
+        self.closed = True
+
 
 class _FakeWrappedEnv:
     """Raw wrapped-env contract consumed by FADAPlaybackSession."""
@@ -105,18 +110,25 @@ class _FakeWrappedEnv:
 
     def reset(self):
         self._obs = _raw_obs(self._rng)
+        self.env.set_next_done(False)
         self.env.state.info["commands"] = _command()
         self.env.state.info["current_actions"] = np.zeros((1, ACTION_DIM), np.float32)
         return {"actor": torch.from_numpy(self._obs)}, {}
 
     def step(self, actions):
-        np.copyto(self.env.state.info["current_actions"], actions.detach().cpu().numpy())
+        np.copyto(
+            self.env.state.info["current_actions"],
+            actions.detach().cpu().numpy() + self.env.action_offset,
+        )
         np.copyto(self._obs, _raw_obs(self._rng))
         reward = torch.zeros(1)
         return {"actor": torch.from_numpy(self._obs)}, reward, torch.from_numpy(self.env._done.copy()), {}
 
     def get_observations(self):
         return {"actor": torch.from_numpy(self._obs)}
+
+    def close(self):
+        self.env.close()
 
 
 @pytest.fixture
@@ -174,7 +186,9 @@ def _make_session(policy, env, wrapped, online, ckpt: Path):
 
 _ONLINE = {
     "enabled": True,
-    "lambda_forget": 0.9,
+    "window_size": 3,
+    "gamma": 0.05,
+    "sigma": 1e-4,
     "update_interval": 2,
     "learning_rate": 1e-3,
     "max_grad_norm": 1.0,
@@ -184,179 +198,163 @@ _ONLINE = {
 }
 
 
-def test_disabled_selects_offline_controller(policy, checkpoint_file):
-    rng = np.random.default_rng(0)
-    env, wrapped = _FakeEnv(rng), None
-    wrapped = _FakeWrappedEnv(env, rng)
+def test_disabled_preserves_checkpoint_actions_and_parameters(policy, checkpoint_file):
+    env = _FakeEnv(np.random.default_rng(0))
+    wrapped = _FakeWrappedEnv(env, env._rng)
     session, _, _ = _make_session(policy, env, wrapped, None, checkpoint_file)
-    assert isinstance(session.controller, FADAPlaybackController)
-    assert not isinstance(session.controller, OnlineAdaptationController)
     session.reset()
+    projected = session.controller.project_observation(session.obs)
+    with torch.no_grad():
+        expected = policy(
+            projected[:, None].repeat(1, HISTORY, 1),
+            torch.zeros(1, HISTORY, ACTION_DIM),
+            torch.from_numpy(_command()),
+        ).action
+    before = {name: p.detach().clone() for name, p in policy.named_parameters()}
     session.step_once()
-    np.testing.assert_allclose(env.state.info["current_actions"], session.actions.numpy())
-    assert session.last_update_stats is None
+    torch.testing.assert_close(session.actions, expected)
+    for _ in range(3):
+        session.step_once()
+        assert session.last_update_stats is None
+    for name, parameter in policy.named_parameters():
+        torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
     assert list(fada_adapter_parameters(policy)) == []
 
 
-def test_online_step_semantics_and_update_stats(policy, checkpoint_file):
-    rng = np.random.default_rng(2)
-    env = _FakeEnv(rng)
-    wrapped = _FakeWrappedEnv(env, rng)
+def test_online_closes_next_step_labels_and_updates_only_on_full_window_tick(policy, checkpoint_file):
+    env = _FakeEnv(np.random.default_rng(2))
+    env.action_offset = 7.0  # Execution-side values must not replace the model snapshot.
+    env.cfg.control_config.action_scale = [0.25] + [0.5] * (ACTION_DIM - 1)
+    wrapped = _FakeWrappedEnv(env, env._rng)
     session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
-    controller: OnlineAdaptationController = session.controller
-    assert controller.policy is controller.updater.policy is policy
     session.reset()
-
-    transitions: list[dict[str, np.ndarray]] = []
-    original_append = controller.collector.append
-
-    def _spy(**kwargs):
-        transitions.append(kwargs)
-        return original_append(**kwargs)
-
-    controller.collector.append = _spy
-
-    planner_before = [p.detach().clone() for p in policy.planner.parameters()]
-    lora_before = [p.detach().clone() for p in fada_adapter_parameters(policy)]
-
-    num_steps = HISTORY + HORIZON + 2  # cross one full window plus two update ticks
-    actions_seen: list[np.ndarray] = []
-    observations_seen: list[np.ndarray] = []
-    published_stats: list[dict] = []
-    for _ in range(num_steps):
-        observations_seen.append(np.concatenate((wrapped._obs[0, :64], wrapped._obs[0, 96:98])).copy())
+    controller = session.controller
+    before = {name: p.detach().clone() for name, p in policy.named_parameters()}
+    anchors = {name: value.clone() for name, value in controller.updater.theta_base.items()}
+    session.step_once()
+    first = controller.collector.get_window()[0]
+    error = first.snapshot.nominal_joint_positions - torch.from_numpy(wrapped._obs[:, 6:35].copy())
+    torch.testing.assert_close(first.joint_position_error, error)
+    expected_target = first.snapshot.action_snapshot + 0.05 * error / torch.tensor(
+        env.cfg.control_config.action_scale
+    )
+    torch.testing.assert_close(first.target_action, expected_target)
+    torch.testing.assert_close(first.snapshot.action_snapshot, session.actions)
+    assert not torch.allclose(first.target_action, torch.from_numpy(env.state.info["current_actions"]))
+    label = first.target_action.clone()
+    for _ in range(2):
+        assert session.last_update_stats is None
         session.step_once()
-        actions_seen.append(env.state.info["current_actions"].copy())
-        np.testing.assert_array_equal(transitions[-1]["next_observation"], np.concatenate((wrapped._obs[0, :64], wrapped._obs[0, 96:98])))
-        if session.last_update_stats is not None:
-            published_stats.append(session.last_update_stats)
-
-    # Session executed the online controller's actions (== playback policy output).
-    assert session.actions is not None
-    assert np.allclose(actions_seen[-1], session.actions.detach().cpu().numpy())
-
-    # Exact previous/current action semantics on the projected contract.
-    assert len(transitions) == num_steps
-    for index, tr in enumerate(transitions):
-        assert tr["observation"].shape == (OBS_DIM,)
-        assert tr["next_observation"].shape == (OBS_DIM,)
-        assert tr["executed_action"].shape == (ACTION_DIM,)
-        assert np.allclose(tr["executed_action"], actions_seen[index][0])
-        np.testing.assert_array_equal(tr["observation"], observations_seen[index])
-        expected_prev = (
-            np.zeros(ACTION_DIM, dtype=np.float32)
-            if index == 0
-            else actions_seen[index - 1][0]
-        )
-        assert np.allclose(tr["previous_action"], expected_prev)
-
-    # At least one window collected and update stats published.
-    assert published_stats, "expected at least one periodic LoRA update"
-    assert "loss" in published_stats[-1]
-
-    # LoRA mutated; Planner frozen.
-    lora_after = list(fada_adapter_parameters(policy))
-    assert any(
-        not torch.allclose(b, a) for b, a in zip(lora_before, lora_after)
-    ), "LoRA adapters did not update"
-    planner_after = list(policy.planner.parameters())
-    for before, after in zip(planner_before, planner_after):
-        assert torch.allclose(before, after)
+    assert controller.collector.ready and session.last_update_stats is None
+    session.step_once()  # Full T=3, first update at valid step 4 (interval 2).
+    stats = session.last_update_stats
+    assert stats is not None and stats["num_samples"] == 3
+    assert stats["loss"] == pytest.approx(stats["regression_loss"] + stats["anchor_loss"])
+    assert [sample.timestep for sample in controller.collector.get_window()] == [1, 2, 3]
+    torch.testing.assert_close(first.target_action, label, atol=0, rtol=0)
+    changed = {name for name, p in policy.named_parameters() if not torch.equal(p, before[name])}
+    trainable = {name for name, p in policy.named_parameters() if p.requires_grad}
+    assert changed and changed <= trainable
+    assert all(name.startswith("idm.") for name in trainable)
+    for name, value in controller.updater.theta_base.items():
+        torch.testing.assert_close(value, anchors[name], atol=0, rtol=0)
     assert not policy.idm.training
 
 
-def test_terminal_transition_rejected_and_autoreset_resets_history(policy, checkpoint_file):
-    rng = np.random.default_rng(3)
-    env = _FakeEnv(rng)
-    wrapped = _FakeWrappedEnv(env, rng)
-    session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
-    controller: OnlineAdaptationController = session.controller
+@pytest.mark.parametrize("autoreset", [True, False])
+def test_terminal_and_manual_reset_keep_learning_state_but_isolate_samples(
+    policy, checkpoint_file, autoreset
+):
+    import copy
+
+    env = _FakeEnv(np.random.default_rng(3))
+    wrapped = _FakeWrappedEnv(env, env._rng)
+    online = dict(_ONLINE, window_size=2, update_interval=1)
+    session, _, _ = _make_session(policy, env, wrapped, online, checkpoint_file)
     session.reset()
-    session.set_autoreset(True)
-
+    session.set_autoreset(autoreset)
     session.step_once()
+    session.step_once()
+    controller = session.controller
+    old_episode = controller.collector.get_window()[-1].episode_id
+    params = {name: p.detach().clone() for name, p in policy.named_parameters()}
+    anchors = {name: value.clone() for name, value in controller.updater.theta_base.items()}
+    optimizer = controller.updater.optimizer
+    adam_state = copy.deepcopy(optimizer.state_dict()["state"])
+    assert adam_state
     env.set_next_done(True)
-    records_before = len(controller.collector._records)
-    session.step_once()  # terminal step
-
-    # Terminal transition rejected (no append), then reset(done) cleared episode
-    # trajectory without discarding learned LoRA or valid updater windows.
-    assert records_before == 1
-    assert len(controller.collector._records) == 0
-    assert controller._last_obs is None
-
-    # Next step starts a fresh episode: previous_action is zero.
-    captured: list[dict[str, np.ndarray]] = []
-    original_append = controller.collector.append
-    controller.collector.append = lambda **kw: (captured.append(kw), original_append(**kw))[1]
-    env.set_next_done(False)
     session.step_once()
-    assert np.allclose(captured[-1]["previous_action"], np.zeros(ACTION_DIM, np.float32))
-
-
-def test_autoreset_disabled_keeps_history_on_done(policy, checkpoint_file):
-    rng = np.random.default_rng(4)
-    env = _FakeEnv(rng)
-    wrapped = _FakeWrappedEnv(env, rng)
-    session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
-    controller: OnlineAdaptationController = session.controller
-    session.reset()
-    session.set_autoreset(False)
-
+    assert session.last_update_stats is None
+    assert controller.collector.get_window() == ()
+    if autoreset:
+        env.set_next_done(False)
+    else:
+        session.step_once()  # Physics still advances; collection must remain suspended.
+        assert controller.collector.get_window() == ()
+        assert session.last_update_stats is None
+        session.reset()
     session.step_once()
-    env.set_next_done(True)
-    records_before = len(controller.collector._records)
-    session.step_once()
-
-    # No done is passed downstream: transition kept, history/collector untouched.
-    assert len(controller.collector._records) == records_before + 1
-
-
-def test_enabled_requires_single_env(policy, checkpoint_file):
-    rng = np.random.default_rng(5)
-    env = _FakeEnv(rng)
-    wrapped = _FakeWrappedEnv(env, rng)
-    bad = _playback_cfg(checkpoint_file)
-    object.__setattr__(bad, "num_envs", 2)
-    with pytest.raises(ValueError, match="exactly one env"):
-        create_fada_playback_session(
-            playback_cfg=bad,
-            cfg=_cfg(dict(_ONLINE)),
-            root_dir="/tmp",
-            device="cpu",
-            deps=_deps(policy, env, wrapped, checkpoint_file),
-            log=lambda msg: None,
-        )
+    sample = controller.collector.get_window()[0]
+    assert (sample.episode_id, sample.timestep) == (old_episode + 1, 0)
+    torch.testing.assert_close(
+        sample.snapshot.action_history, torch.zeros_like(sample.snapshot.action_history)
+    )
+    torch.testing.assert_close(
+        sample.snapshot.observation_history,
+        sample.snapshot.observation_history[:, -1:].repeat(1, HISTORY, 1),
+    )
+    assert controller.updater.optimizer is optimizer
+    for key, state in optimizer.state_dict()["state"].items():
+        for field, value in state.items():
+            torch.testing.assert_close(value, adam_state[key][field], atol=0, rtol=0)
+    for name, value in controller.updater.theta_base.items():
+        torch.testing.assert_close(value, anchors[name], atol=0, rtol=0)
+    for name, parameter in policy.named_parameters():
+        torch.testing.assert_close(parameter, params[name], atol=0, rtol=0)
 
 
-def test_enabled_rejects_already_adapted_policy(policy, checkpoint_file):
-    rng = np.random.default_rng(6)
-    env = _FakeEnv(rng)
-    wrapped = _FakeWrappedEnv(env, rng)
-    session, _, _ = _make_session(policy, env, wrapped, dict(_ONLINE), checkpoint_file)
-    with pytest.raises(ValueError, match="without existing LoRA"):
-        OnlineAdaptationController(policy, FADALoRAConfig(rank=2, alpha=4.0), device="cpu")
-
-
-@pytest.mark.parametrize("values", [
-    {"update_interval": 0}, {"update_interval": 1.5},
-    {"learning_rate": float("nan")}, {"learning_rate": 0.0},
-    {"max_grad_norm": -1.0}, {"max_grad_norm": float("inf")},
-])
-def test_online_config_rejects_invalid_update_settings(values):
-    from unilab.algos.torch.distill.fada.online_controller import FADAOnlineAdaptationConfig
-
+@pytest.mark.parametrize("failure", ["scale", "wrapper", "io", "adapted"])
+def test_failed_online_construction_releases_environment(policy, checkpoint_file, failure):
+    env = _FakeEnv(np.random.default_rng(4))
+    wrapped = _FakeWrappedEnv(env, env._rng)
+    deps = _deps(policy, env, wrapped, checkpoint_file)
+    if failure == "scale":
+        env.cfg.control_config.action_scale = 0.0
+    elif failure == "wrapper":
+        def fail_wrapper(*args, **kwargs):
+            raise ValueError("wrapper construction failed")
+        deps["wrapper_cls"] = fail_wrapper
+    elif failure == "io":
+        wrapped.num_obs = 97
+    else:
+        from unilab.algos.torch.distill.fada.adaptation import inject_fada_idm_lora
+        inject_fada_idm_lora(policy, FADALoRAConfig(rank=2, alpha=4.0))
     with pytest.raises(ValueError):
-        FADAOnlineAdaptationConfig(**values)
-
-
-def test_online_requires_policy_mode_before_environment_creation(policy, checkpoint_file):
-    rng = np.random.default_rng(8)
-    env = _FakeEnv(rng)
-    playback = _playback_cfg(checkpoint_file)
-    object.__setattr__(playback, "action_mode", "zero")
-    with pytest.raises(ValueError, match="policy action mode"):
         create_fada_playback_session(
-            playback_cfg=playback, cfg=_cfg(dict(_ONLINE)), root_dir="/tmp",
-            device="cpu", deps={},
+            playback_cfg=_playback_cfg(checkpoint_file), cfg=_cfg(dict(_ONLINE)),
+            root_dir="/tmp", device="cpu", deps=deps, log=lambda msg: None,
+        )
+    assert env.closed
+
+
+@pytest.mark.parametrize("failure", ["multiple_envs", "zero_actions", "old_config"])
+def test_invalid_online_request_fails_before_environment_creation(policy, checkpoint_file, failure):
+    env = _FakeEnv(np.random.default_rng(5))
+    wrapped = _FakeWrappedEnv(env, env._rng)
+    playback = _playback_cfg(checkpoint_file)
+    online = dict(_ONLINE)
+    if failure == "multiple_envs":
+        object.__setattr__(playback, "num_envs", 2)
+    elif failure == "zero_actions":
+        object.__setattr__(playback, "action_mode", "zero")
+    else:
+        online["lambda_forget"] = 0.9
+    deps = _deps(policy, env, wrapped, checkpoint_file)
+    def forbidden_env(*args, **kwargs):
+        pytest.fail("invalid online request must not create an environment")
+    deps["create_env"] = forbidden_env
+    with pytest.raises((ValueError, TypeError)):
+        create_fada_playback_session(
+            playback_cfg=playback, cfg=_cfg(online), root_dir="/tmp",
+            device="cpu", deps=deps, log=lambda msg: None,
         )

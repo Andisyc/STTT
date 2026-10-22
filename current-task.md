@@ -1,41 +1,47 @@
 # Current task
 
-Goal: 在现有 FADA 离线链路基础上，新增在线 Streaming TTT 链路（在线轨迹收集 + 在线更新机制），实现挂载事件触发的 LoRA-IDM 在线适应。
-Do not: 不修改现有离线 FADA 链路的行为；不引入变化检测、瞬态掩蔽、影子验证等扩展机制（原始 idea 不包含）；不处理 Planner 更新；不实现 RLS（仅 weighted SGD）。
+Goal: 将现有在线 FADA 改为基于标称未来、时序对齐误差和固定动作快照标签的 LoRA 窗口回归，并通过现有 MuJoCo 录制入口验证链路。
+Do not: 本轮仅实施已授权的步骤 4、一次聚焦集成检查和一次 0.6s 本地真实录制；不启动服务器任务、长时训练、真机或 Git 操作。不改变离线 FADA、关闭在线更新的 baseline、负重物理、观测/动作维度或 checkpoint 格式，不新增力矩监督、影子模型、变化检测或航向控制器。
 
 Current identity:
-- 基座代码: FADA_Unofficial 复制，离线 LoRA 链路完整
-- 目标链路: 新增在线推理 + 在线适应的闭环
+- 仓库: `/Users/chengyuxuan/ArtiIntComVis/TTT`；入口: `scripts/play_fada_online.py`；profile: `conf/distill/recording_profile/straight_payload.yaml`。
+- 正式入口已切到 OnlineAdaptationController → OnlineSnapshotCollector/OnlineSnapshotUpdater，使用标称未来条件下的固定标签回归和显式 LoRA 锚定；旧在线真实未来重建/指数遗忘实现已删除。关闭在线更新仍走原 baseline。
+- `playback.py:act_projected_with_snapshot` 已提供同次前向输入、Y_nom 和首动作快照；普通推理接口行为保持不变。
+- 本地实际 checkpoint: `/Users/chengyuxuan/ArtiIntComVis/FADA_Unofficial/model/plaidm_v024_close_some_dr/planner_idm_close_some_dr_v001.pt`；原 `model/v024_checkpoint` 路径已不存在。本轮正式加载确认 obs/action/command=66/29/3、H=30、K=6。服务器路径和环境仍须在实际远程运行前核对，本轮未重配环境。
 
 Confirmed decisions:
-- 三轴框架: 架构解耦（已有）+ 满秩轨迹采集（新增）+ 指数遗忘（新增）
-- 数据收集: 跨相位轨迹窗口，非单步 streaming
-- 更新机制: 指数加权最小二乘，非 RLS
-- Planner 冻结，仅更新 IDM LoRA
-- 仿真负重改为躯干左肩外侧刚性小包：质量加权合成 COM，有限尺寸箱体惯量加平行轴项；通过 `SimBackend.set_body_mass_and_com(..., inertia_tensor=...)` 同时写入质量、body-local COM 与完整惯性张量，reset 恢复三项基线。新配置为 `attachment_pos_m` / `half_size_m`，不再使用 `com_offset_m`
+- Planner 与 IDM 基础权重冻结，只更新 IDM LoRA；θ_base 是部署初始化完成后的固定参数副本，不假设已加载离线训练好的 LoRA。
+- 在 t 保存同一次实际前向的 O_t^H、A_t^H、Y_nom(t) 和首动作 U_snapshot(t)；动作历史快照取本次动作追加之前的输入，不事后重新运行 Planner，也不复制整份网络。
+- 在 t+1 用 Y_nom(t) 第一帧关节位置参考与实际下一观测计算误差。两边均使用相对同一默认姿态的弧度偏移；U 是动作空间量，不是绝对关节角。部署仍由环境转换 q_cmd = q_default + S_scale * U_exec。
+- 固定标签: U_target(t) = U_snapshot(t) + gamma * (q_nominal_relative(t+1) - q_real_relative(t+1)) / S_scale；采集闭合时只算一次，保存的输入与标签均脱离计算图并独立持有，不随后续推理或优化改变。
+- 主目标: 最近 T 条有效样本在保存的 Y_nom 条件下做首动作均方回归，加 (sigma/2) * ||θ - θ_base||²；不再混入旧指数遗忘权重，不将 AdamW 默认衰减当成非零锚点正则的等价实现。
+- H 为推理历史长度，K 为 Planner 未来长度，T 为回归样本数，更新间隔为独立配置。T/gamma/sigma 的取值及窗口预热规则由对应 engineering-plan 明示，不作为隐含实现默认。
+- 滑动窗口由 collector 单独持有，updater 消费固定 batch，更新后不清空最近 T 条样本。发生 reset 时清除待闭合样本、推理历史与训练窗口，不拼接跨回合样本；保留已学 LoRA、固定锚点及优化器状态。
+- 沿用既有在线开关时序，不新增等待负重的更新门控。冻结 Planner 只是冻结映射，不保证输出在受扰状态下可达；窗口不保证 PE/自动滤波，参数锚定不保证安全或防谱坍缩，机制实现不等于控制效果已证实。
+- 四步路线固定编号；每步开工前使用 engineering-plan 形成当步实现包，明确 owner、允许/禁止范围、真实依赖和最近验证；只规划时不自动实施，不额外生成计划文件或哈希。
+
 Progress:
-- [x] 步骤 1: 接口定义 — Done when: $A_{real}$ 来源与轨迹窗口格式明确
-  - Evidence: $A_{real}$ 从 `env.step()` → `info["current_actions"]` 获取；轨迹窗口复用 `FADACausalWindow` 结构
-- [x] 步骤 2: 在线轨迹收集器 — Done when: 实时构建跨相位 FADATargetBatch
-  - Evidence: `online_collector.py` 创建，测试通过（窗口形状正确）
-- [x] 步骤 3: 在线更新机制 — Done when: 指数加权 LoRA 更新运行
-  - Evidence: `online_updater.py` 创建，测试通过（loss: 0.718，指数加权正常）
-- [x] 步骤 4: 在线链路集成（当前四步路线的第 3 步） — Done when: FADA session 的实际动作经过 online controller，transition 在每个 step 后进入 collector
-  - Evidence: `uv run --frozen --no-sync pytest tests/visualization/test_fada_online_playback.py -q` → 13 passed；schema 5 真实 checkpoint 经官方 session + fake env 连续执行 35 步后完成一次 LoRA 更新，loss=0.345505625，IDM 恢复 eval；未启动 physics/Viewer
-- [x] 步骤 5: 端到端录制链路 — Done when: 无窗口执行真实 MuJoCo、负重事件与在线 LoRA 更新，并输出可播放 MP4
-  - Evidence: `scripts/play_fada_online.py` 默认无窗口录制；本地 CPU + schema 5 checkpoint 实跑 0.8s / 40 个控制步，3 kg 负重在 0.22s 的 post-step 状态可见，0.8s 完成一次 LoRA 更新（6 个窗口）；输出 H.264 MP4（320x240、10 fps、8 帧），已查看视频预览
-- [x] 负重步骤 1: Backend 运行时接口 — Done when: 不重置 physics state 即可按环境设置 body 质量与质心
-  - Evidence: `SimBackend.set_body_mass_and_com`、MuJoCo `BatchEnvPool.set_field_indexed` 实现；聚焦测试 1 passed
-- [x] 负重步骤 2: G1 环境负重事件 — Done when: 按环境定时挂载负重，并在 episode reset 前恢复标称质量与质心
-  - Evidence: `G1RuntimePayload`、`env.runtime_payload` 配置与 `G1WalkEnv` 生命周期接入完成；`uv run --frozen --no-sync pytest tests/envs/locomotion/g1/test_runtime_payload.py -q` → 4 passed
-- [x] 服务器录制入口：`video_recording` 配置时长/FPS/分辨率/路径，逐帧编码、不按墙钟 sleep、不累积整段 RGB；Linux 默认 EGL，允许通过 `MUJOCO_GL` 指定其他后端；`video_recording.enabled=false` 保留本地 Viewer
-- [x] 直行评估录制：`recording_profile=straight_payload` 固定标称 reset、零初速度与 `[0.4, 0, 0]` 命令，关闭随机扰动，侧后方 135° 跟随相机；episode 上限 180s，120s 视频在 30s 加载 3kg，负重后观察 90s；真实 termination/reset 保留并在画面和日志标记
-  - Evidence: 本地 CPU + 真实 checkpoint 录制 0.8s / 40 步（仅为 smoke，将负重时间缩为 0.2s），输出 640x360 H.264；已查看视频，确认无负重/负重状态切换、挂载提示、横向位移/航向偏差、reset 次数和侧后方视角
-  - Protocol: 先用同一 profile 覆盖 `online_adaptation.enabled=false env.runtime_payload.enabled=false video_recording.duration_s=30`，检查原策略无负重直行；通过后再录 120s 的在线适应视频。后者保持现有从开局在线更新的行为；要判断适应的因果效果，还需同样负重、关闭更新的对照
-- [x] 左肩负重：`torso_link` 局部中心 `[0.004,0.22,0.15]` m、半尺寸 `[0.08,0.06,0.12]` m、3kg；随躯干刚性携带，不加自由度/碰撞，不模拟摆绳。录制以同位置/尺寸橙色箱体可视化，不重复添加物理质量；profile 仍先无负重 30s
-  - Evidence: `uv run --frozen --no-sync pytest tests/envs/locomotion/g1/test_runtime_payload.py -q` → 7 passed（手算质量/COM/惯量、左右镜像、逐行触发与 reset 恢复）；真实 G1 + checkpoint 录制 0.8s / 40 步（挂载时间缩为 0.2s），视频已目视确认橙色小包在事件后出现，并完成一次在线更新
+- [x] 旧在线推理、LoRA 更新、左肩负重和无窗口录制链路已建立，本轮已只读核对关键 owner；旧效果结论不升级为新方法证据。
+  - Evidence: `playback.py:_act`、`online_controller.py:act/on_env_step`、`online_collector.py:append`、`online_updater.py:update`、`playback_distill_sessions.py:create_fada_playback_session`；历史 smoke 见现有录制与测试，本轮未重跑。
+- [x] 总体路线与跨模块数据语义已记录；新路线实现进度为 4/4。
+  - Evidence: 本板 Confirmed decisions 和下列四步。原板“满秩采集、指数遗忘、负重事件触发更新”不再作为新方法约束；当前实现从开局收集并在窗口可用后更新。
+- [x] 步骤 1: 同次推理快照与样本接口 — Owner: `fada/playback.py`、`fada/observation.py`、`fada/online_data.py`；Depends on: 无；Done when: 可取得独立、无梯度的实际推理输入、Y_nom、首动作和关节参考，普通推理动作与历史推进保持原行为。
+  - Evidence: `env PYTHONPATH=/Users/chengyuxuan/ArtiIntComVis/TTT/src uv run --frozen --no-sync python /tmp/ttt_snapshot_step1_smoke.py` → PASS，2.15s；真实小型 eval Planner-IDM 普通/快照路径动作及后续历史一致，单次前向、独立存储、无梯度、源观测/动作/后续推理/reset 隔离、样本标签独立、G1 关节坐标及 legacy action-only 路径均通过。PYTHONPATH 明确选本仓库源码，复用 uv 环境；临时脚本验证后删除，未运行测试套件、checkpoint、训练或仿真。
+- [x] 步骤 2: 一步延迟标签与滑动窗口 — Owner: `fada/online_collector.py:OnlineSnapshotCollector`；Depends on: 步骤 1 接口；Done when: t+1 闭合 t 样本，标签固定，保留最近 T 条有效样本，终止/reset 不产生跨回合标签。
+  - Evidence: `env PYTHONPATH=/Users/chengyuxuan/ArtiIntComVis/TTT/src uv run --frozen --no-sync python /tmp/ttt_snapshot_step2_smoke.py` → PASS，1.95s；手算 target=0.202、正负误差/向量缩放、固定标签、满窗/淘汰/读取不清空、非法配对、终止忽略重置观测并要求显式 reset、回合编号及真实小型 Planner-IDM 快照到样本链路均通过。临时脚本随后删除，未运行优化器、checkpoint、测试套件或物理仿真；本步仅修改 `online_collector.py` 与本板。
+- [x] 步骤 3: 新回归损失与参数锚定 — Owner: `fada/online_updater.py:OnlineSnapshotUpdater`；Depends on: 步骤 1 样本接口；Done when: 使用保存的 Y_nom/目标做窗口均值回归和显式锚定，只有 LoRA 收到更新，标签与 θ_base 不变。
+  - Evidence: `env PYTHONPATH=/Users/chengyuxuan/ArtiIntComVis/TTT/src uv run --frozen --no-sync python /tmp/ttt_snapshot_step3_smoke.py` → PASS，2.02s；真实小型 Planner-IDM、基础 dropout=0.2、LoRA dropout=0.35。手算 regression=0.003625、首动作梯度、非零初值锚定及 sigma*(parameter-base) 梯度、零修正近零 loss/梯度、单 batch 前向且不调用 Planner、eval+autograd 与异常后模式恢复、一次离线 Adam step 仅改 LoRA、固定锚点/标签及窗口重复消费均通过。临时脚本随后删除，未启动 checkpoint、训练任务、物理仿真或广泛测试；本步只修改 updater 与本板。
+- [x] 步骤 4: 正式入口切换与最小录制验证 — controller/session/factory/config 已统一接通新目标，关闭更新 baseline 保留，旧在线专属实现/手动入口已清理。
+  - 行为: 在同次前向保存快照，下一步闭合标签，满窗且满足更新周期时消费窗口；动作缩放读取实际 env.cfg；终止步丢弃，关闭 autoreset 时暂停采集直到显式 reset，reset 保留 LoRA/锚点/Adam。创建 wrapper/controller/session 的失败路径释放资源。
+  - 配置: 正式默认 window_size=100、gamma=0.05、sigma=1e-4、update_interval=10、learning_rate=1e-4、max_grad_norm=1.0，删除 lambda_forget；启动日志明确 objective=snapshot_regression。默认 0.02s 控制步长下约 2s 首次更新，无等待负重门控。
+  - Evidence: `env PYTHONPATH=/Users/chengyuxuan/ArtiIntComVis/TTT/src OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 uv run --frozen --no-sync pytest tests/visualization/test_fada_online_playback.py -q` → 11 passed in 0.82s。覆盖 baseline、下一步标签/实际缩放、满窗/周期、仅 LoRA 更新、两种 reset、学习状态保留及构造失败释放；旧算法测试已迁移但未追加运行算法套件。
+  - Evidence: 官方 `scripts/play_fada_online.py` + 上述真实 checkpoint + straight_payload，本地 CPU/CGL 录制 0.6s、30 步、640x360/10fps/6 帧；仅 smoke 覆盖 T=10、负重时间=0.2s。日志 0.2/0.4/0.6s 各更新一次，num_samples 均为 10，回归/锚定值有限；0.22s 挂载 3kg；进程成功退出。
+  - Artifact: `/tmp/ttt_snapshot_step4_smoke.mp4`，已解码查看 H.264 视频，画面包含负重挂载提示、在线更新计数，未见 reset。短录制证明新正式链路与编码输出，不证明长时稳定、直行恢复或适应有效。
+  - 清理/说明: 删除旧 OnlineTrajectoryCollector、OnlineAdaptationUpdater、scripts/test_online_adaptation.py 及旧调用，保留共享离线 windows/adaptation；两份在线测试迁移到新行为，README 增补入口、参数、坐标、reset 与旧配置移除说明。未新建环境、分支或额外计划文件。
+
 Blockers:
-- 旧扰动模型的 120s 视频中，用户观察到 25s 无负重偏转；已有日志确认 25s 前更新 121 次、30.02s 才挂载、无 reset。尚未定因；左肩扰动模型切换不代表解决该偏转，也不证明适应有效。服务器需保留进程级 `LD_PRELOAD=/lib/x86_64-linux-gnu/libgcc_s.so.1`
+- none，本次四步工程链路已完成。
+- 证据边界: T/gamma/sigma 仍是试验初值；旧视频偏航和用户另报约 40s reset 尚未定因，本轮没有修复或评估这些现象，没有进行长时/服务器效果实验。
 
 Next:
-- 同步左肩负重代码后，仍优先用关闭更新/负重的无负重基线区分原策略偏转和在线更新退化；不要把扰动位置变化当成已有闭环问题的修复
+- none。长时方法效果评测或服务器运行由用户另行决定并授权。
