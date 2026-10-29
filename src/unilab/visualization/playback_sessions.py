@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from unilab.visualization.footprints import FootprintRecorder
 
 
 def _external_velocity_command_rows(
@@ -342,11 +345,24 @@ class RslRlPlaybackSession:
 class FADAPlaybackSession(RslRlPlaybackSession):
     """Stateful Planner-IDM playback session with episode-aligned histories."""
 
-    def __init__(self, *, controller: Any | None, official_adapter: Any | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self, *, controller: Any | None, official_adapter: Any | None = None,
+        command_program: Any | None = None,
+        footprint_recorder: FootprintRecorder | None = None, **kwargs: Any,
+    ) -> None:
         self.controller = None
         self.official_adapter = official_adapter
+        self.command_program = command_program
+        self.footprint_recorder = footprint_recorder
         self.last_update_stats: dict[str, float | int] | None = None
         super().__init__(policy=None, **kwargs)
+        self.command_control_steps = np.zeros(self.num_envs, dtype=np.int64)
+        if footprint_recorder is not None:
+            if footprint_recorder.num_envs != self.num_envs:
+                raise ValueError("footprint recorder must match the playback environment rows")
+            for method in ("get_foot_pos", "get_foot_contact"):
+                if not callable(getattr(self.env, method, None)):
+                    raise ValueError(f"demo.footprints requires env.{method}()")
         if controller is not None:
             self.bind_controller(controller)
 
@@ -368,13 +384,32 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         result = super().reset()
         if self.official_adapter is not None:
             self.official_adapter.reset()
+        if self.command_program is not None:
+            self.command_control_steps.fill(0)
+        if self.footprint_recorder is not None:
+            self.footprint_recorder.reset(self.env.get_foot_contact())
         return result
 
     def step_once(self) -> Any:
         # B1: 先以当前 observation/command 计算并执行第一动作.
+        if self.command_program is not None:
+            if self.obs is None:
+                raise RuntimeError("Playback session must be reset before stepping.")
+            self.set_external_command(np.stack([
+                self.command_program.command_at_control_step(step)
+                for step in self.command_control_steps
+            ]))
         actions = self._build_actions()
         self.actions = actions
         self.obs, _reward, done, _info = self.wrapped_env.step(actions)
+        if self.footprint_recorder is not None:
+            done_rows = done.detach().cpu().numpy() if isinstance(done, torch.Tensor) else np.asarray(done)
+            self.footprint_recorder.observe(
+                foot_positions=self.env.get_foot_pos(),
+                contacts=self.env.get_foot_contact(),
+                done=np.asarray(done_rows, dtype=bool).reshape(self.num_envs),
+                autoreset=self.autoreset_enabled,
+            )
         # Terminal observations are never labels, even when physics autoreset is off.
         # Only an actual reset resumes collection after a terminal transition.
         if self.controller is not None:
@@ -390,6 +425,11 @@ class FADAPlaybackSession(RslRlPlaybackSession):
                 self.controller.reset(done)
                 if self.official_adapter is not None:
                     self.official_adapter.reset(done)
+        if self.command_program is not None:
+            self.command_control_steps += 1
+            if self.autoreset_enabled:
+                done_rows = done.detach().cpu().numpy() if isinstance(done, torch.Tensor) else np.asarray(done)
+                self.command_control_steps[np.asarray(done_rows, dtype=bool).reshape(self.num_envs)] = 0
         self.step_count += 1
         return self.obs
 

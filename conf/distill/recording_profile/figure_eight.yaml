@@ -1,0 +1,69 @@
+# @package _global_
+# Use with task=g1_walk_flat/mujoco and an explicit FADA checkpoint.
+# Official checkpoints additionally require official_playback.profile_path.
+interactive:
+  action_mode: policy
+  keyboard: false
+  camera_follow_body: false
+  camera_focus_body_name: pelvis
+  camera_distance: null  # Fit the whole world-anchored reference route once.
+  camera_elevation: -65.0
+  camera_azimuth: 90.0
+
+demo:
+  figure_eight:
+    enabled: true
+    width_m: 6.0
+    height_m: 3.0
+    speed_m_s: 0.3
+    segment_duration_s: 0.8
+  footprints:
+    enabled: true
+  rendering:
+    enabled: true
+
+env:
+  max_episode_seconds: 180.0  # Auto-duration recording checks this against the actual cycle.
+  reset_base_qvel_limit: 0.0
+  standing_reset_base_qvel_limit: 0.0
+  noise_config:
+    level: 0.0
+  domain_rand:
+    randomize_reset_pose: false
+    randomize_kp: false
+    randomize_kd: false
+    randomize_base_mass: false
+    randomize_body_mass: false
+    random_com: false
+    randomize_gravity: false
+    randomize_ground_friction: false
+    randomize_dof_armature: false
+    randomize_dof_position_bias: false
+    randomize_control_delay: false
+    torque_rfi_fraction: 0.0
+    push_robots: false
+    actuator_strength:
+      enabled: false
+      group_curriculum_enabled: false
+  commands:
+    vel_limit: [[-0.6, -0.4, -0.8], [1.0, 0.4, 0.8]]
+    resampling_time: 0.0
+    heading_command: false
+    small_xy_threshold: 0.0
+    dead_zone_enabled: false
+    rel_standing_envs: 0.0
+    rel_transition_envs: 0.0
+    rel_straight_envs: 0.0
+  command_gated_phase_contact:
+    command_xy_dead_zone: 0.0
+    command_yaw_dead_zone: 0.0
+  runtime_payload:
+    enabled: false
+
+online_adaptation:
+  enabled: false  # Override explicitly for the online-adaptation comparison.
+
+video_recording:
+  output_path: logs/fada_online/figure_eight.mp4
+  duration_s: null  # Exactly one command-program cycle, including its terminal frame.
+  show_status_overlay: true

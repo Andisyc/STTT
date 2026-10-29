@@ -12,7 +12,6 @@ if sys.platform == "linux":
 
 import hydra
 import mujoco  # type: ignore[attr-defined]
-import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 ROOT_DIR = Path(__file__).parent.parent
@@ -31,8 +30,9 @@ from unilab.visualization.interactive_playback import (
     create_fada_playback_session,
     select_torch_device,
 )
-from unilab.visualization.playback_controls import _build_playback_config
+from unilab.visualization.fada_rendering import FADADemoRenderConfig, FADAPlaybackRendering
 from unilab.visualization.playback_cli import _build_play_args
+from unilab.visualization.playback_controls import _build_playback_config
 
 
 @hydra.main(version_base="1.3", config_path="../conf/distill", config_name="config")
@@ -53,6 +53,10 @@ def main(cfg: DictConfig) -> None:
 
     recording = FADAVideoRecordingConfig(
         **OmegaConf.to_container(cfg.video_recording, resolve=True)
+    )
+    render_node = OmegaConf.select(cfg, "demo.rendering")
+    render_config = FADADemoRenderConfig(
+        **(OmegaConf.to_container(render_node, resolve=True) if render_node is not None else {})
     )
 
     # Create FADA session; the factory binds exactly one controller (offline or online).
@@ -76,52 +80,51 @@ def main(cfg: DictConfig) -> None:
 
     try:
         if recording.enabled:
-            record_fada_playback(session, args, recording)
+            record_fada_playback(session, args, recording, render_config=render_config)
         else:
-            _run_viewer(session, args)
+            _run_viewer(session, args, render_config)
     finally:
         session.wrapped_env.close()
 
 
-def _run_viewer(session, args) -> None:
+def _run_viewer(session, args, render_config: FADADemoRenderConfig | None = None) -> None:
     import mujoco.viewer
     # Get environment and load MuJoCo model
     env = session.env
 
     # Load viewer model (same as play_interactive)
-    from unilab.visualization.playback_viewer import (
-        _default_viewer_camera_distance,
-        _load_viewer_model,
-        _resolve_focus_body_id,
-    )
-    model = _load_viewer_model(env, use_env_visual_model=True)
+    from unilab.visualization.playback_viewer import _load_viewer_model
+
+    model = _load_viewer_model(env, use_env_visual_model=args.use_env_visual_model)
     data = mujoco.MjData(model)
 
     session.reset()
-    focus_body_id = _resolve_focus_body_id(model, env, args.camera_focus_body_name)
+    rendering = FADAPlaybackRendering(session, model, args, render_config)
+    rendering.sync_physics(data)
+    controls = PlaybackControls(paused=args.start_paused, speed=args.speed)
+
+    def on_key(key: int) -> None:
+        if key == 32:
+            controls.toggle_pause()
+        elif key == 78:
+            controls.request_single_step()
+        elif key in (43, 61):
+            controls.set_speed(controls.speed * 1.25)
+        elif key == 45:
+            controls.set_speed(controls.speed / 1.25)
 
     # Launch MuJoCo viewer
-    with mujoco.viewer.launch_passive(model, data) as viewer:
+    with mujoco.viewer.launch_passive(model, data, key_callback=on_key) as viewer:
         with viewer.lock():
-            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-            viewer.cam.distance = (
-                args.camera_distance if args.camera_distance is not None
-                else _default_viewer_camera_distance(
-                    model, env, follow_body=args.camera_follow_body
-                )
-            )
-            if args.camera_elevation is not None:
-                viewer.cam.elevation = args.camera_elevation
-            if args.camera_azimuth is not None:
-                viewer.cam.azimuth = args.camera_azimuth
+            rendering.initialize_camera(viewer.cam)
         print("[play_fada_online] MuJoCo viewer started")
         print("[play_fada_online] Controls: Space=pause/resume, N=single-step, +/-=speed")
 
-        controls = PlaybackControls()
-
         while viewer.is_running():
             # Advance session; the bound controller runs collection/update internally.
-            session.advance(controls)
+            advanced = session.advance(controls)
+            if advanced:
+                rendering.observe_step()
 
             # Online adaptation stats published by the session.
             stats = getattr(session, "last_update_stats", None)
@@ -130,13 +133,16 @@ def _run_viewer(session, args) -> None:
                 session.last_update_stats = None
 
             # Sync viewer
-            phys = session.physics_state()[0].astype(np.float64)
-            mujoco.mj_setState(model, data, phys, mujoco.mjtState.mjSTATE_FULLPHYSICS)
-            mujoco.mj_forward(model, data)
-            if args.camera_follow_body:
-                with viewer.lock():
-                    viewer.cam.lookat[:] = data.xpos[focus_body_id]
-                    viewer.cam.lookat[2] += args.camera_height_offset
+            with viewer.lock():
+                rendering.sync_physics(data)
+                rendering.update_camera(viewer.cam, data)
+                viewer.user_scn.ngeom = 0
+                rendering.append_scene(viewer.user_scn, data)
+            status = rendering.status(data)
+            viewer.set_texts((
+                mujoco.mjtFontScale.mjFONTSCALE_100, mujoco.mjtGridPos.mjGRID_TOPLEFT,
+                "\n".join((status.title, *status.details, *((status.alert,) if status.alert else ()))), "",
+            ))
             viewer.sync()
 
             # Control speed

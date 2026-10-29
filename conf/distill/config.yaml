@@ -259,6 +259,25 @@ reward: {}
 official_playback:
   profile_path: null  # Required source-run control profile for official 64/29/7 checkpoints.
 
+demo:
+  figure_eight:
+    enabled: false
+    width_m: 6.0
+    height_m: 3.0
+    speed_m_s: 0.3
+    segment_duration_s: 0.8
+  footprints:
+    enabled: false
+    max_records: 2048  # Per environment; cleared on that environment's reset.
+  rendering:
+    enabled: false
+    show_reference_route: true
+    show_footprints: true
+    max_footprint_markers: 256
+    footprint_radius_m: 0.045
+    route_width_m: 0.012
+    camera_margin_m: 1.0
+
 online_adaptation:
   enabled: false
   window_size: 10

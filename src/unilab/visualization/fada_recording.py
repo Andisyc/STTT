@@ -14,20 +14,18 @@ import mujoco
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from unilab.envs.common.rotation import np_wrap_to_pi, np_yaw_from_quat
-
-from unilab.visualization.playback_viewer import (
-    _default_viewer_camera_distance,
-    _load_viewer_model,
-    _resolve_focus_body_id,
+from unilab.visualization.fada_rendering import (
+    FADADemoRenderConfig,
+    FADAPlaybackRendering,
 )
+from unilab.visualization.playback_viewer import _load_viewer_model
 
 
 @dataclass(frozen=True)
 class FADAVideoRecordingConfig:
     enabled: bool = True
     output_path: str = "logs/fada_online/online_adaptation.mp4"
-    duration_s: float = 30.0
+    duration_s: float | None = 30.0
     fps: int = 30
     width: int = 1280
     height: int = 720
@@ -35,8 +33,10 @@ class FADAVideoRecordingConfig:
     show_status_overlay: bool = True
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.duration_s) or self.duration_s <= 0.0:
-            raise ValueError("video_recording.duration_s must be finite and positive")
+        if self.duration_s is not None and (
+            not math.isfinite(self.duration_s) or self.duration_s <= 0.0
+        ):
+            raise ValueError("video_recording.duration_s must be finite and positive, or null for one figure-eight cycle")
         if not math.isfinite(self.progress_interval_s) or self.progress_interval_s <= 0.0:
             raise ValueError("video_recording.progress_interval_s must be finite and positive")
         for name in ("fps", "width", "height"):
@@ -47,6 +47,44 @@ class FADAVideoRecordingConfig:
             raise ValueError("MP4 recording width and height must be even")
         if not self.output_path or Path(self.output_path).suffix.lower() != ".mp4":
             raise ValueError("video_recording.output_path must name an MP4 file")
+
+
+@dataclass(frozen=True)
+class FADARecordingTiming:
+    duration_s: float
+    control_steps: int
+    frame_count: int
+    include_terminal_frame: bool = False
+
+
+def resolve_fada_recording_timing(session: Any, config: FADAVideoRecordingConfig) -> FADARecordingTiming:
+    """Resolve one full command cycle without advancing the policy or environment."""
+    ctrl_dt = float(session.env.cfg.ctrl_dt)
+    if not math.isfinite(ctrl_dt) or ctrl_dt <= 0.0:
+        raise ValueError("FADA recording requires finite positive env.ctrl_dt")
+    if config.duration_s is not None:
+        return FADARecordingTiming(
+            config.duration_s, math.ceil(config.duration_s / ctrl_dt),
+            math.ceil(config.duration_s * config.fps),
+        )
+    program = getattr(session, "command_program", None)
+    if program is None:
+        raise ValueError("video_recording.duration_s=null requires demo.figure_eight.enabled=true")
+    if not math.isclose(program.ctrl_dt, ctrl_dt, rel_tol=1e-9):
+        raise ValueError("figure-eight program and recording must use the same ctrl_dt")
+    steps = int(program.total_control_steps)
+    duration = steps * ctrl_dt
+    episode_seconds = float(session.env.cfg.max_episode_seconds)
+    episode_steps = int(getattr(session.env.cfg, "max_episode_steps", math.floor(episode_seconds / ctrl_dt)))
+    if episode_steps <= steps:
+        raise ValueError(
+            f"Full figure-eight recording needs env.max_episode_seconds > {duration:g}s; "
+            f"got {episode_seconds:g}s ({episode_steps} steps)"
+        )
+    # The extra encoded frame holds the completed cycle's final state. For a
+    # nonintegral FPS boundary it is flushed at the final control step, never
+    # by stepping into the next command cycle.
+    return FADARecordingTiming(duration, steps, math.ceil(duration * config.fps) + 1, True)
 
 
 def _annotate_frame(
@@ -79,6 +117,7 @@ def record_fada_playback(
     args: Any,
     config: FADAVideoRecordingConfig,
     *,
+    render_config: FADADemoRenderConfig | None = None,
     log: Callable[[str], None] = partial(print, flush=True),
 ) -> str:
     """Advance simulation without wall-clock pacing and stream frames to FFmpeg.
@@ -88,53 +127,26 @@ def record_fada_playback(
     Progress is flushed at completed-step boundaries on a wall-clock interval;
     a single long-running adaptation step cannot report completion until it returns.
     """
+    timing = resolve_fada_recording_timing(session, config)
     ctrl_dt = float(session.env.cfg.ctrl_dt)
-    if not math.isfinite(ctrl_dt) or ctrl_dt <= 0.0:
-        raise ValueError("FADA recording requires finite positive env.ctrl_dt")
+    duration_s = timing.duration_s
     output = Path(config.output_path).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    num_steps = math.ceil(config.duration_s / ctrl_dt)
-    num_frames = math.ceil(config.duration_s * config.fps)
+    num_steps, num_frames = timing.control_steps, timing.frame_count
 
     model = _load_viewer_model(session.env, use_env_visual_model=args.use_env_visual_model)
     model.vis.global_.offwidth = max(model.vis.global_.offwidth, config.width)
     model.vis.global_.offheight = max(model.vis.global_.offheight, config.height)
     data = mujoco.MjData(model)
     camera = mujoco.MjvCamera()
-    mujoco.mjv_defaultCamera(camera)
-    focus_body_id = _resolve_focus_body_id(model, session.env, args.camera_focus_body_name)
-    payload_config = getattr(session.env.cfg, "runtime_payload", None)
-    payload_body_id = -1
-    payload_position = payload_half_size = None
-    payload_rgba = np.asarray([1.0, 0.35, 0.05, 1.0], dtype=np.float32)
-    if payload_config is not None and payload_config.enabled:
-        payload_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, payload_config.body_name)
-        if payload_body_id < 0:
-            raise ValueError(f"Payload body is absent from recording model: {payload_config.body_name}")
-        payload_position = np.asarray(payload_config.attachment_pos_m, dtype=np.float64)
-        payload_half_size = np.asarray(payload_config.half_size_m, dtype=np.float64)
-    camera.distance = (
-        args.camera_distance if args.camera_distance is not None
-        else _default_viewer_camera_distance(model, session.env, follow_body=args.camera_follow_body)
-    )
-    if args.camera_elevation is not None:
-        camera.elevation = args.camera_elevation
-    if args.camera_azimuth is not None:
-        camera.azimuth = args.camera_azimuth
-
     session.reset()
-    reset_count = 0
-    last_reset_time: float | None = None
-    last_attach_time: float | None = None
-    update_count = 0
-    last_loss: float | None = None
-    origin_xy: np.ndarray | None = None
-    origin_yaw = 0.0
+    rendering = FADAPlaybackRendering(session, model, args, render_config)
+    rendering.initialize_camera(camera)
     font = (
         ImageFont.load_default(size=max(12, config.height // 40))
         if config.show_status_overlay else None
     )
-    log(f"Recording {config.duration_s:g}s simulation to {output} ({config.width}x{config.height}, {config.fps} fps); no viewer or realtime pacing")
+    log(f"Recording {duration_s:g}s simulation to {output} ({config.width}x{config.height}, {config.fps} fps); no viewer or realtime pacing")
     frame_index = 0
     started = time.monotonic()
     last_progress = started
@@ -142,7 +154,7 @@ def record_fada_playback(
     def report_progress(step: int, now: float) -> None:
         log(
             f"Progress: step={step}/{num_steps} ({100.0 * step / num_steps:.1f}%) "
-            f"sim_time={step * ctrl_dt:.2f}/{config.duration_s:g}s "
+            f"sim_time={step * ctrl_dt:.2f}/{duration_s:g}s "
             f"frames={frame_index}/{num_frames} wall_time={now - started:.1f}s"
         )
 
@@ -152,78 +164,35 @@ def record_fada_playback(
             for step_index in range(num_steps + 1):
                 if step_index:
                     session.step_once()
+                    rendering.observe_step()
                     if session.last_update_stats is not None:
                         log(f"sim_time={step_index * ctrl_dt:.3f}s Update: {session.last_update_stats}")
-                        update_count += 1
-                        last_loss = float(session.last_update_stats["loss"])
                     if np.any(session.info.get("runtime_payload_attached_this_step", False)):
                         log(f"sim_time={step_index * ctrl_dt:.3f}s Payload attached: {session.info['runtime_payload_added_mass_kg']} kg")
-                        last_attach_time = step_index * ctrl_dt
 
                     state = session.env.state
                     assert state is not None
                     if np.any(state.terminated | state.truncated):
-                        reset_count += 1
-                        last_reset_time = step_index * ctrl_dt
                         reason = "terminated" if np.any(state.terminated) else "timeout"
                         log(
-                            f"sim_time={last_reset_time:.3f}s EPISODE RESET ({reason}); "
-                            f"reset_count={reset_count}. Do not treat the trajectory as uninterrupted walking."
+                            f"sim_time={step_index * ctrl_dt:.3f}s EPISODE {'RESET' if session.autoreset_enabled else 'TERMINATED'} ({reason}); "
+                            f"reset_count={rendering.reset_count}. Do not treat the trajectory as uninterrupted walking."
                         )
                 elapsed = step_index * ctrl_dt
-                if frame_index < num_frames and frame_index / config.fps <= elapsed + 1e-9:
-                    physics = np.asarray(session.physics_state()[0], dtype=np.float64)
-                    mujoco.mj_setState(model, data, physics, mujoco.mjtState.mjSTATE_FULLPHYSICS)
-                    mujoco.mj_forward(model, data)
-                    if args.camera_follow_body:
-                        camera.lookat[:] = data.xpos[focus_body_id]
-                        camera.lookat[2] += args.camera_height_offset
+                final_frame = timing.include_terminal_frame and step_index == num_steps
+                if frame_index < num_frames and (frame_index / config.fps <= elapsed + 1e-9 or final_frame):
+                    rendering.sync_physics(data)
+                    rendering.update_camera(camera, data)
                     renderer.update_scene(data, camera=camera)
-                    active = bool(np.asarray(session.info.get("runtime_payload_active", [False])).reshape(-1)[0])
-                    if active and payload_body_id >= 0:
-                        scene = renderer.scene
-                        if scene.ngeom >= scene.maxgeom:
-                            raise RuntimeError("Recording scene has no room for the payload marker")
-                        rotation = data.xmat[payload_body_id].reshape(3, 3)
-                        center = data.xpos[payload_body_id] + rotation @ payload_position
-                        # Visualize the same rigid box used in inertia composition; no extra physics mass.
-                        mujoco.mjv_initGeom(
-                            scene.geoms[scene.ngeom], mujoco.mjtGeom.mjGEOM_BOX,
-                            payload_half_size, center, rotation.reshape(9), payload_rgba,
-                        )
-                        scene.ngeom += 1
+                    rendering.append_scene(renderer.scene, data)
                     image = renderer.render()
                     if config.show_status_overlay:
-                        position = data.xpos[focus_body_id]
-                        yaw = float(np_yaw_from_quat(data.xquat[focus_body_id:focus_body_id + 1])[0])
-                        if origin_xy is None:
-                            origin_xy = position[:2].copy()
-                            origin_yaw = yaw
-                        dx, dy = position[:2] - origin_xy
-                        forward = math.cos(origin_yaw) * dx + math.sin(origin_yaw) * dy
-                        lateral = -math.sin(origin_yaw) * dx + math.cos(origin_yaw) * dy
-                        yaw_error = math.degrees(float(np_wrap_to_pi(yaw - origin_yaw)))
-                        added_mass = float(np.asarray(session.info.get("runtime_payload_added_mass_kg", [0.0])).reshape(-1)[0])
-                        status = f"PAYLOAD +{added_mass:g} kg" if active else "NO PAYLOAD"
-                        if active and payload_config is not None:
-                            status += f" @ {payload_config.body_name}"
-                        alert = None
-                        if last_attach_time is not None and elapsed - last_attach_time < 2.0:
-                            alert = f"PAYLOAD ATTACHED +{added_mass:g} kg"
-                        if last_reset_time is not None and elapsed - last_reset_time < 2.0:
-                            alert = "EPISODE RESET - trajectory interrupted"
-                        loss_text = f" loss={last_loss:.4g}" if last_loss is not None else ""
+                        status = rendering.status(data)
                         image = _annotate_frame(
-                            image,
-                            title=f"t={elapsed:.2f}s | {status}",
-                            details=(
-                                f"forward={forward:+.2f}m lateral={lateral:+.2f}m",
-                                f"yaw error={yaw_error:+.1f}deg resets={reset_count}",
-                                f"LoRA updates={update_count}{loss_text}",
-                            ),
-                            alert=alert, loaded=active, font=font,
+                            image, title=status.title, details=status.details,
+                            alert=status.alert, loaded=status.loaded, font=font,
                         )
-                    while frame_index < num_frames and frame_index / config.fps <= elapsed + 1e-9:
+                    while frame_index < num_frames and (frame_index / config.fps <= elapsed + 1e-9 or final_frame):
                         writer.add_image(image)
                         frame_index += 1
 

@@ -444,6 +444,39 @@ def create_fada_playback_session(
         raise RuntimeError("Playback env factory did not return an environment.")
     wrapped_env = None
     try:
+        command_program = None
+        demo = getattr(getattr(cfg, "demo", None), "figure_eight", None)
+        if demo is not None and bool(getattr(demo, "enabled", False)):
+            from unilab.visualization.demo_commands import (
+                FigureEightCommandConfig,
+                FigureEightCommandProgram,
+            )
+
+            command_program = FigureEightCommandProgram.from_config(
+                FigureEightCommandConfig(
+                    width_m=float(demo.width_m), height_m=float(demo.height_m),
+                    speed_m_s=float(demo.speed_m_s),
+                    segment_duration_s=float(demo.segment_duration_s),
+                ),
+                ctrl_dt=float(env.cfg.ctrl_dt),
+                prediction_horizon=(architecture.prediction_horizon if architecture is not None else 1),
+                window_size=(online.window_size if online is not None else 0),
+                update_interval=(online.update_interval if online is not None else 0),
+            )
+            command_program.validate_environment(
+                env.cfg, keyboard=playback_cfg.keyboard or bool(getattr(
+                    getattr(cfg, "interactive", None), "keyboard", False,
+                )),
+            )
+        footprint_recorder = None
+        footprints = getattr(getattr(cfg, "demo", None), "footprints", None)
+        if footprints is not None and bool(getattr(footprints, "enabled", False)):
+            from unilab.visualization.footprints import FootprintRecorder
+
+            footprint_recorder = FootprintRecorder(
+                num_envs=int(playback_cfg.num_envs), ctrl_dt=float(env.cfg.ctrl_dt),
+                max_records=footprints.max_records,
+            )
         wrapped_env = resolved_deps["wrapper_cls"](
             env, device=device_name, policy_obs_mode=policy_obs_mode
         )
@@ -517,6 +550,8 @@ def create_fada_playback_session(
             controller=controller,
             num_envs=playback_cfg.num_envs,
             official_adapter=official_adapter,
+            command_program=command_program,
+            footprint_recorder=footprint_recorder,
         )
         return session, policy_obs_mode, checkpoint_path
     except Exception:

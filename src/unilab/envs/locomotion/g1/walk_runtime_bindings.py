@@ -60,6 +60,18 @@ def publish_walk_termination_provenance(
 
 
 class G1WalkRuntimeBindings:
+    def get_foot_contact(self) -> np.ndarray:
+        """Return real left/right foot contacts with shape ``(N, 2)``.
+
+        Reuse the task's existing any-corner contact rule; gait targets and
+        predicted contact schedules are not sensor observations.
+        """
+        left = compute_aggregated_foot_contact(self._backend, LEFT_FOOT_CONTACT_SENSORS)
+        right = compute_aggregated_foot_contact(self._backend, RIGHT_FOOT_CONTACT_SENSORS)
+        if left.shape != (self._num_envs,) or right.shape != left.shape:
+            raise ValueError("G1 foot contact sensors must match the environment rows")
+        return np.stack((left, right), axis=1)
+
     def refresh_state(self) -> NpEnvState:
         """Refresh playback observations without a reward or curriculum transaction."""
         if self._state is None:
