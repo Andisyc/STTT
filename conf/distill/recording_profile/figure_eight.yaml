@@ -6,15 +6,15 @@ interactive:
   keyboard: false
   camera_follow_body: false
   camera_focus_body_name: pelvis
-  camera_distance: null  # Fit the whole world-anchored reference route once.
-  camera_elevation: -65.0
+  camera_distance: 8.0  # Elevated fixed view covering the full route.
+  camera_elevation: -70.0
   camera_azimuth: 90.0
 
 demo:
   figure_eight:
     enabled: true
-    width_m: 6.0
-    height_m: 3.0
+    width_m: 4.0
+    height_m: 2.0
     speed_m_s: 0.3
     segment_duration_s: 0.8
   footprints:
