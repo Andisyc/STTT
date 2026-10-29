@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import queue
+import signal
 import sys
 import time
 import traceback
@@ -57,12 +58,28 @@ class DaggerCollectResult:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class DaggerPrepareRequest:
+    request_id: str
+
+
+@dataclass(frozen=True)
+class DaggerPrepareResult:
+    request_id: str
+    worker_pid: int
+    metadata: Mapping[str, Any]
+
+
 class DaggerCollectorService(Protocol):
     """Worker-local service initialized once and reused across requests."""
 
     def collect(self, request: DaggerCollectRequest) -> DaggerCollectResult: ...
 
     def close(self) -> None: ...
+
+
+class PreparedDaggerCollectorService(DaggerCollectorService, Protocol):
+    def prepare(self, request: DaggerPrepareRequest) -> DaggerPrepareResult: ...
 
 
 def validate_dagger_collect_result(
@@ -117,7 +134,10 @@ def _persistent_dagger_collector_entry(
                 continue
             if request is None:
                 break
-            result_queue.put(service.collect(request))
+            if isinstance(request, DaggerPrepareRequest):
+                result_queue.put(cast(PreparedDaggerCollectorService, service).prepare(request))
+            else:
+                result_queue.put(service.collect(request))
     except BaseException as exc:
         collect_error = exc
         raise
@@ -152,6 +172,7 @@ class PersistentDaggerCollectorRunner(AsyncRunner):
         checkpoint_activator: Callable[[Path], int] | None = None,
         request_timeout_seconds: float = 300.0,
         worker_lifecycle: Literal["persistent", "request"] = "persistent",
+        collector_daemon: bool = True,
     ) -> None:
         super().__init__(
             env_name="DAggerPersistentCollector",
@@ -160,6 +181,7 @@ class PersistentDaggerCollectorRunner(AsyncRunner):
             device="cpu",
             collector_device="cpu",
             num_envs=1,
+            collector_daemon=collector_daemon,
         )
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -244,6 +266,16 @@ class PersistentDaggerCollectorRunner(AsyncRunner):
                     f"request={request.expected_weight_version}, "
                     f"active={self._active_weight_version}"
                 )
+        return cast(DaggerCollectResult, self._exchange(request))
+
+    def prepare(self, request: DaggerPrepareRequest) -> DaggerPrepareResult:
+        if self._worker_lifecycle != "persistent":
+            raise ValueError("prepare requires a persistent worker lifecycle")
+        return cast(DaggerPrepareResult, self._exchange(request))
+
+    def _exchange(
+        self, request: DaggerCollectRequest | DaggerPrepareRequest
+    ) -> DaggerCollectResult | DaggerPrepareResult:
         self.start()
         primary_error: BaseException | None = None
         try:
@@ -256,10 +288,7 @@ class PersistentDaggerCollectorRunner(AsyncRunner):
                         f"persistent DAgger collector timed out for request {request.request_id!r}"
                     )
                 try:
-                    result = cast(
-                        DaggerCollectResult,
-                        self._result_queue.get(timeout=min(0.1, remaining)),
-                    )
+                    result = self._result_queue.get(timeout=min(0.1, remaining))
                 except queue.Empty:
                     if (
                         self._collector_process is not None
@@ -267,7 +296,13 @@ class PersistentDaggerCollectorRunner(AsyncRunner):
                     ):
                         raise RuntimeError(self._read_collector_error())
                     continue
-                validate_dagger_collect_result(request, result)
+                if isinstance(request, DaggerPrepareRequest):
+                    if not isinstance(result, DaggerPrepareResult) or result.request_id != request.request_id:
+                        raise ValueError("persistent DAgger prepare result identity mismatch")
+                else:
+                    if not isinstance(result, DaggerCollectResult):
+                        raise ValueError("expected a persistent DAgger collection result")
+                    validate_dagger_collect_result(request, result)
                 return result
         except BaseException as exc:
             primary_error = exc
@@ -301,13 +336,19 @@ class PersistentDaggerCollectorRunner(AsyncRunner):
             process.join(timeout=10.0)
         retirement_error: RuntimeError | None = None
         if process.is_alive():
-            process.terminate()
+            if not self._signal_collector_group(signal.SIGTERM):
+                process.terminate()
             process.join(timeout=5.0)
+            if process.is_alive():
+                self._signal_collector_group(signal.SIGKILL)
+                process.kill()
+                process.join(timeout=5.0)
             retirement_error = RuntimeError(
                 "request-scoped DAgger collector did not retire after its transaction"
             )
         elif process.exitcode != 0:
             retirement_error = RuntimeError(self._read_collector_error())
+        self._signal_collector_group(signal.SIGKILL)
         process.close()
         self._collector_process = None
         if self._error_recv is not None:

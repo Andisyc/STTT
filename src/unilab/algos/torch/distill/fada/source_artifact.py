@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 import uuid
 import weakref
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -13,10 +13,19 @@ from typing import Any, Iterator, Mapping
 import torch
 
 from unilab.algos.torch.distill.fada.model import FADAArchitectureConfig, FADASourceBatch
+from unilab.algos.torch.distill.fada.collection_contract import (
+    OFFICIAL_FADA_SCENARIO,
+    OFFICIAL_FADA_SOURCE_REVISION,
+    OfficialFADACollectionSpec,
+    OfficialFADARawTransitionBatch,
+    validate_official_fada_preprocessing,
+)
 
 FADA_SOURCE_BATCH_SCHEMA_VERSION = 4
 FADA_SHARDED_SOURCE_SCHEMA_VERSION = 5
 _FADA_SOURCE_SHARD_SCHEMA_VERSION = 1
+OFFICIAL_FADA_SHARDED_SOURCE_SCHEMA_VERSION = 8
+_OFFICIAL_FADA_SOURCE_SHARD_SCHEMA_VERSION = 3
 
 
 def _cleanup_uncommitted_artifact(shard_dir: Path, manifest_temporary: Path) -> None:
@@ -224,11 +233,15 @@ class FADAShardedSourceWriter:
         self,
         path: str | Path,
         *,
-        config: FADAArchitectureConfig,
+        config: FADAArchitectureConfig | None = None,
+        official_spec: OfficialFADACollectionSpec | None = None,
         replace_existing: bool = False,
     ) -> None:
+        if (config is None) == (official_spec is None):
+            raise ValueError("provide exactly one legacy config or official collection spec")
         self.target = Path(path)
         self.config = config
+        self.official_spec = official_spec
         self.replace_existing = bool(replace_existing)
         self._token = uuid.uuid4().hex
         self._shard_dir = self.target.parent / f"{self.target.name}.shards-{self._token}"
@@ -265,20 +278,35 @@ class FADAShardedSourceWriter:
         )
         return self
 
-    def append(self, batch: FADASourceBatch) -> None:
+    def append(self, batch: FADASourceBatch | OfficialFADARawTransitionBatch) -> None:
         if self._committed:
             raise RuntimeError("cannot append to a committed FADA source artifact")
-        validated = _validated_cpu_batch(batch, config=self.config)
-        rows = int(validated.command.shape[0])
+        if self.official_spec is not None:
+            if not isinstance(batch, OfficialFADARawTransitionBatch):
+                raise TypeError("official artifacts require raw transitions, not sampled windows")
+            batch.validate(self.official_spec)
+            tensors = {
+                item.name: getattr(batch, item.name).detach().cpu()
+                for item in fields(OfficialFADARawTransitionBatch)
+            }
+            rows = batch.num_samples
+            shard_schema = _OFFICIAL_FADA_SOURCE_SHARD_SCHEMA_VERSION
+        else:
+            if not isinstance(batch, FADASourceBatch) or self.config is None:
+                raise TypeError("legacy artifacts require a legacy source batch and config")
+            validated = _validated_cpu_batch(batch, config=self.config)
+            tensors = _batch_payload(validated)
+            rows = int(validated.command.shape[0])
+            shard_schema = _FADA_SOURCE_SHARD_SCHEMA_VERSION
         if rows <= 0:
             raise ValueError("FADA source artifact shards must contain at least one row")
         shard_path = self._shard_dir / f"shard_{len(self._shards):04d}.pt"
         temporary = shard_path.with_suffix(".pt.tmp")
         torch.save(
             {
-                "schema_version": _FADA_SOURCE_SHARD_SCHEMA_VERSION,
+                "schema_version": shard_schema,
                 "rows": rows,
-                "batch": _batch_payload(validated),
+                "batch": tensors,
             },
             temporary,
         )
@@ -301,10 +329,18 @@ class FADAShardedSourceWriter:
             raise FileExistsError(
                 f"refusing to overwrite existing FADA source artifact: {self.target}"
             )
+        if self.official_spec is not None:
+            _validate_official_source_metadata(metadata, self.official_spec)
+            schema_version = OFFICIAL_FADA_SHARDED_SOURCE_SCHEMA_VERSION
+            identity = {"official_spec": asdict(self.official_spec)}
+        else:
+            assert self.config is not None
+            schema_version = FADA_SHARDED_SOURCE_SCHEMA_VERSION
+            identity = {"architecture": asdict(self.config)}
         torch.save(
             {
-                "schema_version": FADA_SHARDED_SOURCE_SCHEMA_VERSION,
-                "architecture": asdict(self.config),
+                "schema_version": schema_version,
+                **identity,
                 "num_samples": self.num_samples,
                 "shards": [
                     {
@@ -414,41 +450,7 @@ def open_fada_source_artifact(
             shards=(),
             legacy_batch=batch,
         )
-    entries = payload.get("shards")
-    num_samples = payload.get("num_samples")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("FADA source artifact shards must be a non-empty list")
-    if not isinstance(num_samples, int) or num_samples <= 0:
-        raise ValueError("FADA source artifact num_samples must be positive")
-    shards: list[_FADASourceShard] = []
-    seen: set[Path] = set()
-    for entry in entries:
-        if (
-            not isinstance(entry, dict)
-            or not isinstance(entry.get("rows"), int)
-            or not isinstance(entry.get("size_bytes"), int)
-            or not isinstance(entry.get("sha256"), str)
-        ):
-            raise ValueError("FADA source artifact shard entries are malformed")
-        shard = _FADASourceShard(
-            path=_resolve_shard(target, entry.get("path")),
-            rows=int(entry["rows"]),
-            size_bytes=int(entry["size_bytes"]),
-            sha256=str(entry["sha256"]),
-        )
-        if (
-            shard.rows <= 0
-            or shard.size_bytes <= 0
-            or len(shard.sha256) != 64
-            or shard.path in seen
-        ):
-            raise ValueError("FADA source artifact shard entries must be unique and non-empty")
-        if not shard.path.is_file():
-            raise FileNotFoundError(f"FADA source artifact shard does not exist: {shard.path}")
-        seen.add(shard.path)
-        shards.append(shard)
-    if sum(shard.rows for shard in shards) != num_samples:
-        raise ValueError("FADA source artifact manifest row count does not match its shards")
+    shards, num_samples = _source_shards_from_payload(target, payload)
     return LoadedFADASourceArtifact(
         config=config,
         metadata=metadata,
@@ -497,3 +499,123 @@ def validate_fada_async_artifact_identity(
     mismatches = [name for name in identity_fields if metadata.get(name) != expected.get(name)]
     if mismatches:
         raise ValueError(f"FADA async artifact identity mismatch: {mismatches}")
+
+
+def _source_shards_from_payload(
+    target: Path, payload: Mapping[str, Any]
+) -> tuple[tuple[_FADASourceShard, ...], int]:
+    entries = payload.get("shards")
+    num_samples = payload.get("num_samples")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("FADA source artifact shards must be a non-empty list")
+    if not isinstance(num_samples, int) or num_samples <= 0:
+        raise ValueError("FADA source artifact num_samples must be positive")
+    shards: list[_FADASourceShard] = []
+    seen: set[Path] = set()
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("rows"), int)
+            or not isinstance(entry.get("size_bytes"), int)
+            or not isinstance(entry.get("sha256"), str)
+        ):
+            raise ValueError("FADA source artifact shard entries are malformed")
+        shard = _FADASourceShard(
+            path=_resolve_shard(target, entry.get("path")),
+            rows=int(entry["rows"]),
+            size_bytes=int(entry["size_bytes"]),
+            sha256=str(entry["sha256"]),
+        )
+        if (
+            shard.rows <= 0
+            or shard.size_bytes <= 0
+            or len(shard.sha256) != 64
+            or shard.path in seen
+        ):
+            raise ValueError("FADA source artifact shard entries must be unique and non-empty")
+        if not shard.path.is_file():
+            raise FileNotFoundError(f"FADA source artifact shard does not exist: {shard.path}")
+        seen.add(shard.path)
+        shards.append(shard)
+    if sum(shard.rows for shard in shards) != num_samples:
+        raise ValueError("FADA source artifact manifest row count does not match its shards")
+    return tuple(shards), num_samples
+
+
+def _validate_official_source_metadata(
+    metadata: Mapping[str, Any], spec: OfficialFADACollectionSpec
+) -> None:
+    required = {
+        "request_id", "scenario", "iteration", "checkpoint_path", "expected_weight_version",
+        "observed_weight_version", "producer_pid", "source", "upstream_revision",
+        "expert_checkpoint", "expert_checkpoint_sha256", "experiment_config_sha256",
+        "preprocessing", "weak_checkpoint", "sample_unit", "collected_steps",
+    }
+    missing = required - metadata.keys()
+    if missing:
+        raise ValueError(f"official source metadata is incomplete: {sorted(missing)}")
+    validate_official_fada_preprocessing(metadata["preprocessing"])
+    if (
+        metadata["scenario"] != OFFICIAL_FADA_SCENARIO
+        or metadata["source"] not in {"optimal", "suboptimal", "online"}
+        or metadata["sample_unit"] != "transition"
+        or ((metadata["source"] == "suboptimal") != bool(metadata["weak_checkpoint"]))
+        or metadata["upstream_revision"] != OFFICIAL_FADA_SOURCE_REVISION
+        or metadata["observed_weight_version"] != metadata["expected_weight_version"]
+        or metadata["expert_checkpoint"] != str(Path(spec.expert_checkpoint).expanduser().resolve())
+    ):
+        raise ValueError("official source identity or weight version mismatch")
+    count = metadata["collected_steps"]
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ValueError("official collected_steps must be a positive transition count")
+    for name in ("expert_checkpoint_sha256", "experiment_config_sha256"):
+        value = metadata[name]
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError(f"official source {name} must be a SHA256 identity")
+
+
+@dataclass(frozen=True)
+class LoadedOfficialFADASourceArtifact:
+    """Lazy raw-transition reader; window batches are produced only by Replay."""
+
+    spec: OfficialFADACollectionSpec
+    metadata: Mapping[str, Any]
+    num_samples: int
+    shards: tuple[_FADASourceShard, ...]
+
+    def iter_batches(self) -> Iterator[OfficialFADARawTransitionBatch]:
+        for shard in self.shards:
+            if shard.path.stat().st_size != shard.size_bytes or _file_sha256(shard.path) != shard.sha256:
+                raise ValueError(f"FADA source shard content identity mismatch: {shard.path}")
+            payload = torch.load(shard.path, map_location="cpu", weights_only=True, mmap=True)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != _OFFICIAL_FADA_SOURCE_SHARD_SCHEMA_VERSION
+                or payload.get("rows") != shard.rows
+            ):
+                raise ValueError(f"malformed official source shard: {shard.path}")
+            batch = OfficialFADARawTransitionBatch.from_mapping(payload["batch"]).validate(self.spec)
+            if batch.num_samples != shard.rows:
+                raise ValueError(f"official source shard row mismatch: {shard.path}")
+            yield batch
+
+
+def open_official_fada_source_artifact(
+    path: str | Path, *, spec: OfficialFADACollectionSpec
+) -> LoadedOfficialFADASourceArtifact:
+    """Open the official schema with the same integrity/atomic writer as legacy data."""
+
+    target = Path(path)
+    payload = torch.load(target, map_location="cpu", weights_only=True, mmap=True)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != OFFICIAL_FADA_SHARDED_SOURCE_SCHEMA_VERSION
+        or payload.get("official_spec") != asdict(spec)
+    ):
+        raise ValueError("official source schema or collection spec mismatch")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("official source metadata must be a mapping")
+    _validate_official_source_metadata(metadata, spec)
+    shards, num_samples = _source_shards_from_payload(target, payload)
+    return LoadedOfficialFADASourceArtifact(spec, metadata, num_samples, shards)

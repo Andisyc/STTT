@@ -18,6 +18,8 @@ from unilab.algos.torch.distill.runtime.async_runtime import (
     DaggerCollectorService,
     DaggerCollectRequest,
     DaggerCollectResult,
+    DaggerPrepareRequest,
+    DaggerPrepareResult,
     PersistentDaggerCollectorRunner,
 )
 from unilab.ipc import SharedWeightSync
@@ -38,6 +40,8 @@ class PersistentDistillationRuntime:
         lifecycle_report_queue: Any | None = None,
         request_timeout_seconds: float = 300.0,
         worker_lifecycle: Literal["persistent", "request"] = "persistent",
+        collector_daemon: bool = True,
+        initial_student: torch.nn.Module | None = None,
     ) -> None:
         resolved_worker_kwargs = dict(worker_kwargs or {})
         collisions = sorted(_WEIGHT_SYNC_KEYS & resolved_worker_kwargs.keys())
@@ -53,12 +57,14 @@ class PersistentDistillationRuntime:
         self.close_report: dict[str, Any] | None = None
         self._request_timeout_seconds = float(request_timeout_seconds)
         self._worker_lifecycle: Literal["persistent", "request"] = worker_lifecycle
+        self._collector_daemon = collector_daemon
         self._weight_sync: SharedWeightSync | None = None
         self._runner: PersistentDaggerCollectorRunner | None = None
         self._param_shapes: dict[str, torch.Size] | None = None
         self._pending_path: str | None = None
         self._pending_state_dict: dict[str, torch.Tensor] | None = None
         self._closed = False
+        self._initial_student = initial_student
 
     @property
     def weight_version(self) -> int:
@@ -91,11 +97,13 @@ class PersistentDistillationRuntime:
 
     def _ensure_runtime(
         self,
-        checkpoint_path: Path,
+        checkpoint_path: Path | None,
         state_dict: dict[str, torch.Tensor],
     ) -> None:
         if self._runner is not None:
             return
+        if checkpoint_path is None and self._worker_kwargs_factory is not None:
+            raise ValueError("prepare cannot use checkpoint-derived worker kwargs")
         self._param_shapes = {name: value.shape for name, value in state_dict.items()}
         self._weight_sync = SharedWeightSync(self._param_shapes)
         dynamic_worker_kwargs = (
@@ -118,14 +126,15 @@ class PersistentDistillationRuntime:
             "weight_sync_lock": self._weight_sync._lock,
             "weight_param_shapes": self._param_shapes,
         }
-        self._pending_path = str(checkpoint_path.resolve())
-        self._pending_state_dict = state_dict
+        self._pending_path = None if checkpoint_path is None else str(checkpoint_path.resolve())
+        self._pending_state_dict = None if checkpoint_path is None else state_dict
         self._runner = PersistentDaggerCollectorRunner(
             worker_factory=self._worker_factory,
             worker_kwargs=worker_kwargs,
             checkpoint_activator=self._publish_checkpoint,
             request_timeout_seconds=self._request_timeout_seconds,
             worker_lifecycle=self._worker_lifecycle,
+            collector_daemon=self._collector_daemon,
         )
 
     def _publish_checkpoint(self, checkpoint_path: Path) -> int:
@@ -153,6 +162,23 @@ class PersistentDistillationRuntime:
         self._pending_state_dict = state_dict
         assert self._runner is not None
         return self._runner.activate_checkpoint(resolved_path)
+
+    def prepare(self, request: DaggerPrepareRequest) -> DaggerPrepareResult:
+        if self._closed:
+            raise RuntimeError("cannot prepare a closed persistent distillation runtime")
+        if self._runner is None:
+            if self._initial_student is None:
+                raise RuntimeError("prepare requires an explicit initial student")
+            state = {
+                name: value.detach().cpu()
+                for name, value in self._initial_student.state_dict().items()
+            }
+            if not state:
+                raise ValueError("initial student has an empty state_dict")
+            self._ensure_runtime(None, state)
+            self._initial_student = None
+        assert self._runner is not None
+        return self._runner.prepare(request)
 
     def collect(self, request: DaggerCollectRequest) -> DaggerCollectResult:
         if self._runner is None:

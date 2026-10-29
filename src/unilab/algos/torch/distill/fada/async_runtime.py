@@ -24,7 +24,10 @@ from unilab.algos.torch.distill.fada.async_config import (
     v005_replay_cfg,
 )
 from unilab.algos.torch.distill.fada.checkpoint import load_fada_policy_checkpoint
-from unilab.algos.torch.distill.fada.collection_contract import FADACollectionSpec
+from unilab.algos.torch.distill.fada.collection_contract import (
+    FADACollectionSpec,
+    OfficialFADACollectionSpec,
+)
 from unilab.algos.torch.distill.fada.model import FADA_COMMAND_SCENARIOS, FADAArchitectureConfig
 from unilab.algos.torch.distill.fada.oracle import (
     load_fada_oracle_policy,
@@ -310,10 +313,38 @@ def build_persistent_fada_runtime(
     )
 
 
+def build_official_fada_runtime(
+    *,
+    spec: OfficialFADACollectionSpec,
+    student_loader: Callable[[Path], torch.nn.Module],
+    initial_student: torch.nn.Module,
+    request_timeout_seconds: float = 300.0,
+    performance_enabled: bool = False,
+) -> PersistentDistillationRuntime:
+    """Compose the official source service without importing its simulator in the parent."""
+
+    from unilab.algos.torch.distill.fada.official_source_runtime import (
+        OfficialFADACollectorWorker,
+    )
+
+    if not isinstance(performance_enabled, bool):
+        raise ValueError("performance_enabled must be a boolean")
+
+    return PersistentDistillationRuntime(
+        student_loader=student_loader,
+        initial_student=initial_student,
+        worker_factory=OfficialFADACollectorWorker,
+        worker_kwargs={"spec": spec, "performance_enabled": performance_enabled},
+        request_timeout_seconds=request_timeout_seconds,
+        collector_daemon=False,
+    )
+
+
 __all__ = [
     "FADA_COMMAND_SCENARIOS",
     "FADA_ASYNC_SCENARIO",
     "PersistentFADACollectorWorker",
     "allocate_fada_command_scenarios",
     "build_persistent_fada_runtime",
+    "build_official_fada_runtime",
 ]

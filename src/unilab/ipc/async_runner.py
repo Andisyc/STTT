@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import signal
 import sys
 from abc import ABC, abstractmethod
 from typing import Any, Callable
@@ -50,6 +51,8 @@ def _collector_entry_wrapper(
     collector 本进程 abort, 以便 core dump 保留真实 collector native 状态.
     """
     label = kwargs.pop("_error_label", "collector")
+    if kwargs.pop("_collector_session", False) and os.name == "posix":
+        os.setsid()
     _enable_collector_faulthandler()
     try:
         with collector_error_guard(
@@ -88,6 +91,7 @@ class AsyncRunner(ABC):
         collector_device: str | None = None,
         sim_backend: str = "mujoco",
         num_envs: int = 4096,
+        collector_daemon: bool = True,
     ):
         self.env_name = env_name
         self.env_cfg_overrides = env_cfg_overrides
@@ -96,6 +100,8 @@ class AsyncRunner(ABC):
         self.collector_device = collector_device or self.device
         self.sim_backend = sim_backend
         self.num_envs = num_envs
+        self._collector_daemon = collector_daemon
+        self._collector_group_closed = False
 
         self._collector_process: Any = None
         self._stop_event = _SPAWN_CTX.Event()
@@ -121,11 +127,14 @@ class AsyncRunner(ABC):
 
     def _start_collector(self, target_fn: Callable, kwargs: dict) -> None:
         self._error_recv, self._error_send = create_error_pipe()
+        kwargs = dict(kwargs)
+        kwargs["_collector_session"] = not self._collector_daemon
+        self._collector_group_closed = False
 
         self._collector_process = _SPAWN_CTX.Process(
             target=_collector_entry_wrapper,
             args=(target_fn, self._error_send, kwargs),
-            daemon=True,
+            daemon=self._collector_daemon,
         )
         self._collector_process.start()
         self._error_send.close()
@@ -157,13 +166,37 @@ class AsyncRunner(ABC):
         exitcode = getattr(self._collector_process, "exitcode", None)
         return format_collector_death(exitcode, traceback_text)
 
+    def _signal_collector_group(self, sig: int) -> bool:
+        process = self._collector_process
+        if (
+            self._collector_daemon
+            or self._collector_group_closed
+            or os.name != "posix"
+            or process is None
+        ):
+            return False
+        if sig == signal.SIGKILL:
+            self._collector_group_closed = True
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return False
+        return True
+
     def close(self) -> None:
         self._stop_event.set()
         if self._collector_process is not None and self._collector_process.is_alive():
             self._collector_process.join(timeout=10)
             if self._collector_process.is_alive():
-                self._collector_process.terminate()
+                if not self._signal_collector_group(signal.SIGTERM):
+                    self._collector_process.terminate()
                 self._collector_process.join(timeout=5)
+                if self._collector_process.is_alive():
+                    self._signal_collector_group(signal.SIGKILL)
+                    self._collector_process.kill()
+                    self._collector_process.join(timeout=5)
+        # Native crashes can leave a shadow child after the collector has exited.
+        self._signal_collector_group(signal.SIGKILL)
 
         if self._collector_process is not None:
             exitcode = getattr(self._collector_process, "exitcode", None)

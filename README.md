@@ -516,3 +516,59 @@ FADAOracleCheckpointGateway
         ├── observation / action 布局
         └── robot asset 身份
 ```
+
+## 官方 FADA Locomotion 源训练
+
+正式入口为 `scripts/train_distill.py --config-name official_fada`，配置位于 `conf/distill/official_fada.yaml`，不再继承旧 SAC teacher、MuJoCo task 或 66/3 站走课程。非 FADA 蒸馏、旧 checkpoint 播放和现有在线 LoRA 方法保持独立。
+
+在仓库根目录启动；将下列路径替换为真实官方 checkout 和 PPO 产物：
+
+```bash
+PYTHONPATH="$PWD/src" uv run --frozen --no-sync python scripts/train_distill.py \
+  --config-name official_fada \
+  training.fada.upstream_root=/absolute/path/to/FADA \
+  training.fada.config.expert_checkpoint=/absolute/path/to/oracle_run/model_5000.pt
+```
+
+官方源码固定为 `LeCAR-Lab/FADA@290b3a9c5c0ebe2e9851b61350617544be05e9bc`。需要官方可读取的 PPO 配套保存配置、弱 checkpoint 历史，以及 Linux/CUDA/官方原生仿真环境；现有 MuJoCo SAC/APPO 和 66/3 学生不能替代。命令不会下载权重或安装依赖。
+
+### 采集、Replay 与外循环
+
+- `fada.async_runtime.build_official_fada_runtime` 显式接收 `OfficialFADACollectionSpec`、`student_loader` 和 `initial_student`。先通过同一 Runner 的 `prepare` 获取实际 Oracle 身份、预处理、配置和弱策略列表，再保存完整初始 checkpoint、`activate_checkpoint` 并采集；没有缺失文件时随机初始化的 loader 回退。
+- `OfficialFADACollectRequest` 明确指定 `optimal` / `suboptimal` / `online`；弱策略请求另带 `weak_checkpoint`，可选 `collect_steps` 以跨全部 env 的原始 transition 总数计。一个常驻 worker 复用官方 env、Trainer 和固定 Oracle shadow；不调用官方完整训练主循环。
+- 采集产物使用同一 `FADAShardedSourceWriter` 的官方 schema v8，经 `open_official_fada_source_artifact(...).iter_batches()` 读取原始 13 字段：obs、command、executed/expert action、两类 expert chunk 及有效标志、strict-label 标志、reward、done、env/episode ID。旧官方窗口 v7 不能冒充原始 Replay；历史 v5 reader 不变。
+- 父进程的 `OfficialFADAReplayBuffer` 复用固定上游纯 NumPy ReplayBuffer，按轨迹抽取、train/val 划分和 random/fifo 淘汰；容量单位为 transition。离线集可增长，online 跨轮积累；更新时重新 `sample_chunk`，而不是反复训练 worker 预抽的静态窗口。跨 shard 的完整 episode 统一判断。
+- 唯一外循环执行 `prepare → offline 采集/缓存 → warmup → DAgger 采集/更新 → save/publish → 下一轮 → close`。optimal 按固定 horizon 分次采集并保留完整 episode；suboptimal 轮换弱 checkpoint 至目标数据量。官方缓存、warmup 开关优先级和恢复语义保留。
+- 第一轮 online 前发布 warmup 后权重，每轮更新后发布新权重；`save_every_iter` 仅控制保留的周期快照，不降低权重发布频率。恢复包含模型、两组 optimizer、更新/轮次/采集计数及对应 online train/val Replay；不承诺物理环境或 RNG 的精确断点重放。
+- 此路径使用 non-daemon collector 以支持官方 shadow 子进程，继续沿用原错误通道、版本屏障和 POSIX 进程组回收。仍是轮次 barrier，不宣称已实现采学重叠。
+
+### 学生与学习接口
+
+- `fada.official_model.build_official_fada_student` 构建纯 Torch 官方结构，默认 compact/action/command 为 64/29/7，H=30、K=6；保留官方位置编码、pre-Norm、delta 重建与原生权重布局，不借用旧 66/3 模型。
+- `OfficialFADALearner.update(idm_batches_by_source, planner_batch)` 每批先更新 IDM，再固定其参数、经 IDM 反传更新 Planner。保留官方增强、mask、AdamW、梯度裁剪与来源配额；输出完整 K 步，但默认 `idm_action_loss_horizon_gamma=0` 仅监督首动作，Planner 状态损失系数默认 0。`sample_update(mode="offline" 或 "mixed")` 先采 Planner，再采五种 IDM 用途。
+- 预处理来自 worker 实际解析的 Oracle run；artifact 必须与其身份一致，不猜测缺失的 scale/noise，也不额外启用 IO normalization。
+- `save_official_fada_checkpoint` 保存独立 `unilab_official_fada_student` schema v2、模型/训练/预处理配置、原生权重、两组 optimizer、计数和 Replay 引用；`load_official_fada_checkpoint` 严格恢复学习状态，`load_official_fada_student_checkpoint` 仅恢复 eval 模型。旧学生、旧官方诊断 schema 和 Oracle PPO/APPO 不混用。
+
+已完成两类离线证据：固定官方源码的 CPU 数值对照（网络、采样、loss、权重与 AdamW 状态），以及真实入口、原始 Replay、多 shard、warmup、两轮 DAgger、共享权重发布和恢复的短链路验证。后者使用明确标识的诊断轨迹，不代表真实采集。官方原生仿真验收、shadow 状态/RNG 隔离和策略质量仍需实际产物、环境及运行授权。
+
+### 官方学生播放与在线适应（第 5 步）
+
+- 沿用 `scripts/play_fada_online.py` 和同一 playback session。使用 `task=g1_walk_flat/mujoco`、`interactive.action_mode=policy`，将 `training.play_checkpoint_path` 指向官方学生 checkpoint，并显式提供 `official_playback.profile_path`。关闭/开启更新仍由 `online_adaptation.enabled=false/true` 控制，不另建播放或更新循环。
+- profile 是从真实 Oracle run 核准的 YAML，必须包含 `source_identity`、`joint_names`、`default_joint_pos`、`action_scale`、`stiffness`、`damping`、`clip_actions`、`ctrl_dt`、`gait_frequency`、`gait_clock_mode`、`phase_init`。身份必须与 checkpoint 一致；关节相关向量按源关节顺序提供 29 项，初始双脚相位为弧度。checkpoint 本身没有完整控制契约，不能用旧 task 的姿态、scale 或 PD 默认值代替。
+- 官方 64D 观测从公共物理状态接口组装：世界系角速度与重力转到基座系，关节位置减源默认角，按源关节顺序施加 checkpoint 预处理。不是截取旧 actor 观测的前 64 维，也不重复施加旧 actor 的缩放。完整 7D command 保留速度和四个步态 sin/cos；零速仍保留相位。
+- source 归一化动作经 source clip 后作为快照与历史保存，再映射到目标关节顺序、默认角和 scale；PD、控制周期和相位时钟必须匹配 profile。冷启动及 reset 左补零并携带 bool mask，历史不跨 episode。相位持续变化不会被误判为新的速度指令而清空待成熟轨迹。
+- 在线路径保留冻结 Planner/独立 base IDM、Q/V LoRA、固定伪标签、`Y_nom` 回归条件和原窗口/Adam/锚定/reset 语义。官方模型通过原生 command/mask 接口调用；旧 66/3 与既有 adapted checkpoint 的加载和播放路径保留。
+
+CPU 诊断已通过正式 loader/factory/session 的推理、完整 K 步收集、实际 LoRA 更新、partial reset、旧路径及缺失/错配 profile 提前拒绝检查。诊断环境不含物理仿真；真实官方产物绑定、原生播放与负重效果尚未验收。
+
+### 可选性能计时（第 6A 步）
+
+在官方源训练命令末尾追加 `training.fada.performance.enabled=true` 即可开启；默认关闭。开关位于原生算法配置之外，不进入 checkpoint、缓存或 Oracle 身份，也不改变采样量、更新量、loss 或权重发布规则。
+
+- 控制台在 warmup 完成、每轮 DAgger 和最终关闭后输出 `[FADA PERF]`；字段为累计值，比较相邻报告可得到本轮增量。最终返回值另含 `performance`。
+- `wall_seconds` 覆盖初始化、采集 RPC、artifact 读取/Replay 入库、采样/H2D、IDM 与 Planner 前反向/optimizer、保存、发布和关闭。最终 `total_elapsed` 的范围为训练 owner 初始化至 runtime 关闭，不含 CLI 启动前的 Python 导入；整条命令的耗时应在实际对照时另外计入。
+- `worker_wall_seconds` 保留真实资源初始化、同步、完整 rollout、CPU 打包和写盘耗时。rollout 包含原生 Oracle/shadow/环境事务，不冒充纯物理计算时间。父进程 RPC、worker 总时长与子阶段互相包含，不能直接相加。
+- `cuda_stream_seconds` 仅在 CUDA 路径记录本进程当前 stream 的 event 间隔，不是整个 GPU 或 shadow 子进程的 kernel 总耗时；仅在报告边界统一解析，不逐算子强制同步。CPU 下此字段为空。
+- `counters` 区分实际采集的原始 transition、抽取的训练窗口、学习更新和 online 轮数；窗口计数不是新增物理数据量。未执行的阶段不填假零值。
+
+已用一套 CPU 诊断短链路验证计时关闭/开启时模型、两组 AdamW、loss、RNG、保存轨迹及发布版本逐项一致，走通 warmup 和两轮 DAgger。原生仿真、CUDA 计时及官方/TTT 性能对照尚未运行；本次没有实现或宣称训练加速。

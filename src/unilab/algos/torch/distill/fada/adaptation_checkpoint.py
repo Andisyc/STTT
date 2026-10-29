@@ -19,7 +19,9 @@ from unilab.algos.torch.distill.fada.adaptation import (
 from unilab.algos.torch.distill.fada.checkpoint import (
     FADA_CHECKPOINT_SCHEMA_VERSION,
     LoadedFADAPlannerIDMPolicy,
+    LoadedOfficialFADAStudentPolicy,
     load_fada_policy_checkpoint,
+    load_official_fada_playback_checkpoint,
 )
 from unilab.algos.torch.distill.fada.model import FADAArchitectureConfig, FADAPlannerIDMPolicy
 from unilab.algos.torch.distill.fada.privileged_oracle import (
@@ -316,12 +318,14 @@ def load_fada_deployable_policy_checkpoint(
     path: str | Path,
     *,
     device: str | torch.device = "cpu",
-) -> LoadedFADAPlannerIDMPolicy:
+) -> LoadedFADAPlannerIDMPolicy | LoadedOfficialFADAStudentPolicy:
     """Dispatch supported source and adapted schemas for the official playback consumer."""
 
     payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     if not isinstance(payload, dict):
         raise ValueError("unsupported or malformed FADA deployable checkpoint schema")
+    if payload.get("format") == "unilab_official_fada_student":
+        return load_official_fada_playback_checkpoint(path, device=device)
     schema = payload.get("schema_version")
     if schema in {1, 2, 3, FADA_CHECKPOINT_SCHEMA_VERSION}:
         return load_fada_policy_checkpoint(path, device=device)

@@ -9,7 +9,13 @@ from torch import nn
 from torch.nn import functional as F
 
 from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy, first_action_mse
+from unilab.algos.torch.distill.fada.official_model import (
+    PlannerIDMPolicy as OfficialPlannerIDMPolicy,
+)
 from unilab.algos.torch.distill.fada.target_data import FADATargetBatch
+
+# Online LoRA ownership spans the legacy and official Planner-IDM policy families.
+FADAAdaptablePolicy = FADAPlannerIDMPolicy | OfficialPlannerIDMPolicy
 
 
 @dataclass(frozen=True)
@@ -200,11 +206,11 @@ class FADALoRAQVMultiheadAttention(nn.Module):
 
 @dataclass(frozen=True)
 class FADAAdaptedPolicy:
-    policy: FADAPlannerIDMPolicy
+    policy: FADAAdaptablePolicy
     lora_config: FADALoRAConfig
 
 
-def _discover_lora_targets(policy: FADAPlannerIDMPolicy) -> tuple[str, ...]:
+def _discover_lora_targets(policy: FADAAdaptablePolicy) -> tuple[str, ...]:
     return tuple(
         name
         for name, module in policy.idm.named_modules()
@@ -231,7 +237,7 @@ def _replace_submodule(root: nn.Module, name: str, replacement: nn.Module) -> No
 
 
 def inject_fada_idm_lora(
-    policy: FADAPlannerIDMPolicy,
+    policy: FADAAdaptablePolicy,
     config: FADALoRAConfig,
 ) -> FADAAdaptedPolicy:
     """Freeze Planner/base IDM and inject zero-delta adapters at the exact manifest."""
@@ -328,20 +334,20 @@ _ADAPTER_PARAMETER_SUFFIXES = (
 
 
 def fada_adapter_named_parameters(
-    policy: FADAPlannerIDMPolicy,
+    policy: FADAAdaptablePolicy,
 ) -> Iterator[tuple[str, nn.Parameter]]:
     for name, parameter in policy.named_parameters():
         if name.endswith(_ADAPTER_PARAMETER_SUFFIXES):
             yield name, parameter
 
 
-def fada_adapter_parameters(policy: FADAPlannerIDMPolicy) -> Iterator[nn.Parameter]:
+def fada_adapter_parameters(policy: FADAAdaptablePolicy) -> Iterator[nn.Parameter]:
     for _name, parameter in fada_adapter_named_parameters(policy):
         yield parameter
 
 
 def assert_fada_adaptation_parameter_ownership(
-    policy: FADAPlannerIDMPolicy,
+    policy: FADAAdaptablePolicy,
     config: FADALoRAConfig,
 ) -> None:
     adapters = dict(fada_adapter_named_parameters(policy))

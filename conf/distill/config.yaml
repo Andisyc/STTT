@@ -256,6 +256,9 @@ interactive:
 env: {}
 reward: {}
 
+official_playback:
+  profile_path: null  # Required source-run control profile for official 64/29/7 checkpoints.
+
 online_adaptation:
   enabled: false
   window_size: 10

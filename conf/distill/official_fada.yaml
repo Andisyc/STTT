@@ -1,0 +1,110 @@
+# Native FADA source training; intentionally does not compose a UniLab task.
+defaults:
+  - _self_
+
+training:
+  device: cuda:0
+  fada:
+    enabled: true
+    source_route: official
+    upstream_root: null
+    async_request_timeout_seconds: 3600.0
+    experiment_override_args: []
+    performance:
+      enabled: false
+    config:
+      expert_checkpoint: null
+      command_profile: locomotion
+      obs_dim: 64
+      act_dim: 29
+      cmd_dim: 7
+      history_len: 30
+      pred_horizon: 6
+      predict_future_obs: true
+      planner_use_action_history: false
+      use_generalized_idm: true
+      planner_predict_delta: true
+      idm_use_teacher_forcing: true
+      idm_teacher_forcing_ratio: 1.0
+      idm_detach_planner_future_obs: true
+      idm_use_current_command_for_history: false
+      planner_d_model: 128
+      planner_nhead: 4
+      planner_num_layers: 3
+      planner_dim_feedforward: 512
+      planner_dropout: 0.1
+      planner_use_learned_positional_encoding: false
+      idm_d_model: 128
+      idm_nhead: 4
+      idm_encoder_num_layers: 3
+      idm_decoder_num_layers: 2
+      idm_dim_feedforward: 512
+      idm_dropout: 0.1
+      idm_use_learned_positional_encoding: false
+      batch_size: 4096
+      lr: 3.0e-4
+      weight_decay: 0.01
+      grad_clip: 1.0
+      planner_obs_loss_coef: 0.0
+      idm_action_loss_coef: 1.0
+      idm_action_loss_horizon_gamma: 0.0
+      idm_planner_pass_action_loss_coef: 1.0
+      mixed_batch_offline_ratio: 0.2
+      idm_suboptimal_batch_ratio: 0.375
+      planner_suboptimal_batch_ratio: 0.375
+      online_trajectory_batch_ratio: 0.5
+      suboptimal_expert_batch_ratio: 0.5
+      warmup_idm_suboptimal_batch_ratio: 0.75
+      warmup_planner_suboptimal_batch_ratio: 0.75
+      augment_obs_noise: true
+      augment_obs_noise_overrides:
+        base_ang_vel: 0.15
+        projected_gravity: 0.02
+        dof_vel: 0.4
+        dof_pos: 0.02
+      augment_action_noise_level: 0.01
+      augment_history_mask_ratio: 0.2
+      augment_future_mask_ratio: 0.2
+      validation_batches: 4
+      val_trajectory_ratio: 0.15
+      replay_capacity: 5000000
+      online_buffer_eviction_policy: random
+      online_rollout_sample_ratio: 0.5
+      save_online_buffer: true
+      resume_checkpoint: null
+      resume_online_buffer: null
+      warmup_episodes: 5
+      warmup_max_steps_per_episode: 500
+      warmup_collect_steps: null
+      warmup_train_steps: 2000
+      suboptimal_data_ratio: 1.0
+      suboptimal_num_checkpoints: 20
+      suboptimal_checkpoint_sampling: reward_aware
+      dagger_iters: 30
+      rollout_steps_per_iter: 500
+      train_steps_per_iter: 1000
+      dagger_sigma: 0.05
+      command_resample_interval: 200
+      strict_chunk_labels: true
+      strict_label_worker_timeout_s: 60.0
+      simulator_override: keep
+      num_envs: 1024
+      headless: true
+      device: ${training.device}
+      seed: 42
+      output_dir: logs/fada/official
+      run_name: g1_official_fada
+      offline_cache_path: ${training.fada.config.output_dir}/cache/optimal.npz
+      offline_suboptimal_cache_path: ${training.fada.config.output_dir}/cache/suboptimal.npz
+      warmup_ckpt_path: ${training.fada.config.output_dir}/cache/warmup.pt
+      load_warmup_ckpt: true
+      force_warmup_train: true
+      force_recollect_offline: false
+      save_every_iter: 1
+      show_progress: true
+      wandb_enable: false
+      wandb_mode: disabled
+
+hydra:
+  job:
+    chdir: false

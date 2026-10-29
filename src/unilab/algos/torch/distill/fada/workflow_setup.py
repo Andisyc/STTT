@@ -5,10 +5,10 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, cast
 
-import torch
 from omegaconf import DictConfig, OmegaConf
 
 from unilab.algos.torch.distill.fada.async_config import fada_training_schedule
@@ -19,9 +19,6 @@ from unilab.algos.torch.distill.fada.observation import (
     assert_fada_active_route_contract,
     assert_fada_projection_matches_contract,
 )
-from unilab.algos.torch.distill.fada.oracle import (
-    load_fada_oracle_policy as _default_load_fada_oracle_policy,
-)
 from unilab.algos.torch.distill.fada.replay_sampling import (
     FADAReplaySamplingSpec,
     validate_sampling_batch_size,
@@ -30,6 +27,8 @@ from unilab.algos.torch.distill.fada.source_plan import (
     FADAPaperSourcePlan,
     build_fada_paper_source_plan,
 )
+from unilab.algos.torch.distill.fada.collection_contract import OfficialFADACollectionSpec
+from unilab.algos.torch.distill.fada.official_model import canonical_official_model_config
 
 ROOT_DIR = Path(__file__).resolve().parents[6]
 
@@ -38,15 +37,7 @@ ROOT_DIR = Path(__file__).resolve().parents[6]
 class FADAWorkflowDependencies:
     """Composition-root dependencies used by the FADA training owner."""
 
-    require_teacher_policy_collection_route: Callable[[DictConfig], None]
-    apply_collect_command_distribution_overrides: Callable[[DictConfig], Mapping[str, Any]]
-    resolve_teacher_checkpoint: Callable[..., tuple[Path | None, Path | None]]
-    build_teacher_spec: Callable[[DictConfig], Any]
-    build_persistent_fada_runtime: Callable[..., Any]
-    ensure_registries: Callable[[], None]
-    create_env: Callable[..., Any]
-    backend_adapter_cls: Callable[..., Any]
-    load_fada_oracle_policy: Callable[..., torch.nn.Module] = _default_load_fada_oracle_policy
+    build_official_fada_runtime: Callable[..., Any]
 
 
 def _distill_device(cfg: DictConfig) -> str:
@@ -337,3 +328,63 @@ fada_execution_mode = _fada_execution_mode
 resolve_fada_path = _fada_path
 paper_source_plan = _paper_source_plan
 fada_v005_replay_settings = _fada_v005_replay_settings
+
+
+def resolve_official_fada_setup(
+    cfg: DictConfig, *, teacher_checkpoint: str | Path | None = None
+) -> tuple[OfficialFADACollectionSpec, dict[str, Any], str, Path, float]:
+    """Keep official source parameters separate from historical UniLab SAC tasks."""
+
+    if not OmegaConf.select(cfg, "training.fada.enabled", default=False):
+        raise ValueError("run_fada_training requires training.fada.enabled=true")
+    if OmegaConf.select(cfg, "training.fada.source_route") != "official":
+        raise ValueError(
+            "historical FADA source training is retired; use "
+            "scripts/train_distill.py --config-name official_fada"
+        )
+    if any(OmegaConf.select(cfg, name) is not None for name in ("env", "teacher", "student")):
+        raise ValueError("official_fada must not inherit a legacy task, SAC teacher or student config")
+    fada = cfg.training.fada
+    native = OmegaConf.to_container(fada.config, resolve=True)
+    if not isinstance(native, dict):
+        raise TypeError("training.fada.config must contain native FADAConfig fields")
+
+    def absolute(value: Any, name: str) -> str:
+        if not isinstance(value, (str, Path)) or not str(value).strip():
+            raise ValueError(f"{name} must be set for official FADA training")
+        path = Path(value).expanduser()
+        return str((path if path.is_absolute() else ROOT_DIR / path).resolve())
+
+    upstream = absolute(OmegaConf.select(fada, "upstream_root"), "training.fada.upstream_root")
+    expert = absolute(
+        teacher_checkpoint if teacher_checkpoint is not None else native.get("expert_checkpoint"),
+        "training.fada.config.expert_checkpoint",
+    )
+    native["expert_checkpoint"] = expert
+    for name in (
+        "output_dir", "offline_cache_path", "offline_suboptimal_cache_path", "warmup_ckpt_path",
+        "resume_checkpoint", "resume_online_buffer",
+    ):
+        if native.get(name) is not None:
+            native[name] = absolute(native[name], f"training.fada.config.{name}")
+    model_config = canonical_official_model_config(
+        {name: native[name] for name in canonical_official_model_config() if name in native}
+    )
+    device = str(OmegaConf.select(cfg, "training.device", default=native.get("device", "cuda:0")))
+    if native.get("device", device) != device:
+        raise ValueError("parent training.device must equal the official worker device")
+    timeout = float(OmegaConf.select(fada, "async_request_timeout_seconds", default=3600.0))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("official request timeout must be finite and positive")
+    run_name = native.get("run_name")
+    if not isinstance(run_name, str) or not run_name or Path(run_name).name != run_name:
+        raise ValueError("official run_name must be a nonempty single path component")
+    output_dir = Path(native["output_dir"]) / f"{datetime.now():%Y%m%d_%H%M%S_%f}_{run_name}"
+    overrides = OmegaConf.select(fada, "experiment_override_args", default=[])
+    if not all(isinstance(item, str) for item in overrides):
+        raise ValueError("official experiment_override_args must contain strings")
+    spec = OfficialFADACollectionSpec(
+        upstream_root=upstream, expert_checkpoint=expert, config=native,
+        experiment_override_args=tuple(overrides),
+    )
+    return spec, model_config, device, output_dir, timeout

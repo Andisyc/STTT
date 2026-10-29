@@ -37,7 +37,6 @@ from unilab.algos.torch.distill import (
     WorkflowStudentUpdateResult,
     adopt_legacy_role_artifact,
     build_multitask_distillation_dataset,
-    build_persistent_fada_runtime,
     collect_distillation_dataset_from_env,
     collect_transition_distillation_dataset_from_env,
     config_fingerprint,
@@ -47,7 +46,6 @@ from unilab.algos.torch.distill import (
     load_distillation_checkpoint,
     load_distillation_dataset,
     load_distillation_student_policy,
-    load_fada_oracle_policy,
     load_sac_teacher_policy,
     make_fake_distillation_dataset,
     required_balanced_replay_updates,
@@ -90,9 +88,7 @@ from unilab.algos.torch.distill.fada.planner_idm.training import (
     FADAWorkflowDependencies,
     run_fada_training_owner,
 )
-from unilab.algos.torch.distill.fada.planner_idm.training import (
-    teacher_spec as build_fada_teacher_spec,
-)
+from unilab.algos.torch.distill.fada.async_runtime import build_official_fada_runtime
 from unilab.algos.torch.distill.g1_persistent_worker import (
     build_persistent_g1_distillation_runtime,
 )
@@ -136,29 +132,17 @@ def run_fada_training(
     cfg: DictConfig,
     *,
     teacher_checkpoint: str | Path | None = None,
-    create_env_fn: Any | None = None,
-    env_cfg_override_fn: Any | None = None,
 ) -> dict[str, Any]:
     """Compose dependencies and delegate the FADA use-case to its owner module."""
 
     dependencies = FADAWorkflowDependencies(
-        require_teacher_policy_collection_route=_require_teacher_policy_collection_route,
-        apply_collect_command_distribution_overrides=_apply_collect_command_distribution_overrides,
-        resolve_teacher_checkpoint=resolve_teacher_checkpoint,
-        build_teacher_spec=build_fada_teacher_spec,
-        build_persistent_fada_runtime=build_persistent_fada_runtime,
-        ensure_registries=ensure_registries,
-        create_env=create_env,
-        backend_adapter_cls=BackendAdapter,
-        load_fada_oracle_policy=load_fada_oracle_policy,
+        build_official_fada_runtime=build_official_fada_runtime,
     )
     return cast(
         dict[str, Any],
         run_fada_training_owner(
             cfg,
             teacher_checkpoint=teacher_checkpoint,
-            create_env_fn=create_env_fn,
-            env_cfg_override_fn=env_cfg_override_fn,
             dependencies=dependencies,
         ),
     )

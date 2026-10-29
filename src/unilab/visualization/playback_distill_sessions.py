@@ -376,6 +376,8 @@ def create_fada_playback_session(
         policy_obs_mode = "actor"
     controller = None
     architecture = None
+    official_profile = None
+    official_adapter = None
     if playback_cfg.action_mode == "policy":
         if checkpoint is None or not Path(checkpoint).is_file():
             raise FileNotFoundError(
@@ -384,16 +386,26 @@ def create_fada_playback_session(
         from unilab.algos.torch.distill.fada_playback import FADAPlaybackController
 
         loaded = resolved_deps["load_fada_policy"](checkpoint, device=device_name)
-        architecture = loaded.policy.config
+        from unilab.algos.torch.distill.fada.checkpoint import LoadedOfficialFADAStudentPolicy
+        if isinstance(loaded, LoadedOfficialFADAStudentPolicy):
+            from unilab.algos.torch.distill.fada.official_deployment import load_official_playback_profile
+            from unilab.algos.torch.distill.fada.runtime_policy import get_fada_runtime_spec
+            architecture = get_fada_runtime_spec(loaded.policy)
+            # Bind the actual source control contract before creating any env.
+            official_profile = load_official_playback_profile(
+                cfg, root_dir=root_dir, source_identity=loaded.checkpoint["source_identity"]
+            )
+        else:
+            architecture = loaded.policy.config
 
         if online is not None:
             from unilab.algos.torch.distill.fada.observation import (
                 FADA_G1_STATE_OBSERVATION_CONTRACT,
             )
 
-            if architecture.observation_contract != FADA_G1_STATE_OBSERVATION_CONTRACT:
+            if official_profile is None and architecture.observation_contract != FADA_G1_STATE_OBSERVATION_CONTRACT:
                 raise ValueError("Online snapshot adaptation requires g1_fada_state_v2")
-        else:
+        elif official_profile is None:
             controller = FADAPlaybackController(loaded.policy, device=device_name)
         log(f"Loading FADA Planner-IDM checkpoint: {checkpoint}")
         completed_name = (
@@ -410,6 +422,8 @@ def create_fada_playback_session(
     # B2: 通过 distill task config 构造环境, 键盘模式先收敛为静止零速 reset, 再核对 policy IO.
     create_env = resolved_deps["create_env"]
     task_name = str(getattr(cfg.training, "task_name", playback_cfg.task))
+    if official_profile is not None and task_name != "G1WalkFlat":
+        raise ValueError("official Locomotion playback requires task=g1_walk_flat/mujoco")
     build_env_cfg_override = resolved_deps.get("build_env_cfg_override")
     env_cfg_override = build_env_cfg_override(cfg) if build_env_cfg_override is not None else {}
     env_cfg_override = _apply_keyboard_playback_reset_contract(
@@ -433,7 +447,15 @@ def create_fada_playback_session(
         wrapped_env = resolved_deps["wrapper_cls"](
             env, device=device_name, policy_obs_mode=policy_obs_mode
         )
-        if architecture is not None:
+        if official_profile is not None:
+            from unilab.algos.torch.distill.fada.official_deployment import OfficialFADADeploymentAdapter
+            from unilab.algos.torch.distill.fada.official_playback import OfficialFADAPlaybackController
+            official_adapter = OfficialFADADeploymentAdapter(env, official_profile, device=device_name)
+            controller = OfficialFADAPlaybackController(
+                loaded.policy, profile=official_profile,
+                target_joint_names=official_adapter.target_joint_names, device=device_name,
+            )
+        elif architecture is not None:
             from unilab.algos.torch.distill.fada_observation import (
                 raw_observation_dim_for_fada_contract,
             )
@@ -473,10 +495,11 @@ def create_fada_playback_session(
                 lr=online.learning_rate,
                 max_grad_norm=online.max_grad_norm,
                 device=device_name,
+                **({"playback": controller} if official_profile is not None else {}),
             )
             log(
                 "Online adaptation enabled: objective=expert_trajectory_difference, "
-                f"prediction_horizon={loaded.policy.config.prediction_horizon}, "
+                f"prediction_horizon={architecture.prediction_horizon}, "
                 f"window_size={online.window_size}, gamma={online.gamma}, sigma={online.sigma}, "
                 f"warmup_steps={online.warmup_steps}, update_interval={online.update_interval}, "
                 f"learning_rate={online.learning_rate}, "
@@ -493,6 +516,7 @@ def create_fada_playback_session(
             action_mode=playback_cfg.action_mode,
             controller=controller,
             num_envs=playback_cfg.num_envs,
+            official_adapter=official_adapter,
         )
         return session, policy_obs_mode, checkpoint_path
     except Exception:

@@ -6,6 +6,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Any
 
 import torch
 
@@ -401,3 +402,47 @@ def validate_sampling_batch_size(
                 ordered_names=FADA_WALK_SPEED_BINS,
                 label="intermediate walk steady speed",
             )
+
+
+def official_replay_source_counts(
+    config: Mapping[str, Any], *, mode: str, planner: bool
+) -> dict[str, int]:
+    """Pinned FADA source budgets, including Python's original round semantics."""
+
+    if mode not in {"offline", "mixed"}:
+        raise ValueError(f"unknown official training mode: {mode}")
+    size = int(config["batch_size"])
+    if size <= 0:
+        raise ValueError("official batch_size must be positive")
+    planner_suboptimal = (
+        float(config["planner_suboptimal_batch_ratio"]) > 0
+        and float(config["suboptimal_data_ratio"]) > 0
+    )
+    suboptimal_enabled = planner_suboptimal or (
+        bool(config["use_generalized_idm"]) and float(config["suboptimal_data_ratio"]) > 0
+    )
+    name = "planner" if planner else "idm"
+    ratio_name = f"warmup_{name}_suboptimal_batch_ratio" if mode == "offline" else f"{name}_suboptimal_batch_ratio"
+    enabled = planner_suboptimal if planner else suboptimal_enabled
+    total_suboptimal = max(0, min(int(round(size * float(config[ratio_name]))) if enabled else 0, size))
+    expert_count = (
+        max(0, min(int(round(total_suboptimal * float(config["suboptimal_expert_batch_ratio"]))), total_suboptimal))
+        if not planner else 0
+    )
+    remaining = size - total_suboptimal
+    optimal = remaining if mode == "offline" else max(
+        0, min(int(round(remaining * float(config["mixed_batch_offline_ratio"]))), remaining)
+    )
+    online_total = remaining - optimal
+    trajectory_count = 0
+    if not planner:
+        trajectory_count = online_total if not config["use_generalized_idm"] else max(
+            0, min(int(round(online_total * float(config["online_trajectory_batch_ratio"]))), online_total)
+        )
+    return {
+        "optimal": optimal,
+        "suboptimal": total_suboptimal - expert_count,
+        "suboptimal_expert": expert_count,
+        "online": online_total - trajectory_count,
+        "online_trajectory": trajectory_count,
+    }

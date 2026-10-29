@@ -342,8 +342,9 @@ class RslRlPlaybackSession:
 class FADAPlaybackSession(RslRlPlaybackSession):
     """Stateful Planner-IDM playback session with episode-aligned histories."""
 
-    def __init__(self, *, controller: Any | None, **kwargs: Any) -> None:
+    def __init__(self, *, controller: Any | None, official_adapter: Any | None = None, **kwargs: Any) -> None:
         self.controller = None
+        self.official_adapter = official_adapter
         self.last_update_stats: dict[str, float | int] | None = None
         super().__init__(policy=None, **kwargs)
         if controller is not None:
@@ -364,7 +365,10 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         if self.controller is not None:
             self.controller.reset()
         self.last_update_stats = None
-        return super().reset()
+        result = super().reset()
+        if self.official_adapter is not None:
+            self.official_adapter.reset()
+        return result
 
     def step_once(self) -> Any:
         # B1: 先以当前 observation/command 计算并执行第一动作.
@@ -376,11 +380,16 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         if self.controller is not None:
             self.last_update_stats = self.controller.on_env_step(
                 executed_action=self.info.get("current_actions"),
-                next_observation=self.obs,
+                next_observation=(
+                    self.official_adapter.observation()
+                    if self.official_adapter is not None else self.obs
+                ),
                 done=done,
             )
             if self.autoreset_enabled:
                 self.controller.reset(done)
+                if self.official_adapter is not None:
+                    self.official_adapter.reset(done)
         self.step_count += 1
         return self.obs
 
@@ -392,6 +401,10 @@ class FADAPlaybackSession(RslRlPlaybackSession):
             )
         if self.controller is None:
             raise RuntimeError("FADA playback controller is unavailable.")
+        if self.official_adapter is not None:
+            physical = self.official_adapter.observation()
+            full_command = self.official_adapter.command(commands, self.info.get("gait_phase"))
+            return self.official_adapter.env_action(self.controller.act(physical, full_command))
         return self.controller.act(observation, commands)
 
 

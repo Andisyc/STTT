@@ -14,6 +14,19 @@ from unilab.algos.torch.distill.fada.async_config import validate_fada_training_
 from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy
 from unilab.algos.torch.distill.fada.source_artifact import load_architecture_config
 from unilab.algos.torch.distill.fada.trainer import FADATrainer
+from unilab.algos.torch.distill.fada.collection_contract import (
+    OFFICIAL_FADA_SOURCE_REVISION,
+    validate_official_fada_preprocessing,
+)
+from unilab.algos.torch.distill.fada.official_learning import (
+    OfficialFADALearner,
+    canonical_official_training_config,
+)
+from unilab.algos.torch.distill.fada.official_model import (
+    PlannerIDMPolicy as OfficialPlannerIDMPolicy,
+    build_official_fada_student,
+    canonical_official_model_config,
+)
 
 FADA_CHECKPOINT_SCHEMA_VERSION = 5
 FADA_TRAINING_SCHEDULE = "alternating_idm_then_planner"
@@ -37,6 +50,14 @@ class LoadedFADAPlannerIDMPolicy:
     """Inference-ready FADA policy reconstructed from one strict checkpoint."""
 
     policy: FADAPlannerIDMPolicy
+    checkpoint: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class LoadedOfficialFADAStudentPolicy:
+    """Explicit official model identity, separate from the legacy architecture."""
+
+    policy: OfficialPlannerIDMPolicy
     checkpoint: Mapping[str, Any]
 
 
@@ -184,3 +205,148 @@ def load_fada_policy_checkpoint(
     policy.idm.load_state_dict(payload["idm_state_dict"], strict=True)
     policy.eval()
     return LoadedFADAPlannerIDMPolicy(policy=policy, checkpoint=payload)
+
+
+_OFFICIAL_STUDENT_FORMAT = "unilab_official_fada_student"
+
+
+def _official_source_identity(identity: Mapping[str, Any]) -> dict[str, str]:
+    names = (
+        "upstream_revision", "expert_checkpoint", "expert_checkpoint_sha256",
+        "experiment_config_sha256",
+    )
+    if not isinstance(identity, Mapping) or any(
+        not isinstance(identity.get(name), str) or not identity[name] for name in names
+    ):
+        raise ValueError("official student requires complete expert/experiment provenance")
+    result = {name: identity[name] for name in names}
+    if result["upstream_revision"] != OFFICIAL_FADA_SOURCE_REVISION:
+        raise ValueError("official student upstream revision mismatch")
+    if not Path(result["expert_checkpoint"]).is_absolute():
+        raise ValueError("official expert checkpoint identity must be an absolute path")
+    for name in ("expert_checkpoint_sha256", "experiment_config_sha256"):
+        value = result[name]
+        if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError(f"official student has malformed {name}")
+    return result
+
+
+def save_official_fada_checkpoint(
+    path: str | Path,
+    learner: OfficialFADALearner,
+    *,
+    completed_iterations: int,
+    samples_seen: int,
+    source_identity: Mapping[str, Any],
+    rollout_step_count: int = 0,
+    online_buffer_path: str | Path | None = None,
+) -> Path:
+    """Save native-key student state and both optimizers, separate from legacy/PPO."""
+
+    counters = (completed_iterations, samples_seen, learner.update_count, rollout_step_count)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counters):
+        raise ValueError("official student counters must be non-negative integers")
+    model_config = canonical_official_model_config(learner.policy.official_model_config)
+    payload = {
+        "format": _OFFICIAL_STUDENT_FORMAT,
+        "schema_version": 2,
+        "model_config": model_config,
+        "training_config": canonical_official_training_config(learner.training_config),
+        "preprocessing": validate_official_fada_preprocessing(learner.preprocessing),
+        "source_identity": _official_source_identity(source_identity),
+        "student_state_dict": learner.policy.state_dict(),
+        "idm_optimizer_state_dict": learner.idm_optimizer.state_dict(),
+        "planner_optimizer_state_dict": learner.planner_optimizer.state_dict(),
+        "update_count": learner.update_count,
+        "completed_iterations": completed_iterations,
+        "samples_seen": samples_seen,
+        "rollout_step_count": rollout_step_count,
+        "online_buffer_path": None if online_buffer_path is None else str(online_buffer_path),
+    }
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(target)
+    return target
+
+
+def _read_official_student_checkpoint(
+    path: str | Path, *, map_location: str | torch.device
+) -> dict[str, Any]:
+    payload = torch.load(Path(path), map_location=map_location, weights_only=True)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("format") != _OFFICIAL_STUDENT_FORMAT
+        or payload.get("schema_version") != 2
+    ):
+        raise ValueError("expected an official64/29/7 student checkpoint, not legacy or Oracle PPO/APPO")
+    for name, canonicalize in (
+        ("model_config", canonical_official_model_config),
+        ("training_config", canonical_official_training_config),
+        ("preprocessing", validate_official_fada_preprocessing),
+        ("source_identity", _official_source_identity),
+    ):
+        value = payload.get(name)
+        if not isinstance(value, dict) or canonicalize(value) != value:
+            raise ValueError(f"official student checkpoint requires complete canonical {name}")
+    for name in ("student_state_dict", "idm_optimizer_state_dict", "planner_optimizer_state_dict"):
+        if not isinstance(payload.get(name), dict):
+            raise ValueError(f"official student checkpoint missing {name}")
+    for name in ("update_count", "completed_iterations", "samples_seen", "rollout_step_count"):
+        value = payload.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"official student checkpoint has invalid {name}")
+    replay_path = payload.get("online_buffer_path")
+    if "online_buffer_path" not in payload or (
+        replay_path is not None and (not isinstance(replay_path, str) or not replay_path)
+    ):
+        raise ValueError("official checkpoint has an invalid online Replay reference")
+    return payload
+
+
+def _restore_official_student(payload: Mapping[str, Any], *, device: str | torch.device):
+    policy = build_official_fada_student(payload["model_config"], device=device)
+    policy.load_state_dict(payload["student_state_dict"], strict=True)
+    policy.official_preprocessing = payload["preprocessing"]
+    policy.official_source_identity = payload["source_identity"]
+    return policy.eval()
+
+
+def load_official_fada_student_checkpoint(
+    path: str | Path, *, device: str | torch.device = "cpu"
+) -> torch.nn.Module:
+    """Inference-only loader usable directly by build_official_fada_runtime."""
+    payload = _read_official_student_checkpoint(path, map_location=device)
+    return _restore_official_student(payload, device=device)
+
+
+def load_official_fada_playback_checkpoint(
+    path: str | Path, *, device: str | torch.device = "cpu"
+) -> LoadedOfficialFADAStudentPolicy:
+    payload = _read_official_student_checkpoint(path, map_location=device)
+    return LoadedOfficialFADAStudentPolicy(
+        policy=_restore_official_student(payload, device=device), checkpoint=payload
+    )
+
+
+def load_official_fada_checkpoint(
+    path: str | Path,
+    learner: OfficialFADALearner,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Any]:
+    """Resume only the same resolved model, optimization, and preprocessing contract."""
+
+    payload = _read_official_student_checkpoint(path, map_location=map_location)
+    if (
+        payload["model_config"] != learner.policy.official_model_config
+        or payload["training_config"] != learner.training_config
+        or payload["preprocessing"] != learner.preprocessing
+    ):
+        raise ValueError("official student resume configuration/preprocessing mismatch")
+    learner.policy.load_state_dict(payload["student_state_dict"], strict=True)
+    learner.idm_optimizer.load_state_dict(payload["idm_optimizer_state_dict"])
+    learner.planner_optimizer.load_state_dict(payload["planner_optimizer_state_dict"])
+    learner.update_count = payload["update_count"]
+    return payload

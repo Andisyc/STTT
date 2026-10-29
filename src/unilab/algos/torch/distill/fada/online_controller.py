@@ -15,6 +15,8 @@ from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy
 from unilab.algos.torch.distill.fada.online_collector import OnlineTrajectoryCollector
 from unilab.algos.torch.distill.fada.online_updater import OnlineSnapshotUpdater, build_expert_samples
 from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
+from unilab.algos.torch.distill.fada.official_model import PlannerIDMPolicy
+from unilab.algos.torch.distill.fada.runtime_policy import get_fada_runtime_spec
 
 
 @dataclass(frozen=True)
@@ -60,7 +62,7 @@ class OnlineAdaptationController:
 
     def __init__(
         self,
-        policy: FADAPlannerIDMPolicy,
+        policy: FADAPlannerIDMPolicy | PlannerIDMPolicy,
         lora_config: FADALoRAConfig,
         *,
         window_size: int = 10,
@@ -71,6 +73,7 @@ class OnlineAdaptationController:
         lr: float = 1e-4,
         max_grad_norm: float | None = 1.0,
         device: str | torch.device = "cpu",
+        playback: Any | None = None,
     ) -> None:
         FADAOnlineAdaptationConfig(
             enabled=True, window_size=window_size, gamma=gamma, sigma=sigma,
@@ -79,14 +82,20 @@ class OnlineAdaptationController:
             lora_alpha=lora_config.alpha, lora_dropout=lora_config.dropout,
         )
         self.device = torch.device(device)
-        self.collector = OnlineTrajectoryCollector(policy.config, window_size=window_size)
+        self.runtime_spec = get_fada_runtime_spec(policy)
+        if playback is None and self.runtime_spec.family == "official":
+            raise ValueError("official online adaptation requires its source-bound playback controller")
+        if playback is not None and playback.policy is not policy:
+            raise ValueError("online adaptation and playback must share the same policy")
+        self.collector = OnlineTrajectoryCollector(self.runtime_spec, window_size=window_size)
         self.base_idm = copy.deepcopy(policy.idm).eval().requires_grad_(False)
         self.updater = OnlineSnapshotUpdater(
-            policy, lora_config, sigma=sigma, lr=lr, max_grad_norm=max_grad_norm
+            policy, lora_config, sigma=sigma, lr=lr, max_grad_norm=max_grad_norm,
+            runtime_spec=self.runtime_spec,
         )
         self.policy = self.updater.policy
         self.policy.eval()
-        self.playback = FADAPlaybackController(self.policy, device=self.device)
+        self.playback = playback if playback is not None else FADAPlaybackController(self.policy, device=self.device)
         self.update_interval = int(update_interval)
         self.warmup_steps = int(warmup_steps)
         self.gamma = float(gamma)
@@ -128,7 +137,8 @@ class OnlineAdaptationController:
             and self.collector.ready
         ):
             samples = build_expert_samples(
-                self.base_idm, self.collector.get_window(), gamma=self.gamma
+                self.base_idm, self.collector.get_window(), gamma=self.gamma,
+                runtime_spec=self.runtime_spec,
             )
             stats = self.updater.update(samples)
             self.collector.clear_window()
