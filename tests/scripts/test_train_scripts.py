@@ -5317,12 +5317,8 @@ def test_play_wrapper_preserves_hora_priv_info_and_proprio_history():
         def init_state(self):
             pass
 
-        def reset(self, env_indices):
-            del env_indices
-            return (
-                cast(dict[str, np.ndarray], getattr(self.state, "obs")),
-                cast(dict[str, np.ndarray], getattr(self.state, "info")),
-            )
+        def reset_all(self):
+            return self.state
 
     wrapper = HoraRslRlVecEnvWrapper(FakeEnv(), device="cpu", policy_obs_mode="flat")
     obs_td, _ = wrapper.reset()

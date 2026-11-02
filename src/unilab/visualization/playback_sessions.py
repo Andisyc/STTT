@@ -351,6 +351,7 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         footprint_recorder: FootprintRecorder | None = None, **kwargs: Any,
     ) -> None:
         self.controller = None
+        self._closed = False
         self.official_adapter = official_adapter
         self.command_program = command_program
         self.footprint_recorder = footprint_recorder
@@ -389,6 +390,18 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         if self.footprint_recorder is not None:
             self.footprint_recorder.reset(self.env.get_foot_contact())
         return result
+
+    def close(self) -> None:
+        """Close controller-owned perception before the environment/backend."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close_controller = getattr(self.controller, "close", None)
+            if callable(close_controller):
+                close_controller()
+        finally:
+            self.wrapped_env.close()
 
     def step_once(self) -> Any:
         # B1: 先以当前 observation/command 计算并执行第一动作.

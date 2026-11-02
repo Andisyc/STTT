@@ -32,6 +32,7 @@ Camera controls (browser):
 import sys
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, cast
 
@@ -454,8 +455,11 @@ def play_viser(
     print("[play_viser] Press Ctrl+C to quit.")
 
     # --- Main loop -----------------------------------------------------------
+    # FADA online adaptation updates LoRA inside the session; inference_mode
+    # makes those tensors inference tensors, so only FADA needs the grad-able path.
+    step_context = nullcontext() if algo == "fada" else torch.inference_mode()
     try:
-        with torch.inference_mode():
+        with step_context:
             while True:
                 t0 = time.perf_counter()
 
@@ -488,7 +492,14 @@ def play_viser(
     except KeyboardInterrupt:
         print("\n[play_viser] Shutting down.")
     finally:
-        _close_scene_entries(scene_entries["value"])
+        try:
+            _close_scene_entries(scene_entries["value"])
+        finally:
+            # FADA sessions own controller/perception resources; RSL-RL sessions have none.
+            if algo == "fada":
+                close_session = getattr(playback_session, "close", None)
+                if callable(close_session):
+                    close_session()
 
 
 # --------------------------------------------------------------------------- #

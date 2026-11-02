@@ -291,6 +291,37 @@ online_adaptation:
   lora_alpha: 16.0
   lora_dropout: 0.05
 
+spatial_adaptation:
+  enabled: false
+  world_model_checkpoint: null
+  space_weight: 1.0
+  proprio_weight: 1.0
+  coordinate_weights: [1.0, 1.0, 1.0]
+  odometry_source: simulation  # simulation | cuvslam; cuvslam needs a local SDK and never falls back.
+  visual_mode: stereo  # stereo | inertial; inertial cuvslam requires all four imu_noise entries.
+  imu_noise: null  # gyroscope_noise_density, gyroscope_random_walk, accelerometer_noise_density, accelerometer_random_walk
+  max_pose_age_s: 0.1  # Measurement freshness: reject a pose older than this in physical time.
+  max_pose_gap_s: 0.1  # Never align a control interval across a longer measurement gap.
+  max_alignment_age_s: 0.2  # Physical-time budget for waiting on historical interval alignment.
+  max_pose_samples: 512
+  max_pending_intervals: 512
+  sensor:  # Shared rig contract; these camera names are created on the cold path.
+    body_name: torso_link
+    pelvis_body: pelvis
+    position: [0.08, 0.0, 0.30]
+    xyaxes: [0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+    baseline_m: 0.06
+    width: 320
+    height: 240
+    fovy_deg: 70.0
+    camera_period_steps: 5  # Integer physics steps, never wall-clock periods.
+    gyro_sensor: torso_gyro
+    accelerometer_sensor: torso_acceleration
+    left_camera: sttt_left
+    right_camera: sttt_right
+  adapter_checkpoint_path: null
+  save_adapter_path: null
+
 video_recording:
   enabled: true
   output_path: logs/fada_online/online_adaptation.mp4

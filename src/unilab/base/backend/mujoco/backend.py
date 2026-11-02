@@ -42,6 +42,7 @@ from ..base import (
     SimBackend,
     normalize_play_render_mode,
 )
+from ..sensors import BackendSensorStream, StereoSensorConfig
 from .playback import run_mujoco_playback
 
 
@@ -49,6 +50,14 @@ def _root_state_dims(model) -> tuple[int, int]:
     if model.njnt > 0 and int(model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE):
         return 7, 6
     return 0, 0
+
+
+_NS_PER_SECOND = 1_000_000_000
+
+
+def _sim_time_to_ns(sim_time: float) -> int:
+    """Convert MuJoCo physics time (state slot 0) to integer nanoseconds."""
+    return int(round(float(sim_time) * _NS_PER_SECOND))
 
 
 @dataclass
@@ -312,7 +321,9 @@ class MuJoCoBackend(SimBackend):
             None if position_actuator_gains is None else dict(position_actuator_gains)
         )
         self._pre_step_control_fn = None
+        self._sensor_stream: BackendSensorStream | None = None
         self._model = self._load_base_model()
+        self._cold_model = self._model
         self._base_body_id = (
             mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, base_name)
             if base_name is not None
@@ -929,8 +940,140 @@ class MuJoCoBackend(SimBackend):
                 f"failure: {failure}"
             )
 
+    def _step_with_sensor_stream(
+        self, ctrl: np.ndarray, nsteps: int
+    ) -> dict[str, dict[str, float]]:
+        """Step one physics substep at a time so every substep is sampled.
+
+        The stream evaluates the chest IMU on the visual model with the same state and
+        control each substep, so every IMU sample, rendered frame and reference pose is
+        stamped with the physics time it actually describes. The trajectory is bitwise
+        identical to the plain single-substep path.
+        """
+        stream = self._sensor_stream
+        if stream is None:
+            raise RuntimeError("MuJoCo sensor stream was released during stepping")
+        if getattr(self, "_isolated_rollout_active", False):
+            raise RuntimeError(
+                "cannot sample the stereo/IMU stream during an isolated rollout branch"
+            )
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError("MuJoCo backend pool is not materialized")
+        stream.ensure_capacity(upcoming_substeps=nsteps)
+
+        set_ctrl_ms = 0.0
+        physics_ms = 0.0
+        refresh_cache_ms = 0.0
+        has_pending_xfrc = bool(np.any(self._pending_xfrc_applied))
+
+        for _ in range(nsteps):
+            t0 = time.perf_counter()
+            native_ctrl = (
+                self._apply_pre_step_control(ctrl)
+                if self._pre_step_control_fn is not None
+                else ctrl
+            )
+            control_traj = native_ctrl[:, None, :]
+            control_spec = int(mujoco.mjtState.mjSTATE_CTRL)
+            if has_pending_xfrc:
+                control_spec |= int(mujoco.mjtState.mjSTATE_XFRC_APPLIED)
+                control_traj = np.concatenate(
+                    (control_traj, self._pending_xfrc_applied[:, None, :]), axis=-1
+                )
+            set_ctrl_ms += (time.perf_counter() - t0) * 1000.0
+
+            t0 = time.perf_counter()
+            state_np, sensor_np = pool.step(
+                self._physics_state,
+                nstep=1,
+                control=control_traj,
+                control_spec=control_spec,
+                return_sensor=True,
+                post_step_forward_sensor=self._post_step_forward_sensor,
+            )
+            self._physics_state[:] = state_np.astype(self._np_dtype)
+            physics_ms += (time.perf_counter() - t0) * 1000.0
+
+            t0 = time.perf_counter()
+            self._sensor_data[:] = sensor_np.astype(self._np_dtype)
+            refresh_cache_ms += (time.perf_counter() - t0) * 1000.0
+
+            t0 = time.perf_counter()
+            stream.observe_substep(
+                state_row=state_np[0],
+                control_row=np.asarray(native_ctrl[0], dtype=np.float64),
+                timestamp_ns=_sim_time_to_ns(float(state_np[0, 0])),
+                xfrc_row=self._pending_xfrc_applied[0] if has_pending_xfrc else None,
+            )
+            refresh_cache_ms += (time.perf_counter() - t0) * 1000.0
+
+        if has_pending_xfrc:
+            self._pending_xfrc_applied.fill(0.0)
+
+        return {
+            "timing": {
+                "set_ctrl_ms": set_ctrl_ms,
+                "physics_ms": physics_ms,
+                "refresh_cache_ms": refresh_cache_ms,
+            }
+        }
+
+    def get_sim_time_ns(self) -> int:
+        if self._num_envs != 1:
+            raise ValueError("A scalar physical clock requires exactly one environment")
+        return _sim_time_to_ns(float(self._physics_state[0, 0]))
+
+    def open_sensor_stream(self, config: StereoSensorConfig) -> BackendSensorStream:
+        """Open the opt-in chest stereo/IMU stream and sample it while stepping."""
+        from .sensors import create_mujoco_sensor_stream
+
+        if not isinstance(config, StereoSensorConfig):
+            raise TypeError(
+                f"MuJoCo sensor streams require a StereoSensorConfig, got {type(config).__name__}"
+            )
+        if self._num_envs != 1:
+            raise ValueError(
+                "MuJoCo stereo/IMU sensor streams support exactly one environment, "
+                f"got num_envs={self._num_envs}"
+            )
+        if getattr(self, "_isolated_rollout_active", False):
+            raise RuntimeError("cannot open a stereo/IMU stream during an isolated rollout branch")
+        if self._sensor_stream is not None:
+            raise RuntimeError(
+                "a MuJoCo stereo/IMU stream is already open; close it before opening another"
+            )
+        if self._pool is None:
+            raise RuntimeError("MuJoCo backend must be materialized before opening sensor streams")
+        visual_model_file = self._scene_artifacts.visual_model_file
+        if not visual_model_file:
+            raise RuntimeError("MuJoCo scene artifacts expose no visual model file")
+        base_model = getattr(self, "_cold_model", None)
+        if base_model is not None and self._model is not base_model:
+            raise RuntimeError(
+                "MuJoCo stereo/IMU streams need the base scene model; this environment runs a "
+                "randomized model variant, so the visual/IMU model would not match"
+            )
+
+        stream = create_mujoco_sensor_stream(
+            visual_model_source=visual_model_file,
+            physics_model=self._model,
+            config=config,
+            sim_dt=self._sim_dt,
+            initial_timestamp_ns=_sim_time_to_ns(float(self._physics_state[0, 0])),
+            on_close=self._release_sensor_stream,
+        )
+        self._sensor_stream = stream
+        return stream
+
+    def _release_sensor_stream(self, stream: BackendSensorStream) -> None:
+        if self._sensor_stream is stream:
+            self._sensor_stream = None
+
     def step(self, ctrl: np.ndarray, nsteps: int = 1) -> dict | None:
         self._raise_if_isolated_rollout_poisoned()
+        if self._sensor_stream is not None:
+            return self._step_with_sensor_stream(ctrl, nsteps)
         if self._pre_step_control_fn is not None:
             return self._step_with_pre_step_control(ctrl, nsteps)
 
@@ -1066,6 +1209,12 @@ class MuJoCoBackend(SimBackend):
         self._physics_state[env_indices] = state_out.astype(self._np_dtype)
         self._sensor_data[env_indices] = sensor_np.astype(self._np_dtype)
 
+        stream = self._sensor_stream
+        if stream is not None:
+            # Physical time of the post-reset state, never wall clock or ctrl_step*dt.
+            row = int(np.asarray(env_indices).reshape(-1)[0])
+            stream.observe_reset(timestamp_ns=_sim_time_to_ns(float(self._physics_state[row, 0])))
+
     def reset_physics_rows_to_default(self, env_indices: np.ndarray) -> None:
         """Sanitize the given rows back to each assigned model variant's default state.
 
@@ -1180,6 +1329,13 @@ class MuJoCoBackend(SimBackend):
         self._pool = None
         self._isolated_rollout_pool = None
         errors: list[BaseException] = []
+        stream = self._sensor_stream
+        self._sensor_stream = None
+        if stream is not None:
+            try:
+                stream.close()
+            except BaseException as exc:
+                errors.append(exc)
         closed_pool_ids: set[int] = set()
         try:
             for pool in (sibling, primary):

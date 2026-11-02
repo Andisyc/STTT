@@ -1,0 +1,33 @@
+# Independent diagnostic; never enables LoRA or world-model updates.
+mode: capture  # capture | replay | live
+output_dir: data/sttt/visual_odometry
+input_dir: data/sttt/visual_odometry
+source:
+  checkpoint_path: null  # Explicit G1 FADA checkpoint for capture/live.
+  num_steps: 300
+  seed: 0
+  device: null
+  overrides: [recording_profile=straight_payload, env.runtime_payload.enabled=false]
+  landmarks: true  # Visual-only scene fragment, no contacts or physical mass.
+sensor:
+  body_name: torso_link
+  pelvis_body: pelvis
+  position: [0.08, 0.0, 0.30]
+  xyaxes: [0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+  baseline_m: 0.06
+  width: 320
+  height: 240
+  fovy_deg: 70.0
+  camera_period_steps: 5  # With default G1 sim_dt: 30 Hz camera / 150 Hz IMU.
+  gyro_sensor: torso_gyro
+  accelerometer_sensor: torso_acceleration
+  left_camera: sttt_left
+  right_camera: sttt_right
+odometry:
+  mode: stereo  # inertial requires explicit positive imu_noise entries below.
+  imu_noise: null  # gyroscope_noise_density, gyroscope_random_walk, accelerometer_noise_density, accelerometer_random_walk
+alignment:
+  max_gap_s: 0.1  # Never interpolate across longer measurement gaps.
+  max_age_s: 0.2  # Physical-time waiting limit, not wall-clock runtime.
+  max_samples: 512
+  max_pending: 512

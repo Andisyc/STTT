@@ -6,6 +6,7 @@ import tempfile
 import time
 import warnings
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ from unilab.visualization.playback_overlay import (
     _render_reward_debug_targets,
     _render_velocity_arrows,
 )
+from unilab.visualization.playback_sessions import FADAPlaybackSession
 from unilab.visualization.playback_trace import (
     _env_flag,
     _env_positive_int,
@@ -617,7 +619,8 @@ def _run_interactive_viewer_loop(runtime: _InteractiveViewerRuntime, args) -> No
                 viewer.cam.elevation = float(args.camera_elevation)
             if getattr(args, "camera_azimuth", None) is not None:
                 viewer.cam.azimuth = float(args.camera_azimuth)
-        with torch.inference_mode():
+        context = nullcontext() if isinstance(runtime.session, FADAPlaybackSession) else torch.inference_mode()
+        with context:
             while viewer.is_running():
                 started = time.perf_counter()
                 if runtime.commander is not None and runtime.env.state is not None:
@@ -661,20 +664,25 @@ def play_interactive(
         if str(exc) in {_PLAYBACK_ENV_UNAVAILABLE, _HORA_DISTILL_CHECKPOINT_UNAVAILABLE}:
             return
         raise
-    if _uses_native_mujoco_viewer_launch() and not _can_launch_glfw_viewer():
-        print(
-            "[play_interactive] GLFW viewer initialization failed (no usable display). "
-            "Set DISPLAY correctly, or run this command in a desktop session."
-        )
-        return
+    playback_session = session[0]
     try:
-        runtime = _prepare_viewer_runtime(
-            args, cfg, algo=algo, device=device, playback_session=session[0]
-        )
-    except RuntimeError as exc:
-        if str(exc).startswith("interactive.keyboard unavailable:"):
-            print(f"[play_interactive] {exc}")
+        if _uses_native_mujoco_viewer_launch() and not _can_launch_glfw_viewer():
+            print(
+                "[play_interactive] GLFW viewer initialization failed (no usable display). "
+                "Set DISPLAY correctly, or run this command in a desktop session."
+            )
             return
-        raise
-    _run_interactive_viewer_loop(runtime, args)
-    print("[play_interactive] Done.")
+        try:
+            runtime = _prepare_viewer_runtime(
+                args, cfg, algo=algo, device=device, playback_session=playback_session
+            )
+        except RuntimeError as exc:
+            if str(exc).startswith("interactive.keyboard unavailable:"):
+                print(f"[play_interactive] {exc}")
+                return
+            raise
+        _run_interactive_viewer_loop(runtime, args)
+        print("[play_interactive] Done.")
+    finally:
+        if isinstance(playback_session, FADAPlaybackSession):
+            playback_session.close()

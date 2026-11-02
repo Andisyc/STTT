@@ -73,10 +73,22 @@ def main(cfg: DictConfig) -> None:
     print(f"[play_fada_online] Action mode: {args.action_mode}")
 
     online_enabled = bool(OmegaConf.select(cfg, "online_adaptation.enabled", default=False))
+    spatial_enabled = bool(OmegaConf.select(cfg, "spatial_adaptation.enabled", default=False))
     print(
         "[play_fada_online] Online adaptation "
-        + ("ENABLED" if online_enabled else "disabled")
+        + ("ENABLED" if online_enabled or spatial_enabled else "disabled")
     )
+    if spatial_enabled:
+        print(
+            "[play_fada_online] Spatial feedback ENABLED: "
+            f"odometry_source={OmegaConf.select(cfg, 'spatial_adaptation.odometry_source')} "
+            f"visual_mode={OmegaConf.select(cfg, 'spatial_adaptation.visual_mode')}"
+        )
+    elif online_enabled:
+        print(
+            "[play_fada_online] Spatial feedback disabled: proprioceptive-only online "
+            "update, not a spatial-adaptation run."
+        )
 
     try:
         if recording.enabled:
@@ -84,7 +96,7 @@ def main(cfg: DictConfig) -> None:
         else:
             _run_viewer(session, args, render_config)
     finally:
-        session.wrapped_env.close()
+        session.close()
 
 
 def _run_viewer(session, args, render_config: FADADemoRenderConfig | None = None) -> None:

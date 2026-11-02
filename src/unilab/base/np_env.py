@@ -15,6 +15,7 @@ import numpy as np
 
 from unilab.base.backend import SimBackend
 from unilab.base.backend.base import BackendPlayRenderPlan, BackendSceneArtifacts
+from unilab.base.backend.sensors import BackendSensorStream, StereoSensorConfig
 from unilab.base.base import ABEnv, EnvCfg, EnvPlayCapabilities
 from unilab.base.scene import SceneCfg
 from unilab.dr import DomainRandomizationManager, DomainRandomizationProvider
@@ -554,6 +555,14 @@ class NpEnv(ABEnv):
         return cast(
             np.ndarray, np.asarray(self._backend.capture_video_frame(), dtype=np.uint8).copy()
         )
+
+    def open_sensor_stream(self, config: StereoSensorConfig) -> BackendSensorStream:
+        """Open a sensor stream without exposing backend-private state."""
+        return self._backend.open_sensor_stream(config)
+
+    def get_sim_time_ns(self) -> int:
+        """Read the backend's physical clock through the public environment seam."""
+        return self._backend.get_sim_time_ns()
 
     def get_physics_state_snapshot(self) -> np.ndarray:
         """Return a detached physics snapshot for offline playback/video export."""

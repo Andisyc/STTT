@@ -1,0 +1,32 @@
+# Offline Spatial TTT tools. Training runs only when explicitly invoked by the user.
+data:
+  paths: []
+  validation_fraction: 0.2
+  split_seed: 0
+
+model:
+  hidden_dims: [512, 512, 512]
+
+training:
+  device: cpu
+  epochs: 100
+  batch_size: 256
+  learning_rate: 0.0003
+  max_grad_norm: 1.0
+  seed: 0
+  output_dir: data/sttt/world_model
+  resume: null
+  loss_weights: [1.0, 1.0, 1.0]
+
+evaluation:
+  checkpoint: null
+  split: validation
+  # Group metrics by each collection's label_source + collection_context.
+  by_condition: true
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

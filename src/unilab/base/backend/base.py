@@ -6,6 +6,7 @@ from typing import Any, ContextManager
 
 import numpy as np
 
+from unilab.base.backend.sensors import BackendSensorStream, StereoSensorConfig
 from unilab.dr.types import (
     DomainRandomizationCapabilities,
     InitRandomizationPlan,
@@ -464,6 +465,16 @@ class SimBackend(abc.ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support native video capture"
         )
+
+    def open_sensor_stream(self, config: StereoSensorConfig) -> BackendSensorStream:
+        """Open an opt-in backend-owned stereo/IMU stream; normal stepping samples it."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support stereo/IMU sensor streams"
+        )
+
+    def get_sim_time_ns(self) -> int:
+        """Return the single environment's physical time, not elapsed wall time."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not expose a physical clock")
 
     def get_physics_state(self) -> np.ndarray:
         """Return a physics snapshot suitable for offline playback/video export."""

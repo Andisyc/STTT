@@ -72,6 +72,22 @@ class G1BaseEnv(LocomotionBaseEnv):
         """Return batched world-frame base linear velocity."""
         return np.asarray(self._backend.get_base_lin_vel())
 
+    def get_base_ang_vel(self) -> np.ndarray:
+        """Return world-frame angular velocity for source-aligned policy inputs."""
+        return np.asarray(self._backend.get_base_ang_vel())
+
+    def get_actuator_gains(self) -> tuple[np.ndarray, np.ndarray]:
+        """Expose source/target PD contract checks without backend traversal."""
+        return self._backend.get_actuator_gains()
+
+    def get_actuated_joint_names(self) -> tuple[str, ...]:
+        """Return the target action ordering through the backend contract."""
+        return self._backend.get_actuated_joint_names()
+
+    def get_upvector(self) -> np.ndarray:
+        """Return the configured torso upvector used by proprioception."""
+        return np.asarray(self._backend.get_sensor_data(self._cfg.sensor.upvector))
+
     def get_foot_pos(self) -> np.ndarray:
         """Return left/right foot world positions with shape ``(N, 2, 3)``."""
         left = np.asarray(self._backend.get_sensor_data("left_foot_pos"))
