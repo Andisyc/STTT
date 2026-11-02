@@ -750,7 +750,8 @@ PYTHONPATH="$PWD/src" uv run --frozen --no-sync python scripts/train_distill.py 
 ### 官方学生播放与在线适应（第 5 步）
 
 - 沿用 `scripts/play_fada_online.py` 和同一 playback session。使用 `task=g1_walk_flat/mujoco`、`interactive.action_mode=policy`，将 `training.play_checkpoint_path` 指向官方学生 checkpoint，并显式提供 `official_playback.profile_path`。关闭/开启更新仍由 `online_adaptation.enabled=false/true` 控制，不另建播放或更新循环。
-- profile 是从真实 Oracle run 核准的 YAML，必须包含 `source_identity`、`joint_names`、`default_joint_pos`、`action_scale`、`stiffness`、`damping`、`clip_actions`、`ctrl_dt`、`gait_frequency`、`gait_clock_mode`、`phase_init`。身份必须与 checkpoint 一致；关节相关向量按源关节顺序提供 29 项，初始双脚相位为弧度。checkpoint 本身没有完整控制契约，不能用旧 task 的姿态、scale 或 PD 默认值代替。
+- profile 是从真实 Oracle run 核准的 YAML 或 JSON，必须包含 `source_identity`、`joint_names`、`default_joint_pos`、`action_scale`、`stiffness`、`damping`、`clip_actions`、`ctrl_dt`、`gait_frequency`、`gait_clock_mode`、`phase_init`。身份必须与 checkpoint 一致；关节相关向量按源关节顺序提供 29 项，初始双脚相位为弧度。checkpoint 本身没有完整控制契约，不能用旧 task 的姿态、scale 或 PD 默认值代替。
+- 官方 profile 在创建环境前绑定 PD、控制周期和步态时钟；不必手工覆盖 `reward.gait_frequency`。G1 的可选 `env.position_actuator_gains` 使用 `joint_names/kp/kd`，MuJoCo 在冷路径按实际 actuator 对应关节名重排并应用，再建立环境增益缓存；未配置时保留模型默认值。该配置当前仅支持 MuJoCo，其他后端明确拒绝。加载后仍核对实际控制参数，不通过修改 profile 或关闭校验绕过不一致。
 - 官方 64D 观测从公共物理状态接口组装：世界系角速度与重力转到基座系，关节位置减源默认角，按源关节顺序施加 checkpoint 预处理。不是截取旧 actor 观测的前 64 维，也不重复施加旧 actor 的缩放。完整 7D command 保留速度和四个步态 sin/cos；零速仍保留相位。
 - source 归一化动作经 source clip 后作为快照与历史保存，再映射到目标关节顺序、默认角和 scale；PD、控制周期和相位时钟必须匹配 profile。冷启动及 reset 左补零并携带 bool mask，历史不跨 episode。相位持续变化不会被误判为新的速度指令而清空待成熟轨迹。
 - 在线路径保留冻结 Planner/独立 base IDM、Q/V LoRA、固定伪标签、`Y_nom` 回归条件和原窗口/Adam/锚定/reset 语义。官方模型通过原生 command/mask 接口调用；旧 66/3 与既有 adapted checkpoint 的加载和播放路径保留。

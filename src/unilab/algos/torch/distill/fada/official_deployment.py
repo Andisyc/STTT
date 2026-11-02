@@ -1,6 +1,7 @@
 """Cold-bound official control mapping over public environment/backend APIs."""
 from __future__ import annotations
 
+from copy import deepcopy
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,26 @@ def load_official_playback_profile(cfg: Any, *, root_dir: str | Path, source_ide
     if not isinstance(payload, Mapping):
         raise ValueError("official playback control profile must be a mapping")
     return OfficialFADAPlaybackProfile.from_mapping(payload, source_identity=source_identity)
+
+
+def build_official_playback_env_override(
+    profile: OfficialFADAPlaybackProfile, env_cfg_override: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind source control values before backend construction and env caches."""
+    result = deepcopy(dict(env_cfg_override or {}))
+    result["position_actuator_gains"] = {
+        "joint_names": list(profile.joint_names),
+        "kp": list(profile.stiffness),
+        "kd": list(profile.damping),
+    }
+    result["ctrl_dt"] = profile.ctrl_dt
+    result["gait_phase_enabled"] = True
+    result["gait_phase_init_mode"] = "offset_phase"
+    result["gait_clock_mode"] = profile.gait_clock_mode
+    reward_config = dict(result.get("reward_config") or {})
+    reward_config["gait_frequency"] = profile.gait_frequency
+    result["reward_config"] = reward_config
+    return result
 
 
 class OfficialFADADeploymentAdapter:

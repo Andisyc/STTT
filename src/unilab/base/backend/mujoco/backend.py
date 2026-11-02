@@ -180,10 +180,32 @@ def _apply_position_actuator_gains_to_mj_model(
     kp: float | np.ndarray,
     kd: float | np.ndarray,
     actuator_ids=slice(None),
+    joint_names: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     _assert_position_actuator_targets(model, actuator_ids)
     kp_arr = np.asarray(kp, dtype=np.float64)
     kd_arr = np.asarray(kd, dtype=np.float64)
+    if joint_names is not None:
+        names = tuple(joint_names)
+        if not names or any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+            raise ValueError("position_actuator_gains requires unique nonempty joint_names")
+        ids = _actuator_ids_from_selector(model, actuator_ids)
+        joint_transmission = int(mujoco.mjtTrn.mjTRN_JOINT)
+        if np.any(np.asarray(model.actuator_trntype[ids]) != joint_transmission):
+            raise ValueError("Named position_actuator_gains requires joint-transmission actuators")
+        target_names = tuple(
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, int(model.actuator_trnid[idx, 0]))
+            for idx in ids
+        )
+        if len(set(target_names)) != len(target_names) or set(target_names) != set(names):
+            raise ValueError("position_actuator_gains joint_names must match the selected actuator joints")
+        if kp_arr.shape != (len(names),) or kd_arr.shape != (len(names),):
+            raise ValueError("Named position_actuator_gains requires one kp and kd per joint")
+        if not np.isfinite(kp_arr).all() or not np.isfinite(kd_arr).all() or np.any(kp_arr <= 0) or np.any(kd_arr < 0):
+            raise ValueError("Named position_actuator_gains requires finite positive kp and nonnegative kd")
+        source_indices = {name: idx for idx, name in enumerate(names)}
+        order = [source_indices[name] for name in target_names]
+        kp_arr, kd_arr = kp_arr[order], kd_arr[order]
     model.actuator_gainprm[actuator_ids, 0] = kp_arr
     model.actuator_biasprm[actuator_ids, 1] = -kp_arr
     model.actuator_biasprm[actuator_ids, 2] = -kd_arr
@@ -1827,10 +1849,12 @@ class MuJoCoBackend(SimBackend):
         kp: float | np.ndarray,
         kd: float | np.ndarray,
         actuator_ids=slice(None),
+        joint_names: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         _apply_position_actuator_gains_to_mj_model(
             model,
             kp=kp,
             kd=kd,
             actuator_ids=actuator_ids,
+            joint_names=joint_names,
         )

@@ -452,6 +452,11 @@ def create_fada_playback_session(
         task_name,
         enabled=playback_cfg.keyboard,
     )
+    if official_profile is not None:
+        from unilab.algos.torch.distill.fada.official_deployment import (
+            build_official_playback_env_override,
+        )
+        env_cfg_override = build_official_playback_env_override(official_profile, env_cfg_override)
     if playback_cfg.keyboard:
         log("Keyboard playback reset: standing command with zero base velocity.")
     env = create_env(

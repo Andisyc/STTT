@@ -195,6 +195,11 @@ class G1WalkEnv(
             raise ValueError("straight_line_lateral_tolerance_m must be positive")
         if cfg.reward_config.straight_line_yaw_tolerance_rad <= 0.0:
             raise ValueError("straight_line_yaw_tolerance_rad must be positive")
+        backend_options = {}
+        if cfg.position_actuator_gains is not None:
+            if backend_type != "mujoco":
+                raise ValueError("G1 position_actuator_gains currently requires the MuJoCo backend")
+            backend_options["position_actuator_gains"] = cfg.position_actuator_gains
         backend = create_backend(
             backend_type,
             cfg.scene,
@@ -205,6 +210,7 @@ class G1WalkEnv(
             mujoco_num_threads=cfg.mujoco_num_threads,
             motrix_max_iterations=cfg.motrix_max_iterations,
             post_step_forward_sensor=cfg.post_step_forward_sensor,
+            **backend_options,
         )
         super().__init__(cfg, backend, num_envs)
         self._enable_reward_log = True

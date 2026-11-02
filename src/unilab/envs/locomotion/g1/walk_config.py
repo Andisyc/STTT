@@ -485,6 +485,7 @@ class G1WalkEnvCfg(G1BaseCfg):
     commands: G1WalkCommandsConfig = field(default_factory=G1WalkCommandsConfig)
     reward_config: G1RewardConfig | None = None
     domain_rand: G1DomainRandConfig = field(default_factory=G1DomainRandConfig)
+    position_actuator_gains: dict[str, Any] | None = None
     gait_phase_enabled: bool = True
     gait_phase_init_mode: str = "offset_phase"
     gait_clock_mode: str = "continuous"
