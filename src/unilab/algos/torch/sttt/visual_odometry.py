@@ -38,10 +38,10 @@ _ROTATION_TOLERANCE = 1e-3
 _LATERAL_TOLERANCE_M = 1e-3
 
 _INSTALL_HINT = (
-    "PyCuVSLAM is unavailable. Install a pre-built wheel on Linux only "
-    "(Ubuntu 22.04 / py3.10 x86_64, Ubuntu 24.04 / py3.12+ x86_64, or Jetson "
-    "aarch64 with JetPack) plus a CUDA toolkit, e.g. "
-    "`pip install ./cuvslam_cu12-<version>-<tags>.whl[cuda]`; macOS is unsupported."
+    "PyCuVSLAM is unavailable. This adapter targets cuVSLAM 17.0.1. Install its "
+    "platform-matched Linux wheel (Ubuntu 22.04 / py3.10 x86_64, Ubuntu 24.04 / "
+    "py3.12+ x86_64, or supported Jetson) and matching CUDA runtime libraries. "
+    "For example: `uv pip install ./cuvslam-17.0.1+cu12-<tags>.whl`; macOS is unsupported."
 )
 
 
@@ -101,11 +101,11 @@ class CuvslamOdometry:
 
         self._cuvslam = _import_cuvslam()
         self._rig = _build_rig(self._cuvslam, self._calibration, imu_noise=self._imu_noise)
-        self._odometry_config = self._cuvslam.Odometry.Config(
+        self._odometry_config = self._cuvslam.Tracker.OdometryConfig(
             odometry_mode=(
-                self._cuvslam.Odometry.OdometryMode.Inertial
+                self._cuvslam.Tracker.OdometryMode.Inertial
                 if self._inertial
-                else self._cuvslam.Odometry.OdometryMode.Multicamera
+                else self._cuvslam.Tracker.OdometryMode.Multicamera
             ),
             async_sba=False,
             rectified_stereo_camera=True,
@@ -181,12 +181,11 @@ class CuvslamOdometry:
     def _start_tracker(self) -> Any:
         if self._rig is None or self._odometry_config is None:
             raise RuntimeError("CuvslamOdometry is closed")
-        # OdometryOnlyOffline keeps bundle adjustment in this thread, so each
-        # returned pose is final and replay stays reproducible.
+        # Disable SLAM; async_sba=False keeps odometry bundle adjustment synchronous.
         return self._cuvslam.Tracker(
             self._rig,
-            self._cuvslam.Tracker.Mode.OdometryOnlyOffline,
-            self._odometry_config,
+            odom_config=self._odometry_config,
+            slam_config=None,
         )
 
     def _release_tracker(self) -> None:
@@ -227,11 +226,21 @@ def _import_cuvslam() -> Any:
         raise ImportError(_INSTALL_HINT) from error
     missing = [
         name
-        for name in ("Rig", "Camera", "Pose", "ImuCalibration", "ImuMeasurement", "Odometry", "Tracker")
+        for name in ("Rig", "Camera", "Pose", "ImuCalibration", "ImuMeasurement", "Tracker")
         if not hasattr(cuvslam, name)
     ]
+    tracker = getattr(cuvslam, "Tracker", None)
+    for name in ("OdometryConfig", "OdometryMode"):
+        if not hasattr(tracker, name):
+            missing.append(f"Tracker.{name}")
+    modes = getattr(tracker, "OdometryMode", None)
+    for name in ("Multicamera", "Inertial"):
+        if not hasattr(modes, name):
+            missing.append(f"Tracker.OdometryMode.{name}")
     if missing:
-        raise ImportError(f"Installed PyCuVSLAM lacks {missing}; cuVSLAM >= 17.0.0 is required")
+        raise ImportError(
+            f"Installed PyCuVSLAM lacks {missing}; this adapter targets the cuVSLAM 17.0.1 Tracker API"
+        )
     return cuvslam
 
 

@@ -190,8 +190,9 @@ uv run scripts/diagnose_visual_odometry.py mode=replay \
 配置位于 `conf/sttt/visual_odometry.yaml`；支持 `--config path.yaml` 和点号覆盖。
 `mode=live` 在同一进程内运行采集与定位。`odometry.mode=inertial` 还要求显式填写
 `odometry.imu_noise` 的四个密度/随机游走值；这些值是仿真模型假设，不是实机标定。
-cuVSLAM 是独立可选依赖，按[官方发布说明](https://github.com/nvidia-isaac/cuVSLAM)
-安装匹配平台的 wheel；当前 Apple Silicon Mac 不提供 CUDA 定位验证。
+cuVSLAM 是独立可选依赖；适配器以 [v17.0.1](https://github.com/nvidia-isaac/cuVSLAM/releases/tag/v17.0.1)
+的 `Tracker.OdometryConfig` / `Tracker.OdometryMode` 接口为依据，显式关闭 SLAM 建图，保留同步里程计。
+安装匹配平台和 CUDA 的 wheel；不假定所有更新版本均兼容。当前 Apple Silicon Mac 不提供 CUDA 定位验证。
 
 采集目录必须为空。每帧 `frame_*.npz` 保存同状态 RGB 双目、物理采集时间、帧间 IMU，
 以及同戳 `pelvis_from_rig` 和骨盆局部理想重力上方向；这些相对量不提供世界位置或 heading。
