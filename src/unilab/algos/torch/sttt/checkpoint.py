@@ -137,7 +137,7 @@ def load_world_model_checkpoint(
     expected_model_spec: Mapping[str, Any] | None = None,
 ) -> tuple[SpatialWorldModel, dict[str, Any]]:
     """Rebuild an inference model without changing global RNG or fitting statistics."""
-    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+    payload = torch.load(Path(path), map_location="cpu", weights_only=True, mmap=True)
     if (not isinstance(payload, dict) or payload.get("format_version") != WORLD_MODEL_CHECKPOINT_VERSION
             or payload.get("kind") != "spatial_world_model"
             or payload.get("loss_contract") != "periodic_se2_v1"):

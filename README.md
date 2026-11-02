@@ -85,6 +85,8 @@ checkpoint 保存模型结构、归一化、优化器、数据身份、划分和
 不能把它当作原训练的留出验证集。
 `training.epochs` 表示目标总 epoch 数，不是恢复后追加的数量；恢复时训练超参数必须与
 checkpoint 一致。评估沿用 checkpoint 记录的损失权重，避免与原验证指标使用不同目标。
+数据集和世界模型 checkpoint 使用 `weights_only=True`、CPU 内存映射读取，保留原有格式、
+数据身份和兼容性检查；加载期间不要覆盖或原地改写这些文件。不通过关闭安全反序列化绕过读取错误。
 
 `evaluation.by_condition=true` 默认按标签来源、配置工况和实际窗口负载阶段分别报告
 `condition_metrics`。缺少旧元信息时标为 unknown/unspecified，不猜作标称或 SLAM。

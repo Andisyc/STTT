@@ -815,7 +815,8 @@ def load_spatial_collection(path: str | Path) -> dict:
             or a window violates the current contract. Legacy field names
             are never silently accepted.
     """
-    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+    # Map CPU storages instead of eagerly allocating each archive storage.
+    payload = torch.load(Path(path), map_location="cpu", weights_only=True, mmap=True)
     if not isinstance(payload, dict):
         raise TypeError(
             f"spatial collection must be a dict, got {type(payload).__name__}."
