@@ -691,6 +691,9 @@ class MuJoCoBackend(SimBackend):
     def get_actuator_ctrl_range(self) -> np.ndarray:
         return np.array(self._model.actuator_ctrlrange, dtype=self._np_dtype)
 
+    def get_actuator_ctrl_limited(self) -> np.ndarray:
+        return np.array(self._model.actuator_ctrllimited, dtype=bool)
+
     def get_actuator_force_range(self) -> np.ndarray:
         return np.array(self._model.actuator_forcerange, dtype=self._np_dtype)
 

@@ -92,3 +92,40 @@ def test_g1_task_rejects_malformed_foot_sensor_shape() -> None:
 
     with pytest.raises(ValueError, match="foot position sensors"):
         env.get_foot_pos()
+
+
+def test_g1_probe_bounds_respect_enabled_limits_and_action_coordinates() -> None:
+    from unilab.base.backend.mujoco.backend import MuJoCoBackend
+    from unilab.algos.torch.sttt.physical_probe_runtime import _perturbed_actions
+
+    model = mujoco.MjModel.from_xml_path(str(ROOT / "src/unilab/assets/robots/g1/scene_flat.xml"))
+    backend = object.__new__(MuJoCoBackend)
+    backend._model = model
+    backend._np_dtype = np.float64
+    env = object.__new__(_G1BaseProbe)
+    env._backend = backend
+    env.default_angles = np.full(model.nu, 0.2)
+    scale = np.ones(model.nu)
+    env._cfg = SimpleNamespace(control_config=SimpleNamespace(action_scale=scale))
+
+    low, high = env.get_action_input_bounds()
+    assert np.isneginf(low).all() and np.isposinf(high).all()
+    actions = [np.full(model.nu, 0.1)]
+    perturbed = _perturbed_actions(actions, action_step=0, joint_index=0, delta=0.01,
+                                   ctrl_low=low, ctrl_high=high)
+    assert perturbed is not None
+    assert perturbed[0][0] == pytest.approx(0.11)
+
+    model.actuator_ctrllimited[:2] = 1
+    model.actuator_ctrlrange[:2] = [[-1.0, 1.0], [0.0, 2.0]]
+    scale[:2] = [0.5, -0.5]
+    env.default_angles[1] = 0.5
+    low, high = env.get_action_input_bounds()
+    np.testing.assert_allclose(low[:2], [-2.4, -3.0])
+    np.testing.assert_allclose(high[:2], [1.6, 1.0])
+    assert np.isneginf(low[2:]).all() and np.isposinf(high[2:]).all()
+    actions[0][0] = 1.595
+    assert _perturbed_actions(actions, action_step=0, joint_index=0, delta=0.01,
+                              ctrl_low=low, ctrl_high=high) is None
+    assert _perturbed_actions(actions, action_step=0, joint_index=0, delta=-0.01,
+                              ctrl_low=low, ctrl_high=high) is not None

@@ -116,6 +116,8 @@ uv run scripts/diagnose_spatial_physics.py mode=compare \
 
 配置位于 `conf/sttt/physical_probe.yaml`。采样按有限 origin 尝试，不通过自动重置凑齐
 成功样本；终止、非有限值、工况改变、输入被改写或越界都保留明确状态，不能填零端点。
+边界检查使用 G1 公共接口将已启用的 actuator PD 目标范围换算为 `env_input`；
+未启用的 MuJoCo `ctrlrange=[0,0]` 不作为限制，实际启用的限制仍会拒绝越界扰动。
 比较器先检查名义回放能否复现 committed 端点，再对可用分支比较物理有限差分与模型
 最终端点 Jacobian，报告分坐标误差、方向一致性和不可用案例。回放容差取采样时保存的
 配置；不可用案例不会变成零梯度或被合并成“通过”。无可用案例时 compare 退出码为 2。

@@ -111,6 +111,12 @@ class SimBackend(abc.ABC):
             Array with shape ``(num_actuators, 2)`` and columns ``[low, high]``.
         """
 
+    def get_actuator_ctrl_limited(self) -> np.ndarray:
+        """Return the control-limit enable mask in actuator order, shape ``(nu,)``."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not expose actuator control-limit flags"
+        )
+
     def get_actuator_force_range(self) -> np.ndarray:
         """Return actuator force limits in actuator id order."""
         raise NotImplementedError(

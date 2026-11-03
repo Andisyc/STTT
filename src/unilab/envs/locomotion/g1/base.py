@@ -84,6 +84,31 @@ class G1BaseEnv(LocomotionBaseEnv):
         """Return the target action ordering through the backend contract."""
         return self._backend.get_actuated_joint_names()
 
+    def get_action_input_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """Convert enabled PD-target limits to the affine env_input coordinates.
+
+        MuJoCo's inactive ctrlrange (often [0, 0]) is not a physical limit.
+        This cold-path query does not change the legacy action-space contract.
+        """
+        ranges = np.asarray(self._backend.get_actuator_ctrl_range(), dtype=np.float64)
+        limited = np.asarray(self._backend.get_actuator_ctrl_limited(), dtype=bool)
+        nu = self._backend.num_actuators
+        if ranges.shape != (nu, 2) or limited.shape != (nu,):
+            raise ValueError("Actuator control limits must match the action dimension")
+        if (not np.isfinite(ranges[limited]).all()
+                or np.any(ranges[limited, 0] > ranges[limited, 1])):
+            raise ValueError("Enabled actuator control limits must be finite and ordered")
+        default = np.asarray(self.default_angles, dtype=np.float64).reshape(-1)
+        scale = np.broadcast_to(
+            np.asarray(self._cfg.control_config.action_scale, dtype=np.float64), (nu,)
+        )
+        if (default.shape != (nu,) or not np.isfinite(default).all()
+                or not np.isfinite(scale).all() or np.any(scale == 0)):
+            raise ValueError("Action bounds require finite defaults and finite nonzero action scales")
+        lower = (np.where(limited, ranges[:, 0], -np.inf) - default) / scale
+        upper = (np.where(limited, ranges[:, 1], np.inf) - default) / scale
+        return np.minimum(lower, upper), np.maximum(lower, upper)
+
     def get_upvector(self) -> np.ndarray:
         """Return the configured torso upvector used by proprioception."""
         return np.asarray(self._backend.get_sensor_data(self._cfg.sensor.upvector))

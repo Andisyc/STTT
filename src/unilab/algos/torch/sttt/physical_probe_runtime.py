@@ -212,10 +212,11 @@ def _collect_branches(
     obs_dim = DEFAULT_OBS_DIM
     if act_dim != 29:
         raise ValueError(f"STTT physical probes require 29 actions, got {act_dim}")
-    ctrl_low = np.asarray(env.action_space.low, dtype=np.float64).reshape(-1)
-    ctrl_high = np.asarray(env.action_space.high, dtype=np.float64).reshape(-1)
+    ctrl_low, ctrl_high = env.get_action_input_bounds()
+    ctrl_low = np.asarray(ctrl_low, dtype=np.float64).reshape(-1)
+    ctrl_high = np.asarray(ctrl_high, dtype=np.float64).reshape(-1)
     if ctrl_low.shape != (act_dim,) or ctrl_high.shape != (act_dim,):
-        raise ValueError("actuator control range must match the action dimension")
+        raise ValueError("Env-input bounds must match the action dimension")
 
     rollout_id = f"sttt_physical_probe_seed{int(metadata.get('seed', 0))}"
     case_steps = tuple(int(step) for step in config.action_steps)
