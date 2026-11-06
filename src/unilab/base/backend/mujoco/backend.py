@@ -380,28 +380,28 @@ class MuJoCoBackend(SimBackend):
         self._num_dof_pos = self.nq - self._root_qpos_dim
         self._num_dof_vel = self.nv - self._root_qvel_dim
 
-        # State storage.
+        # FULLPHYSICS is native MuJoCo state, including its authoritative clock.
+        # Never quantize it through the observation dtype before the next step.
         nstate = mujoco.mj_stateSize(self._model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
-        self._physics_state = np.zeros((num_envs, nstate), dtype=self._np_dtype)
+        self._physics_state = np.zeros((num_envs, nstate), dtype=np.float64)
         # Initialize all envs with the model default qpos, including identity quaternions.
         self._physics_state[:, self._idx_qpos : self._idx_qpos + self._model.nq] = self._model.qpos0
         self._sensor_data = np.zeros((num_envs, self._model.nsensordata), dtype=self._np_dtype)
 
-        # Cached views.
-        self._dof_pos_view = self._physics_state[
-            :, self._idx_qpos + self._root_qpos_dim : self._idx_qpos + self.nq
-        ]
-        self._dof_vel_view = self._physics_state[
-            :, self._idx_qvel + self._root_qvel_dim : self._idx_qvel + self.nv
-        ]
-        self._qpos_view = self._physics_state[:, self._idx_qpos : self._idx_qpos + self.nq]
+        # Only qpos/qvel need an observation projection. np.asarray aliases the
+        # source when np_dtype is float64, otherwise allocates once at init.
+        self._kinematic_state = np.asarray(
+            self._physics_state[:, self._idx_qpos : self._idx_qvel + self.nv],
+            dtype=self._np_dtype,
+        )
+        self._dof_pos_view = self._kinematic_state[:, self._root_qpos_dim : self.nq]
+        self._dof_vel_view = self._kinematic_state[:, self.nq + self._root_qvel_dim :]
+        self._qpos_view = self._kinematic_state[:, : self.nq]
         if self._root_qpos_dim == 7:
-            self._base_pos_view = self._physics_state[:, self._idx_qpos : self._idx_qpos + 3]
-            self._base_quat_view = self._physics_state[:, self._idx_qpos + 3 : self._idx_qpos + 7]
-            self._base_lin_vel_view = self._physics_state[:, self._idx_qvel : self._idx_qvel + 3]
-            self._base_ang_vel_view = self._physics_state[
-                :, self._idx_qvel + 3 : self._idx_qvel + 6
-            ]
+            self._base_pos_view = self._kinematic_state[:, :3]
+            self._base_quat_view = self._kinematic_state[:, 3:7]
+            self._base_lin_vel_view = self._kinematic_state[:, self.nq : self.nq + 3]
+            self._base_ang_vel_view = self._kinematic_state[:, self.nq + 3 : self.nq + 6]
         else:
             if self._base_body_id >= 0:
                 data0 = mujoco.MjData(self._model)
@@ -621,6 +621,16 @@ class MuJoCoBackend(SimBackend):
             return self._model_variants[0]
         return [self._model_variants[int(idx)] for idx in self._model_assignments]
 
+    def _refresh_kinematic_state(self, env_indices: np.ndarray | None = None) -> None:
+        """Refresh projection in place so references held by the env stay valid."""
+        if self._kinematic_state.dtype == self._physics_state.dtype:
+            return  # float64 observation views already alias native state.
+        native = self._physics_state[:, self._idx_qpos : self._idx_qvel + self.nv]
+        if env_indices is None:
+            np.copyto(self._kinematic_state, native, casting="unsafe")
+        else:
+            self._kinematic_state[env_indices] = native[env_indices]
+
     def _build_pool(self) -> BatchEnvPool:
         pool = BatchEnvPool(
             self._current_model_sequence(),
@@ -663,6 +673,7 @@ class MuJoCoBackend(SimBackend):
             (self._num_envs, 6 * self._model.nbody), dtype=np.float64
         )
         self._physics_state[:, self._idx_qpos : self._idx_qpos + self._model.nq] = self._model.qpos0
+        self._refresh_kinematic_state()
 
     # ------------------------------------------------------------------ #
     # Properties                                                         #
@@ -1017,7 +1028,8 @@ class MuJoCoBackend(SimBackend):
                 return_sensor=True,
                 post_step_forward_sensor=self._post_step_forward_sensor,
             )
-            self._physics_state[:] = state_np.astype(self._np_dtype)
+            self._physics_state[:] = state_np
+            self._refresh_kinematic_state()
             physics_ms += (time.perf_counter() - t0) * 1000.0
 
             t0 = time.perf_counter()
@@ -1134,7 +1146,8 @@ class MuJoCoBackend(SimBackend):
         )
         if control_spec & int(mujoco.mjtState.mjSTATE_XFRC_APPLIED):
             self._pending_xfrc_applied.fill(0.0)
-        self._physics_state[:] = state_np.astype(self._np_dtype)
+        self._physics_state[:] = state_np
+        self._refresh_kinematic_state()
         physics_ms = (time.perf_counter() - t0) * 1000.0
 
         t0 = time.perf_counter()
@@ -1177,7 +1190,8 @@ class MuJoCoBackend(SimBackend):
                 return_sensor=True,
                 post_step_forward_sensor=self._post_step_forward_sensor,
             )
-            self._physics_state[:] = state_np.astype(self._np_dtype)
+            self._physics_state[:] = state_np
+            self._refresh_kinematic_state()
             physics_ms += (time.perf_counter() - t0) * 1000.0
 
             t0 = time.perf_counter()
@@ -1240,7 +1254,8 @@ class MuJoCoBackend(SimBackend):
                 self._isolated_rollout_failure = f"{type(exc).__name__}: {exc}"
                 raise
 
-        self._physics_state[env_indices] = state_out.astype(self._np_dtype)
+        self._physics_state[env_indices] = state_out
+        self._refresh_kinematic_state(env_indices)
         self._sensor_data[env_indices] = sensor_np.astype(self._np_dtype)
 
         stream = self._sensor_stream
@@ -1433,7 +1448,8 @@ class MuJoCoBackend(SimBackend):
             raise ValueError(
                 "MuJoCo interval body velocity perturbation requires the floating base body"
             )
-        self._base_lin_vel_view += delta_np[:, 0, :]
+        self._physics_state[:, self._idx_qvel : self._idx_qvel + 3] += delta_np[:, 0, :]
+        self._refresh_kinematic_state()
 
     def apply_body_force(
         self,
@@ -1655,7 +1671,7 @@ class MuJoCoBackend(SimBackend):
         """
         dof_indices = np.asarray(dof_indices, dtype=np.int32).reshape(-1)
         jp, jr = self._pool.compute_site_jacobians(  # type: ignore[union-attr]
-            self._physics_state.astype(np.float64),
+            self._physics_state,
             int(site_id),
             jacp=True,
             jacr=True,
@@ -1670,6 +1686,7 @@ class MuJoCoBackend(SimBackend):
     # ------------------------------------------------------------------ #
 
     def get_physics_state(self) -> np.ndarray:
+        """Return native float64 FULLPHYSICS; observation dtype does not apply."""
         return self._physics_state
 
     def capture_rollout_state(self) -> dict[str, np.ndarray]:
@@ -1708,6 +1725,7 @@ class MuJoCoBackend(SimBackend):
 
         # B2: 原位恢复数组以保留 cached views, 产出与 capture 时相同的下一步输入状态.
         self._physics_state[:] = snapshot["physics_state"]
+        self._refresh_kinematic_state()
         self._sensor_data[:] = snapshot["sensor_data"]
         self._pending_xfrc_applied[:] = snapshot["pending_xfrc_applied"]
 
