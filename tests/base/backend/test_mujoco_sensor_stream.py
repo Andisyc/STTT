@@ -311,3 +311,45 @@ def test_undrained_backlog_fails_loudly_instead_of_dropping_frames() -> None:
     finally:
         stream.close()
         backend.close()
+
+
+def test_opt_in_initial_and_reset_frames_capture_existing_state_without_physics(monkeypatch) -> None:
+    class ArrayRenderer:
+        """No GL dependency; pose/FK still come from real MuJoCo forward kinematics."""
+        def __init__(self, model, *, height, width):
+            self.shape = (height, width, 3)
+
+        def update_scene(self, data, *, camera):
+            pass
+
+        def render(self):
+            return np.zeros(self.shape, dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mujoco, "Renderer", ArrayRenderer)
+    backend = _open_backend()
+    try:
+        before = backend.get_physics_state().copy()
+        stream = backend.open_sensor_stream(_config(capture_initial_frame=True))
+        initial, = stream.drain()
+        reference, = stream.drain_reference_poses()
+        kinematics, = stream.drain_kinematics()
+        assert initial.timestamp_ns == stream.clock.timestamp_ns
+        assert (initial.sequence_id, initial.timestamp_ns) == (kinematics.sequence_id, kinematics.timestamp_ns)
+        assert initial.imu == ()
+        np.testing.assert_array_equal(backend.get_physics_state(), before)
+        qpos = backend.model.qpos0.copy()[None]
+        qpos[0, 0] += 0.25
+        backend.set_state(np.array([0]), qpos, np.zeros((1, backend.model.nv)))
+        reset, = stream.drain()
+        reset_reference, = stream.drain_reference_poses()
+        reset_kinematics, = stream.drain_kinematics()
+        assert reset.sequence_id > initial.sequence_id
+        assert reset.timestamp_ns == 0 and reset.imu == ()
+        np.testing.assert_allclose(reset_reference.world_from_rig[:3, 3] - reference.world_from_rig[:3, 3], [0.25, 0., 0.], atol=1e-9)
+        np.testing.assert_allclose(reset_kinematics.pelvis_from_rig, kinematics.pelvis_from_rig, atol=1e-9)
+        assert stream.drain() == ()
+    finally:
+        backend.close()

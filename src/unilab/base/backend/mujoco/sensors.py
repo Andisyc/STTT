@@ -377,6 +377,20 @@ class MujocoSensorStream(BackendSensorStream):
             on_close(self)
 
     # -- adapter callbacks ------------------------------------------------
+    def capture_state(self, *, state_row: np.ndarray, timestamp_ns: int) -> None:
+        """Capture an existing state without stepping or fabricating IMU samples."""
+        if self._closed:
+            raise RuntimeError("MuJoCo sensor stream is closed")
+        if max(len(self._pending_frames), len(self._pending_kinematics), len(self._pending_references)) >= self._max_pending_frames:
+            raise RuntimeError("MuJoCo sensor stream backlog exceeded at initial capture")
+        state = np.ascontiguousarray(state_row, dtype=np.float64)
+        if state.shape != (mujoco.mj_stateSize(self._visual_model, mujoco.mjtState.mjSTATE_FULLPHYSICS),):
+            raise ValueError("initial capture requires a FULLPHYSICS state row")
+        mujoco.mj_setState(self._visual_model, self._data, state, int(mujoco.mjtState.mjSTATE_FULLPHYSICS))
+        mujoco.mj_forward(self._visual_model, self._data)
+        self._timestamp_ns = int(timestamp_ns)
+        self._capture(self._timestamp_ns)
+
     def observe_substep(
         self,
         *,
@@ -470,7 +484,7 @@ class MujocoSensorStream(BackendSensorStream):
                 "dropping them"
             )
 
-    def observe_reset(self, *, timestamp_ns: int) -> None:
+    def observe_reset(self, *, timestamp_ns: int, state_row: np.ndarray) -> None:
         """Start a new sequence: drop in-flight IMU samples and bump the sequence id.
 
         Frames, kinematics and references that were already produced stay available
@@ -484,6 +498,8 @@ class MujocoSensorStream(BackendSensorStream):
         self._timestamp_ns = int(timestamp_ns)
         self._substep_count = 0
         self._pending_imu.clear()
+        if self._config.capture_initial_frame:
+            self.capture_state(state_row=state_row, timestamp_ns=timestamp_ns)
 
     # -- sampling ---------------------------------------------------------
     def _capture(self, timestamp_ns: int) -> None:

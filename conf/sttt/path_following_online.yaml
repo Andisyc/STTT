@@ -1,0 +1,9 @@
+# A/B update core only. Control cadence, pose buffering and window activation belong to the runtime.
+seed: 0
+calibration_windows: 2
+actor:
+  hidden_dims: [256, 128]
+  hidden_init_std: 0.01
+  learning_rate: 0.0001
+response:
+  learning_rate: 0.0001

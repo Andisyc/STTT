@@ -31,8 +31,11 @@ class StereoSensorConfig:
     accelerometer_sensor: str = "torso_acceleration"
     left_camera: str = "sttt_left"
     right_camera: str = "sttt_right"
+    capture_initial_frame: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.capture_initial_frame, bool):
+            raise ValueError("capture_initial_frame must be boolean")
         for name in ("width", "height", "camera_period_steps"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
-from collections.abc import Iterator
-from dataclasses import asdict
+import random
+from collections.abc import Iterator, Mapping
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
+from omegaconf import OmegaConf
 
 from unilab.algos.torch.sttt.pose_data import ControlInterval
 from unilab.algos.torch.sttt.pose_diagnostics import (
@@ -26,6 +30,166 @@ from unilab.base.backend.sensors import (
     StereoFrame,
     StereoSensorConfig,
 )
+
+_SHA256_CHUNK_BYTES = 1 << 20
+
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_SHA256_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json_primitive(value: Any) -> Any:
+    """Convert config values to JSON primitives with the stdlib conversions only.
+
+    ``dataclass`` -> ``asdict``, ``np.ndarray``/``torch.Tensor`` -> nested
+    lists, NumPy scalars -> Python scalars. No registry and no silent string
+    fallback: an unconvertible leaf is a programming error, not data.
+    """
+
+    if OmegaConf.is_config(value):
+        return _json_primitive(OmegaConf.to_container(value, resolve=True))
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_primitive(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _json_primitive(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_primitive(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _json_primitive(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.Tensor):
+        return _json_primitive(value.detach().cpu().tolist())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bool) or value is None or isinstance(value, (int, str)):
+        return value
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            raise ValueError("collection context must not contain non-finite numbers")
+        return value
+    raise TypeError(f"collection context value is not JSON-safe: {type(value).__name__}")
+
+
+def _collection_context(env: Any) -> dict[str, Any]:
+    """Record the effective collection condition block from the live env config.
+
+    These are the configured conditions of this session (command ranges and
+    resampling, runtime payload, domain randomization, observation noise), not
+    evidence that a payload was physically attached inside every window.
+    Whole config blocks are recorded with the stdlib dataclass conversion so
+    no field is silently dropped.
+    """
+
+    env_cfg = env.cfg
+    context: dict[str, Any] = {}
+    for key in ("commands", "runtime_payload", "domain_rand", "noise_config"):
+        block = getattr(env_cfg, key, None)
+        if block is None:
+            raise RuntimeError(
+                f"STTT collection requires env.cfg.{key} to record the collection context"
+            )
+        context[key] = _json_primitive(block)
+    return context
+
+
+def _set_collection_override(cfg: Any, dotted_key: str, value: Any) -> None:
+    """Set a leaf on the private collection config clone only."""
+
+    if OmegaConf.is_config(cfg):
+        OmegaConf.update(cfg, dotted_key, value, merge=False)
+        return
+    parts = dotted_key.split(".")
+    node = cfg
+    for part in parts[:-1]:
+        node = getattr(node, part)
+    setattr(node, parts[-1], value)
+
+
+def _clone_collection_cfg(cfg: Any) -> Any:
+    """Return a private resolved copy; the caller's config is never mutated."""
+
+    if OmegaConf.is_config(cfg):
+        return OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    import copy
+
+    return copy.deepcopy(cfg)
+
+
+def _create_capture_session(
+    cfg: Any, *, root_dir: Path, device: str | None = None, seed: int = 0,
+) -> tuple[Any, dict[str, Any]]:
+    """Build deterministic sensor playback without any adaptation or training schema."""
+    from unilab.visualization.playback_distill_sessions import create_fada_playback_session
+    from unilab.visualization.playback_sessions import RslRlPlaybackConfig
+
+    if str(cfg.training.task_name) != "G1WalkFlat" or str(cfg.training.sim_backend) != "mujoco":
+        raise ValueError("Visual capture requires task=g1_walk_flat/mujoco")
+    raw_path = cfg.training.play_checkpoint_path
+    if raw_path in (None, ""):
+        raise FileNotFoundError("Visual capture requires an explicit training.play_checkpoint_path")
+    checkpoint = Path(str(raw_path)).expanduser()
+    if not checkpoint.is_absolute():
+        checkpoint = root_dir / checkpoint
+    checkpoint = checkpoint.resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"training.play_checkpoint_path does not exist: {checkpoint}")
+    checkpoint_sha256 = _sha256_file(checkpoint)
+    if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or not 0 <= seed < 2**32:
+        raise ValueError("capture seed must be an integer in [0, 2**32)")
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+
+    capture_cfg = _clone_collection_cfg(cfg)
+    for key, value in (
+        ("online_adaptation.enabled", False),
+        ("interactive.keyboard", False),
+        ("demo.figure_eight.enabled", False),
+        ("demo.footprints.enabled", False),
+        ("env.commands.resampling_time", 0.0),
+        ("env.commands.heading_command", False),
+    ):
+        _set_collection_override(capture_cfg, key, value)
+    playback_cfg = RslRlPlaybackConfig(
+        task="G1WalkFlat", load_run="-1", checkpoint=None,
+        action_mode="policy", policy_obs_mode="actor",
+        algo_log_name=str(getattr(getattr(cfg, "algo", None), "algo_log_name", "distill")),
+        log_root=None, num_envs=1, checkpoint_path=str(checkpoint), keyboard=False,
+    )
+    session, _policy_obs_mode, resolved_checkpoint = create_fada_playback_session(
+        playback_cfg=playback_cfg, cfg=capture_cfg, root_dir=root_dir, device=device,
+    )
+    try:
+        session.set_autoreset(False)
+        env = session.env
+        action_scale = np.asarray(env.cfg.control_config.action_scale, dtype=np.float64).reshape(-1)
+        default_angles = np.asarray(env.default_angles, dtype=np.float64).reshape(-1)
+        joint_names = list(env.get_actuated_joint_names())
+        if int(env.action_space.shape[0]) != 29 or default_angles.shape != (29,) or len(joint_names) != 29:
+            raise ValueError("Visual capture requires 29 target joints and default angles")
+        return session, {
+            "seed": int(seed),
+            "label_source": "mujoco_ground_truth",
+            "collection_context": _collection_context(env),
+            "checkpoint_path": str(resolved_checkpoint or checkpoint),
+            "checkpoint_sha256": checkpoint_sha256,
+            "task": "g1_walk_flat/mujoco",
+            "backend": "mujoco",
+            "ctrl_dt": float(env.cfg.ctrl_dt),
+            "joint_names": joint_names,
+            "action_scale": action_scale.tolist(),
+            "default_joint_angles": default_angles.tolist(),
+            "quaternion_order": "wxyz",
+        }
+    except BaseException:
+        session.close()
+        raise
 
 
 def save_calibration(path: Path, calibration: StereoCalibration) -> None:
@@ -229,10 +393,6 @@ def replay_visual_odometry(cfg: Any) -> dict[str, Any]:
 def capture_visual_odometry(cfg: Any, *, root_dir: Path) -> dict[str, Any]:
     """Advance one existing FADA session; no alternate controller or fake policy."""
     from hydra import compose, initialize_config_dir
-    from omegaconf import OmegaConf
-
-    from unilab.algos.torch.sttt.collection_runtime import create_collection_session
-
     steps = int(cfg.source.num_steps)
     if steps <= 0:
         raise ValueError("source.num_steps must be positive")
@@ -257,7 +417,7 @@ def capture_visual_odometry(cfg: Any, *, root_dir: Path) -> dict[str, Any]:
         fragments = list(OmegaConf.select(playback_cfg, "env.scene.fragment_files", default=[]))
         fragments.append(str(root_dir / "src/unilab/assets/robots/g1/sttt_visual_landmarks.xml"))
         OmegaConf.update(playback_cfg, "env.scene.fragment_files", fragments, force_add=True)
-    session, metadata = create_collection_session(
+    session, metadata = _create_capture_session(
         playback_cfg, root_dir=root_dir, device=cfg.source.device, seed=int(cfg.source.seed),
     )
     metadata["seed"] = int(cfg.source.seed)

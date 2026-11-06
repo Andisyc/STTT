@@ -625,6 +625,27 @@ class PlannerIDMPolicy(nn.Module):
             return None
         return current_command
 
+    def predict_planner_future(
+        self,
+        history_obs: torch.Tensor,
+        history_act: torch.Tensor,
+        current_command: torch.Tensor,
+        *,
+        history_valid_mask: torch.Tensor | None = None,
+        skip_empty_history_check: bool = False,
+    ) -> torch.Tensor:
+        """Predict absolute future observations with the checkpoint's history semantics."""
+        planner_raw_output = self.planner(
+            history_obs,
+            current_command,
+            history_action=(history_act if self.planner_use_action_history else None),
+            history_valid_mask=history_valid_mask,
+            skip_empty_history_check=skip_empty_history_check,
+        )
+        if self.planner_predict_delta:
+            return planner_raw_output + history_obs[:, -1, :].unsqueeze(1)
+        return planner_raw_output
+
     def forward(
         self,
         history_obs: torch.Tensor,
@@ -637,19 +658,13 @@ class PlannerIDMPolicy(nn.Module):
         future_obs_override: torch.Tensor | None = None,
         detach_planner_future_obs: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        planner_raw_output = self.planner(
+        planner_future_obs = self.predict_planner_future(
             history_obs,
+            history_act,
             current_command,
-            history_action=(history_act if self.planner_use_action_history else None),
             history_valid_mask=history_valid_mask,
             skip_empty_history_check=skip_empty_history_check,
         )
-        # Reconstruct absolute obs from delta if planner uses delta prediction
-        if self.planner_predict_delta:
-            ref_obs = history_obs[:, -1, :]  # (B, D)
-            planner_future_obs = planner_raw_output + ref_obs.unsqueeze(1)
-        else:
-            planner_future_obs = planner_raw_output
         idm_future_obs = future_obs_override if future_obs_override is not None else planner_future_obs
         if future_obs_override is None and detach_planner_future_obs:
             idm_future_obs = idm_future_obs.detach()

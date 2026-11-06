@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -19,6 +19,9 @@ from unilab.visualization.playback_sessions import (
     RslRlPlaybackConfig,
     RslRlPlaybackSession,
 )
+
+if TYPE_CHECKING:
+    from unilab.algos.torch.distill.fada.runtime_policy import FADAFutureTransform
 
 LogFn = Callable[[str], None]
 
@@ -343,37 +346,35 @@ def create_fada_playback_session(
     root_dir: str | Path,
     device: str | None,
     prepare_rollout_branch: bool = False,
+    future_transform: FADAFutureTransform | None = None,
     deps: Mapping[str, Any] | None = None,
     log: LogFn = print,
 ) -> tuple[FADAPlaybackSession, str, str | None]:
-    """Create a stateful FADA Planner-IDM playback session."""
+    """Create playback; optional official future transforms run before Tracker inference."""
 
     # B1: policy 模式先严格恢复 checkpoint, 避免加载失败后遗留已创建的环境资源.
     from omegaconf import OmegaConf
 
     online_node = getattr(cfg, "online_adaptation", None)
     online_enabled = bool(getattr(online_node, "enabled", False))
-    spatial_node = getattr(cfg, "spatial_adaptation", None)
-    spatial_enabled = bool(getattr(spatial_node, "enabled", False))
-    spatial = None
-    if spatial_enabled:
-        from unilab.algos.torch.sttt.online_data import SpatialAdaptationConfig
-
-        spatial = SpatialAdaptationConfig(**(
-            OmegaConf.to_container(spatial_node, resolve=True)
-            if OmegaConf.is_config(spatial_node) else vars(spatial_node)
-        ))
-        # cuvslam is opt-in and never falls back to simulated ground truth.
-        if str(getattr(cfg.training, "sim_backend", "mujoco")) != "mujoco":
-            raise ValueError("Spatial adaptation requires sim_backend=mujoco")
-        if spatial.odometry_source == "cuvslam":
-            # Reject a wrong task before allocating the environment; SDK loading
-            # remains lazy and occurs only when the visual source is actually used.
-            early_task = str(getattr(cfg.training, "task_name", playback_cfg.task))
-            if early_task != "G1WalkFlat":
-                raise ValueError("cuvslam odometry requires task=g1_walk_flat/mujoco")
+    path_node = getattr(cfg, "path_following", None)
+    path_enabled = bool(getattr(path_node, "enabled", False))
+    path_setup = None
+    official_playback = None
+    if path_enabled and (future_transform is not None or prepare_rollout_branch):
+        raise ValueError("path following owns the future transform and cannot use isolated rollouts")
+    if getattr(cfg, "spatial_adaptation", None) is not None:
+        raise ValueError(
+            "spatial_adaptation config belongs to the retired spatial implementation; "
+            "remove it before using Planner-IDM playback"
+        )
+    if future_transform is not None:
+        if not callable(future_transform):
+            raise TypeError("future_transform must be callable")
+        if playback_cfg.action_mode != "policy":
+            raise ValueError("future_transform requires official policy playback")
     online = None
-    if online_enabled or spatial_enabled:
+    if online_enabled:
         from unilab.algos.torch.distill.fada.online_controller import (
             FADAOnlineAdaptationConfig,
         )
@@ -417,7 +418,20 @@ def create_fada_playback_session(
                 cfg, root_dir=root_dir, source_identity=loaded.checkpoint["source_identity"]
             )
         else:
+            if future_transform is not None:
+                raise ValueError("future_transform requires an official Planner-IDM checkpoint")
             architecture = loaded.policy.config
+
+        if path_enabled:
+            if official_profile is None:
+                raise ValueError("path following requires an official Planner-IDM checkpoint")
+            from unilab.algos.torch.sttt.path_following.runtime import prepare_path_following
+
+            path_setup = prepare_path_following(
+                path_node, cfg=cfg, playback_cfg=playback_cfg, root_dir=root_dir,
+                checkpoint_path=checkpoint_path, policy=loaded.policy, profile=official_profile,
+                spec=architecture, device=device_name,
+            )
 
         if online is not None:
             from unilab.algos.torch.distill.fada.observation import (
@@ -439,6 +453,9 @@ def create_fada_playback_session(
             f"command_dim={architecture.command_dim}, history={architecture.history_length}, "
             f"horizon={architecture.prediction_horizon}"
         )
+
+    if path_enabled and path_setup is None:
+        raise ValueError("path following requires official policy action mode")
 
     # B2: 通过 distill task config 构造环境, 键盘模式先收敛为静止零速 reset, 再核对 policy IO.
     create_env = resolved_deps["create_env"]
@@ -515,7 +532,9 @@ def create_fada_playback_session(
             controller = OfficialFADAPlaybackController(
                 loaded.policy, profile=official_profile,
                 target_joint_names=official_adapter.target_joint_names, device=device_name,
+                future_transform=future_transform,
             )
+            official_playback = controller
         elif architecture is not None:
             from unilab.algos.torch.distill.fada_observation import (
                 raw_observation_dim_for_fada_contract,
@@ -545,41 +564,20 @@ def create_fada_playback_session(
             lora_config = FADALoRAConfig(
                 rank=online.lora_rank, alpha=online.lora_alpha, dropout=online.lora_dropout,
             )
-            if spatial is not None:
-                from unilab.algos.torch.sttt.online_controller import SpatialOnlineController
-                from unilab.algos.torch.sttt.adapter_checkpoint import (
-                    bind_spatial_adapter_identity, load_spatial_adapter,
-                )
-
-                if task_name != "G1WalkFlat":
-                    raise ValueError("Spatial adaptation requires task=g1_walk_flat/mujoco")
-                controller = SpatialOnlineController(
-                    loaded.policy, lora_config, env=env, online=online, spatial=spatial,
-                    root_dir=root_dir, device=device_name,
-                    playback=controller if official_profile is not None else None,
-                    action_transform=official_adapter.env_action if official_adapter is not None else None,
-                )
-                bind_spatial_adapter_identity(controller, checkpoint)
-                if spatial.adapter_checkpoint_path:
-                    adapter_path = Path(spatial.adapter_checkpoint_path).expanduser()
-                    if not adapter_path.is_absolute():
-                        adapter_path = Path(root_dir) / adapter_path
-                    load_spatial_adapter(controller, adapter_path)
-            else:
-                controller = OnlineAdaptationController(
-                    loaded.policy,
-                    lora_config,
-                    window_size=online.window_size,
-                    warmup_steps=online.warmup_steps,
-                    gamma=online.gamma,
-                    sigma=online.sigma,
-                    update_interval=online.update_interval,
-                    lr=online.learning_rate,
-                    max_grad_norm=online.max_grad_norm,
-                    device=device_name,
-                    **({"playback": controller} if official_profile is not None else {}),
-                )
-            objective = "spatial_real_window+expert_trajectory_difference" if spatial is not None else "expert_trajectory_difference"
+            controller = OnlineAdaptationController(
+                loaded.policy,
+                lora_config,
+                window_size=online.window_size,
+                warmup_steps=online.warmup_steps,
+                gamma=online.gamma,
+                sigma=online.sigma,
+                update_interval=online.update_interval,
+                lr=online.learning_rate,
+                max_grad_norm=online.max_grad_norm,
+                device=device_name,
+                **({"playback": controller} if official_profile is not None else {}),
+            )
+            objective = "expert_trajectory_difference"
             log(
                 f"Online adaptation enabled: objective={objective}, "
                 f"prediction_horizon={architecture.prediction_horizon}, "
@@ -589,24 +587,21 @@ def create_fada_playback_session(
                 f"max_grad_norm={online.max_grad_norm}, lora_rank={lora_config.rank}, "
                 f"lora_alpha={lora_config.alpha}, lora_dropout={lora_config.dropout}"
             )
-            if spatial is None:
-                # Proprio-only TTT: no measured endpoint enters the loss.
-                log(
-                    "Spatial feedback: disabled (proprioceptive-only online update; "
-                    "this is not a spatial adaptation run)"
-                )
-            else:
-                log(
-                    f"Spatial feedback: odometry_source={spatial.odometry_source}, "
-                    f"visual_mode={spatial.visual_mode}, "
-                    f"rig={spatial.sensor.left_camera}/{spatial.sensor.right_camera} "
-                    f"{spatial.sensor.width}x{spatial.sensor.height}, "
-                    f"max_pose_age_s={spatial.max_pose_age_s}, "
-                    f"max_pose_gap_s={spatial.max_pose_gap_s}, "
-                    f"max_alignment_age_s={spatial.max_alignment_age_s}, "
-                    f"space_weight={spatial.space_weight}, "
-                    f"proprio_weight={spatial.proprio_weight}"
-                )
+
+        if path_setup is not None:
+            from unilab.algos.torch.sttt.path_following.runtime import PathFollowingController
+
+            path_updater, path_config = path_setup
+            pose_factory = resolved_deps.get("create_pose_runtime")
+            controller = PathFollowingController(
+                controller, official_playback, env, path_updater, path_config,
+                pose_runtime=(pose_factory(env, path_config.pose) if pose_factory is not None else None),
+            )
+            log(
+                f"Path following enabled: source={path_config.pose.odometry_source}, "
+                f"window_steps={path_updater.contract['data']['window_steps']}, "
+                f"update_interval_steps={path_config.update_interval_steps}"
+            )
 
         log(f"Policy obs mode: {policy_obs_mode}")
         log(f"Action mode: {playback_cfg.action_mode}")

@@ -1088,6 +1088,15 @@ class MuJoCoBackend(SimBackend):
             initial_timestamp_ns=_sim_time_to_ns(float(self._physics_state[0, 0])),
             on_close=self._release_sensor_stream,
         )
+        if config.capture_initial_frame:
+            try:
+                stream.capture_state(
+                    state_row=self._physics_state[0],
+                    timestamp_ns=_sim_time_to_ns(float(self._physics_state[0, 0])),
+                )
+            except BaseException:
+                stream.close()
+                raise
         self._sensor_stream = stream
         return stream
 
@@ -1238,7 +1247,10 @@ class MuJoCoBackend(SimBackend):
         if stream is not None:
             # Physical time of the post-reset state, never wall clock or ctrl_step*dt.
             row = int(np.asarray(env_indices).reshape(-1)[0])
-            stream.observe_reset(timestamp_ns=_sim_time_to_ns(float(self._physics_state[row, 0])))
+            stream.observe_reset(
+                timestamp_ns=_sim_time_to_ns(float(self._physics_state[row, 0])),
+                state_row=self._physics_state[row],
+            )
 
     def reset_physics_rows_to_default(self, env_indices: np.ndarray) -> None:
         """Sanitize the given rows back to each assigned model variant's default state.

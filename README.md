@@ -20,160 +20,204 @@ question, its contracts, implementation evidence, and current design transition.
 配置及 owner 模块表达。训练、仿真、部署、Git 发布和研究语义激活都需要各自明确授权。
 测试、静态检查或文档状态不能单独证明策略质量。
 
-## Spatial TTT 轨迹采集
+## Spatial TTT 实现状态
 
-使用已有 FADA Planner-IDM checkpoint 采集数据，不执行训练或在线权重更新：
+上一版“冻结动作世界模型、空间损失更新 IDM LoRA”的空间方案已退役。
+旧空间采集、训练、动作探针、在线更新入口及其配置和模型加载器不再提供；
+历史数据与 checkpoint 保留，但不代表可由当前代码继续使用。
+新版方法以 [`METHOD_DESIGN_SLAM_TTT.md`](METHOD_DESIGN_SLAM_TTT.md) 为准。
+前六步已接通运行期与有限评估工具；目前证据仅覆盖 CPU 离线验收，真实闭环效果仍待实测。
+普通 Planner/Tracker、独立执行层在线适应、几何计算与下述视觉定位诊断仍保留。
+
+`create_fada_playback_session(..., future_transform=callback)` 仅支持 official
+Planner-IDM checkpoint 的 policy 模式；不传回调时保持普通推理。回调接收
+`FADAFutureQuery`，其中历史、7D 命令、原始绝对 Planner future 为借用只读张量，
+source joint order、`ctrl_dt` 与 preprocessing 均由实际源 profile / checkpoint 绑定。
+回调必须返回相同 shape、dtype、device 的有限 future，不得原地修改输入。
+
+`sttt.path_following.compose_joint_position_residual` 接受 `[B,K,64]` future
+和 source order 的 `[B,29]` 物理弧度残差；调用方必须显式传入 profile 的
+`ctrl_dt` 和 preprocessing 的 `term_scale.dof_pos/dof_vel`，不猜默认值、不做裁剪。
+仅第一未来帧的 `[3:32]` 关节位置叠加残差，速度 `[32:61]` 叠加其有限差分：
+第一帧加 `s_v * residual / ctrl_dt`，存在第二帧时减去同一增量。
+其他关节位置、基座角速度和投影重力保持 Planner 预测；零残差完整恢复原输出。
+
+回调可用 `InterventionQueryRecord.from_query(query, adapted_future, residual_rad)`
+保存独立、脱图的查询记录，保留原始与合成 future、残差及解释元数据。
+公共 `FADAInferenceSnapshot` 结构不变，其 `nominal_future` 始终是实际交给 Tracker
+的合成目标，既有执行层差分标签与更新公式不变。查询记录不代表已执行窗口或三维实测样本；
+新版 API 与播放入口见下文；旧 `spatial_adaptation` 配置仍拒绝，不兼容退役模型。
+
+`unilab.algos.torch.sttt.path_following.collection_runtime.collect_path_following_data`
+是新版仿真预训练采集 API。传入已 compose 的 Hydra `cfg`，显式提供 `root_dir`、
+`output_dir`、`num_steps`、`window_steps`、`residual_amplitude_rad`（物理弧度）和 `seed`
+（仅控制本地残差随机流）；`shard_size` 默认 256。窗口长度不等于 Planner 预测长度。
+每窗独立均匀采样 29 维残差，窗内逐次重规划复用锁定值，候选只在下一边界生效。
+
+调用前须配置 `task=g1_walk_flat/mujoco`、真实 official checkpoint 及其绑定 profile，
+并显式关闭命令重采样（`env.commands.resampling_time=0`）、heading command、键盘和 demo。
+初始速度指令须为固定 `[vx > 0, 0, 0]`；采集器只检查，不改写速度或冻结步态相位。
+采集私有配置关闭执行层在线更新，Planner/Tracker 全程冻结，调用方配置保持不变。
+当前仅使用 simulation 真值位姿，不打开相机或启用 cuVSLAM。
+
+每窗保存首个实际执行查询、锁定残差、逐步实际 env-input 动作及物理时间、端点位姿
+与插值来源、起点水平航向系 `[dx,dy,dyaw]`（米/米/弧度）和固定初始参考线误差。
+延迟位姿按历史控制编号配对，不影响窗口边界；缺步、超时、终止和半窗不生成有效样本。
+定位身份改变即终止本轮，不用当前位置重建参考线。
+
+输出为 `source.json` 与 `windows_000000.npz` 等数值分片，格式标识为
+`sttt_path_following_windows`、版本 1。元数据绑定 checkpoint 哈希、source/target
+关节顺序、预处理尺度和窗口参数；`capture_summary` 记录有效样本与丢弃窗口计数。
+`path_following.dataset.iter_path_following_samples` 逐分片读取，
+`read_path_following_metadata` 读取解释信息；拒绝旧格式、未完成采集、混合窗口契约
+及与位姿不符的标签。非空输出目录不覆盖；只有有效完整窗口才可完成数据集。
+
+### B 离线训练与响应诊断
+
+`path_following.training.train_response_model(cfg)` 接受独立的
+`conf/sttt/response_model.yaml` 配置；显式提供 `data.train_dirs`、
+`data.validation_dirs` 和新的 `output_checkpoint`。训练与验证必须是独立完整采集组，
+不能随机拆开相邻窗口或复制同一份数据冒充验证集；相同路径及完全复制的分片会被拒绝。
+窗口步数、控制周期、H/K、source 关节顺序、基础策略身份和预处理/控制契约必须一致；
+负载、摩擦等采集条件保留在来源信息中，不作为模型兼容性字段冻结。
+
+`features.pack_response_context` 只拼接起点历史观测、动作历史、有效掩码、7D 命令
+和原始 Planner future；不输入合成 future、实测增量、路径误差或执行后动作。
+`model.ResponseModel` 用两层 SiLU MLP，将上下文和独立的 29 维物理弧度残差
+映射为 `[dx,dy,dyaw]`。H/K 从数据读取，隐藏层宽度等超参数走 YAML。
+归一化统计只拟合训练集有效历史，填充保持屏蔽；前向使用固定统计量的可微运算，
+不调用共享归一化器带 `no_grad` 的前向。输出保持米/米/弧度，损失为
+`0.5 * mean(sum((prediction - measured_delta)^2, axis=channels))`，只更新 B。
+全零、固定或缺少任一残差通道变化的数据不能作为 29 维方向预训练数据。
+
+训练按有界缓冲加载与打乱样本，不一次加载全部轨迹，也不创建环境或执行 Planner/Tracker。
+B 产物格式为 `sttt_path_following_response_model`、版本 1，独立保存网络、输入统计、
+残差覆盖、兼容契约、数据来源及训练/验证结果；原子写入且不覆盖已有产物。
+`checkpoint.load_response_checkpoint(path, expected_contract=contract)` 返回的
+`.model` 用于推理、`.contract` 用于冷路径绑定、`.metadata` 保留训练信息；
+只接受本格式，按 `weights_only=True` 加载，不恢复旧模型或训练优化器。
+
+`diagnostics.evaluate_response_model` 报告独立验证集三通道 RMSE/MAE；
+`diagnose_response_jacobian` 冻结 B 参数后，比较对物理弧度残差的自动微分与中心差分，
+并标记探针是否超出训练残差范围。该检查包含归一化的梯度链，**不是物理干预方向证明**；
+报告中的 `physical_direction_verified` 始终为 `false`，不能凭低预测误差或导数自洽
+宣称真实响应方向已验证。该离线训练入口不更新 A，也不提供在线控制或训练恢复。
+
+### A 零启动与 A/B 分离更新核心
+
+`residual_model.ResidualModel` 将测量误差 `[e_y,e_psi]` 和起点上下文映射为
+source order 的 29 维物理弧度残差。隐藏层小方差随机初始化，输出层权重/偏置为零；
+不施加手写方向、目标转速、输出裁剪或额外残差惩罚。A 只复制 B 的固定上下文统计，
+不会把 B 注册为子模块。共享的可微归一化保持 B 原有前向语义和 checkpoint state keys。
+
+`online_learning.PathFollowingUpdater(loaded_b, cfg)` 独占加载后的 B 及新建的 A；
+配置使用 `conf/sttt/path_following_online.yaml`，两个 AdamW 优化器均无权重衰减。
+`update(completed_windows, actor_context=None)` 每次最多更新 B、A 各一步，顺序为 B 再 A。
+B 只用已执行残差和实测三维增量；A 重新计算候选，通过冻结权重的 B 和
+`objectives.actor_loss` 反传旋转合成的新路径误差，不切断候选梯度。B 的统计与预训练覆盖记录不重新拟合。
+
+初始只更新 B；成功使用两个有效零残差窗口（可配置）后才允许更新 A。
+重复/逆序窗口在优化前拒绝，未成功使用的窗口不计校准数；零残差校准不证明响应方向。
+缺少合法 A 观测时 B 仍可更新，A loss 返回 `None` 并给出跳过原因，不把缺测误差补零。
+`ActorUpdateContext.from_aligned_query` 要求查询物理时刻和位姿时刻一致、定位身份与参考线一致；
+`from_window_start` 明确保留历史起点时间，不能把它冒充当前观测。
+
+调用方负责按更新间隔 T 触发、选择足够新鲜的配对观测，以及下一窗口边界的候选激活；
+本核心不轮询定位、不保存待处理窗口，也不提交或修改执行中的锁定残差。
+切换任务需显式 `begin_episode(new_reference)`，测量序列/epoch 必须推进；
+时序标记重置但模型及优化器保留，未完成的启动校准重新计数，已完成后不重复冷启动。
+调用方应丢弃旧任务待用样本，更新器拒绝跨参考线或定位身份的数据。
+
+A 阶段即使异常也恢复 B 的模式/梯度开关并清除残留梯度；异常直接上抛，不自动回滚或重试。
+若 B 已成功更新，随后 A 失败，B 的样本消费仍保留，不能重放整个批次。
+该学习核心不直接控制机器人，也不提供 A 离线预训练或 A/B 联合状态恢复；实际接线由下述运行期承担。
+
+### 路径纠偏运行期
+
+现有 `scripts/play_fada_online.py` 通过 `path_following=online` 显式开启；
+不选择该配置时，普通播放和独立执行层在线适应保持原路径。入口示例：
 
 ```bash
-uv run scripts/collect_spatial_data.py \
-  --checkpoint /absolute/path/to/planner_idm.pt \
-  --num-steps 2000 --out data/sttt/spatial_rollouts.pt
-```
-
-入口复用现有 legacy/official playback；官方 checkpoint 仍需配置对应的
-`official_playback.profile_path`。额外环境设置沿用 Hydra `key=value` override，
-`--render` 使用现有 MuJoCo viewer。checkpoint 缺失时直接报错，不回退到零动作。
-默认 task 未声明的配置项需用 Hydra `+` 添加，例如 `+env.max_episode_seconds=0.8`。
-
-输出为版本化 `.pt` 文件，包含 checkpoint 身份、控制周期、观测布局、目标关节顺序、
-动作缩放及 rollout/episode 标识。`action_sequence` 保存进入环境的 `current_actions`，
-不是缩放后的关节目标或力矩。窗口只包含同一 episode 的连续非终止步，
-默认本体历史与预测视界各 15 步；终止后通过 session reset 重新积累历史。
-HORA wrapper 的显式 reset 使用 `env.reset_all()`，同步清理步数、终止标志和状态观测。
-旧采集器的 `obs_history/actions/command` 文件不兼容，需要重新采集。
-使用 `unilab.algos.torch.sttt.collection.load_spatial_collection` 读取并校验，
-窗口的标准字段可直接构造 `SpatialTrajectoryWindow` 后交给 `SpatialBatch.collate`。
-采集链路可用不代表数据覆盖充分、模型有效或闭环稳定。
-
-采集默认 `--num-rollouts 2`，`--num-steps` 表示每个 rollout 的步数；每次使用独立
-会话、rollout ID 和 `--seed+i`，在建环境前统一设置 Python/NumPy/Torch 种子。
-元信息记录实际生效的命令、负载计划、随机化和噪声配置，以及 `label_source`。
-每窗口另记录实际负载状态：稳定无负载、稳定已负载、跨挂载变化或未知，不能把
-配置 `enabled=true` 当作整段已挂载。动作统计按重叠窗口行计算，不代表独立样本。
-不同 ID/seed 也不自动保证轨迹多样性；固定直行且关闭随机化时，重复运行可能得到
-相同轨迹，泛化评估仍需要有变化的有效命令或独立工况。
-
-## Spatial TTT 离线世界模型工具
-
-以下训练命令由用户自行启动；工具实现与代码冒烟不代表已完成模型训练。
-配置入口为 `conf/sttt/world_model.yaml`，训练业务逻辑由 `sttt.training` 持有：
-
-```bash
-uv run scripts/train_spatial_world_model.py \
-  'data.paths=[data/sttt/spatial_rollouts.pt]' \
-  training.output_dir=data/sttt/world_model
-
-uv run scripts/train_spatial_world_model.py \
-  'data.paths=[data/sttt/spatial_rollouts.pt]' \
-  training.resume=data/sttt/world_model/last.pt training.epochs=200
-
-uv run scripts/evaluate_spatial_world_model.py \
-  'data.paths=[data/sttt/spatial_rollouts.pt]' \
-  evaluation.checkpoint=data/sttt/world_model/best.pt
-
-uv run scripts/diagnose_spatial_jacobian.py \
-  --checkpoint data/sttt/world_model/best.pt \
-  --data data/sttt/spatial_rollouts.pt \
-  --output-step 0 --action-steps 0 1 --joint-indices 0 1 2
-```
-
-数据按 `(rollout_id, episode_id)` 整组划分，至少需要两个有效分组；
-重叠窗口不会分到训练和验证两侧。归一化只拟合训练集一次，评估与恢复不重新拟合。
-checkpoint 保存模型结构、归一化、优化器、数据身份、划分和随机状态，仅支持 epoch
-边界恢复；`last.pt` 用于续训，`best.pt` 用于验证指标最优模型。已有 `last.pt` 的目录
-不能直接作为全新训练输出目录。新数据集评估需显式设置 `evaluation.split=all`，
-不能把它当作原训练的留出验证集。
-`training.epochs` 表示目标总 epoch 数，不是恢复后追加的数量；恢复时训练超参数必须与
-checkpoint 一致。评估沿用 checkpoint 记录的损失权重，避免与原验证指标使用不同目标。
-数据集和世界模型 checkpoint 使用 `weights_only=True`、CPU 内存映射读取，保留原有格式、
-数据身份和兼容性检查；加载期间不要覆盖或原地改写这些文件。不通过关闭安全反序列化绕过读取错误。
-
-`evaluation.by_condition=true` 默认按标签来源、配置工况和实际窗口负载阶段分别报告
-`condition_metrics`。缺少旧元信息时标为 unknown/unspecified，不猜作标称或 SLAM。
-评估同时输出 `zero_motion_*` 静止预测基线，不额外运行模型；偏载外部数据需用
-`evaluation.split=all`，不会自动加入训练，也不会冒充原留出验证集。
-
-损失使用可配置的位置/航向权重，yaw 差值按角度周期处理；指标分别报告位置米数和航向弧度。
-雅可比工具只比较 Autograd 与中心有限差分，不证明真实物理导数、SPR 或闭环稳定性。
-当前整段 MLP 未施加时间因果约束，诊断同时显示未来动作对所选更早输出的敏感度；
-零初始化模型的零动作梯度是允许的，不代表已具备在线控制能力。
-
-### 受控物理动作灵敏度诊断
-
-以下命令也仅由用户显式启动；默认固定命令、关闭负载/随机化/噪声，不需要相机或
-cuVSLAM。采样使用已有环境快照与隔离分支，正常策略只生成一份 committed 名义窗口，
-分支回放同一实际 `env_input` 序列，仅改变一个配置动作分量的 `+epsilon/-epsilon`。
-
-```bash
-uv run scripts/diagnose_spatial_physics.py mode=capture \
-  source.checkpoint_path=/absolute/path/to/planner_idm.pt \
-  output_path=data/sttt/physical_probes.pt
-
-uv run scripts/diagnose_spatial_physics.py mode=compare \
-  input_path=data/sttt/physical_probes.pt \
-  evaluation.checkpoint=data/sttt/world_model/best.pt
-```
-
-配置位于 `conf/sttt/physical_probe.yaml`。采样按有限 origin 尝试，不通过自动重置凑齐
-成功样本；终止、非有限值、工况改变、输入被改写或越界都保留明确状态，不能填零端点。
-边界检查使用 G1 公共接口将已启用的 actuator PD 目标范围换算为 `env_input`；
-未启用的 MuJoCo `ctrlrange=[0,0]` 不作为限制，实际启用的限制仍会拒绝越界扰动。
-比较器先检查名义回放能否复现 committed 端点，再对可用分支比较物理有限差分与模型
-最终端点 Jacobian，报告分坐标误差、方向一致性和不可用案例。回放容差取采样时保存的
-配置；不可用案例不会变成零梯度或被合并成“通过”。无可用案例时 compare 退出码为 2。
-探针文件不会覆盖已有文件，也不保存完整仿真快照。该工具只提供指定状态和有限扰动下的
-局部证据，不证明严格因果模型、SPR、闭环稳定性或偏载适应成功。
-
-
-## Spatial TTT 真实短窗口在线更新
-
-第三步采用**真实短窗口重算的局部梯度**，不是 SuperMimic 式想象状态展开/BPTT。
-每步保存实际 IDM 查询；窗口成熟后重算动作，冻结世界模型只预测终点变化。
-空间候选终点按 SE(2) 组合为 `T_measured * inverse(T_model_actual) * T_model_candidate`，
-因此实测漂移参与损失，而不是仅优化模型自己预测的轨迹。参考路线只在 episode
-起点或定位重新获取时锚定，不在每个窗口消除当前偏航。
-
-以下命令会实际运行仿真和在线 LoRA 更新，由用户自行启动；需要已有策略和自行训练的
-兼容世界模型 checkpoint：
-
-```bash
-uv run scripts/play_spatial_ttt.py \
+uv run python scripts/play_fada_online.py \
   task=g1_walk_flat/mujoco recording_profile=straight_payload \
-  training.play_checkpoint_path=/absolute/path/to/planner_idm.pt \
-  spatial_adaptation.enabled=true \
-  spatial_adaptation.odometry_source=simulation \
-  spatial_adaptation.world_model_checkpoint=data/sttt/world_model/best.pt \
-  spatial_adaptation.save_adapter_path=logs/spatial_ttt/adapter.pt \
-  training.play_steps=3000
+  env.runtime_payload.enabled=false path_following=online \
+  training.play_checkpoint_path=/path/to/official_policy.pt \
+  official_playback.profile_path=/path/to/source_profile.yaml \
+  path_following.checkpoint_path=/path/to/response_b.pt \
+  path_following.pose.odometry_source=simulation
 ```
 
-开启空间适应会保留现有本体 TTT 回归与参数锚定，只有一个优化器更新同一组 IDM LoRA；
-Planner、基础 IDM、世界模型及归一化统计冻结。空间适应默认关闭，普通 playback 和
-原有本体 TTT 入口不变。新命令为无界面入口，现有 `play_fada_online.py` 也可通过
-相同配置接入原 viewer/录制路径。
+路径配置位于 `conf/distill/path_following/online.yaml`；其默认定位源为 `cuvslam`，
+示例显式改为 simulation 真值源。真实 cuVSLAM 需要受支持的 Linux/CUDA 环境，
+缺失库、缺初始位姿或跟踪失败均报错，绝不回退真值；simulation 不打开相机或 tracker。
+`learning_config_path` 复用第四步配置，`path_following.learning` 直接合并学习超参数覆盖，
+不修改学习器严格配置接口。上述入口接通不代表示例中的模型或物理纠偏质量已验证。
 
-位姿来源由 `spatial_adaptation.odometry_source` 明确选择：`simulation`（默认）通过公共
-环境 API 读取仿真真值，不打开相机或加载 cuVSLAM；`cuvslam` 使用仿真双目/IMU、
-同戳腰部 FK、骨盆转换与历史时间线，缺 SDK 或配置错误直接报错，不回退真值。
-后者需要匹配的 Linux + NVIDIA/CUDA 运行环境，但不需要实体相机。将上例 source
-改为 `cuvslam` 即选择视觉来源；`visual_mode`、`imu_noise` 和 `sensor` 参数均位于
-`spatial_adaptation` 下，含义与独立诊断配置一致。
+`runtime.PathFollowingController` 是唯一最外层控制器：内部复用 official 播放，
+可同时组合 `online_adaptation.enabled=true` 的执行层适应；不复制策略或另起物理循环。
+工厂在建 env 前核对实际 policy checkpoint 哈希、源 profile、预处理、H/K 和 B 契约；
+响应窗口长度直接取 B 产物，更新间隔由 `update_interval_steps` 单独指定。
+只支持单环境、official policy、MuJoCo 固定正向直行，拒绝键盘/heading controller/
+命令重采样/figure-eight，以及外部 `future_transform` 或隔离回放分支。
 
-Controller 先保存实际查询快照、本体观测和执行动作；测量到达后按原物理区间配对，
-窗口齐备才交给原空间损失。参考路线只在定位阶段起点锚定，按历史命令顺序积分，
-不随每个窗口或测量到达重锚。正常等待相机不等于丢失定位；失效、过期或 reset
-丢弃旧空间证据，定位不可用时只运行原本体损失，不能视为空间适应成功。
-更新统计的 `num_spatial_samples` 区分是否用了空间样本，另报告
-`localization_waiting`、`localization_lost`、`aligned_control_intervals` 和累计
-`dropped_control_intervals`。`max_pose_age_s` 控制测量新鲜度，`max_pose_gap_s`
-限制插值跨度，`max_alignment_age_s` 限制历史区间等待；它们均使用物理时间。
-视觉定位还要求可跟踪场景；可通过场景 fragment 配置使用
-`src/unilab/assets/robots/g1/sttt_visual_landmarks.xml`，不改变碰撞或增加物理负载。
+每步在原物理时钟上保存查询，按定位返回的历史控制编号配对同一时刻的位姿；
+A 的候选与更新使用最新且未过期的真实配对，保留历史时间，不能把旧误差贴到当前查询。
+校准前候选为零；校准后每步可重算，但只有窗口边界激活，执行中残差始终锁定。
+每隔 T 步先消费新完整窗口更新 B，再用尚未消费的合法决策点更新 A；空间梯度不进入 Tracker。
+执行层快照仍以合成 future 为目标，执行证据保存 target-order 的实际 env-input 动作。
 
-`spatial_adaptation.adapter_checkpoint_path` 可恢复已保存的 LoRA、Adam 和参数锚点，
-但不恢复物理状态、Tracker 或历史窗口。v2 adapter 与源策略、世界模型、动作契约、
-定位来源、传感器配置和对齐参数绑定；身份不一致或旧 v1 格式明确拒绝，保存使用
-`save_adapter_path`。该构建不证明 3kg 偏载收敛、模型导数的物理正确性或真机安全性。
+`pose.sensor.capture_initial_frame=true` 为本模式提供打开/reset 时刻的双目帧与 FK，
+只对已有物理状态做 forward/capture，不推进物理或伪造 IMU。其他传感器使用方默认关闭此项，
+保留原采样节奏。cuVSLAM 保留已经产生的 autoreset 初始帧，且不读取评估真值作为定位输入。
+参考线必须由任务起点证据建立；初始证据缺失、定位失效/过期、身份变化或时间倒退即停止，
+不重新定线、不维持旧非零候选无限行走。terminal 窗口丢弃；显式 reset 清空待配对数据，
+保留模型与优化器，之后按新的物理序列建立参考；close 先释放定位源，再由 session 释放环境。
+
+运行期的 `trace` 是 `max_trace_records` 限定的内存环形记录，保存测量时间、物理年龄、
+横向/航向误差、候选/锁定残差、窗口/更新编号和丢弃原因，不自动写新报告文件。
+查询缓存和待更新窗口也有独立容量上限，过期查询计数、容量超限报错；不静默覆盖训练样本。
+目前只完成 CPU 计算与生命周期证据，未运行 CUDA 定位或机器人闭环，不宣称真实纠偏/抗振荡已通过。
+
+### 有限闭环评估与证据落盘
+
+`scripts/evaluate_path_following.py` 使用独立的 `conf/sttt/path_following_evaluate.yaml`，
+调用 `path_following.evaluation.run_path_following_evaluation`。它是真实实验入口，
+执行该命令会启动显式请求的仿真/在线适应，不是自动验收或训练准备步骤。
+
+必须显式提供输出目录、policy checkpoint、源 profile、物理时长、五项指标阈值，
+以及非空的 `modes`、`conditions`、`seeds`。支持模式为 `nominal`（均不适应）、
+`oat`（仅执行层适应）、`oat_path`（执行层适应与路径纠偏）；条件为
+`clean` 或 `delayed_payload`。只运行这些显式列表的组合，不自动增加种子、延长或重试。
+`oat_path` 还必须提供独立 B 产物；`pose_source` 显式选择 simulation/cuvslam，绝无真值回退。
+
+`source_overrides` 直接 compose 到既有 `g1_walk_flat/mujoco` 与 `straight_payload` 预设，
+用于共享场景/命令/负载配置；模式与负载开关由评估器按请求设置。每组重新创建 session
+并设置同一种子，不继承其他组的模型、优化器或轨迹。无视频渲染路径；只通过公共 session
+单步执行并关闭 autoreset，遇 terminal/truncation/定位失效/异常立即停止该 episode。
+异常停止后续组合；正常提前终止可继续其余已请求组合，但不能被标成完整运行。
+
+五项必填阈值为 `lateral_tolerance_m`、`heading_tolerance_rad`、`dwell_s`、
+`crossing_deadband_m`、`minimum_forward_progress_m`；不内置论文通过阈值。
+时长必须为实际控制周期的整数倍。评分真值通过公开基座位姿读取，仅进入独立评估通道，
+不传回定位、A/B 或 Tracker。参考线在 reset 起点固定，三种模式使用相同误差定义。
+
+每个运行输出 `source.json`（配置、模型/源 profile 哈希、种子、实际条件及参考线）、
+`trajectory.csv`（物理时间、真值误差、前进位置、实际负载事件）、`runtime.jsonl`
+（完整逐步运行期记录）及 `summary.json`；顶层另有组合摘要。非空输出目录拒绝覆盖。
+运行期 `drain_trace()` 每步转移记录，不靠最后一次读取有限环形缓冲；JSONL 保留所有到达记录，
+但定位统计按被表示的测量时间去重，重复使用旧观测不增加独立测量数。
+
+RMSE 对物理时间作梯形积分，不按到达次数或视频帧数平均；缺测不外推、不跨空洞积分，
+并中断持续恢复判据。摘要区分保持、恢复、未恢复、恢复后再丢失、覆盖不足或持续时间不足。
+恢复进入时刻须经完整 dwell 确认，同时满足横向与航向容差；从未偏离不算恢复，
+站住时即使误差很小也不能通过前进要求。带死区横向过零次数与恢复后峰值单独报告。
+
+负载附加依据 `state.info` 的实际事件记录，时间为对应已执行区间的起点，
+不把配置中的计划时间当成已发生事件；另报实际附加后的指标。未实际附加的载荷实验
+即使到达时长，也标为未完成。`complete` 只表示实验协议完整，`tracking_success`
+才表示该次运行满足配置的跟踪与前进要求；二者都不代表跨场景泛化或雅可比方向已验证。
+异常与关闭失败写入失败摘要，后物理步异常仍尽量保留最后真值证据，绝不伪造成功。
+CLI 对未完整执行的协议返回非零状态；本轮仅验收了合成 I/O 和解析轨迹，未执行真实实验。
 
 ## MuJoCo 双目 / IMU 与 cuVSLAM 诊断
 
@@ -211,8 +255,8 @@ cuVSLAM 是独立可选依赖；适配器以 [v17.0.1](https://github.com/nvidia
 插值，不外推；超过 `alignment.max_gap_s` 的间隙、失效或过期区间丢弃并计数。
 `alignment.max_age_s` 是物理时间等待上限，不是脚本或子 Agent 的运行时限。
 Rig 误差评估另用每段首个有效位姿做一次 SE(3) 对齐，不拟合尺度或整条轨迹。
-转换器与时间线既可独立诊断，也已通过在线定位运行时接入 `SpatialOnlineController`
-的原有 LoRA 更新路径；完整 MuJoCo + cuVSLAM 行走运行验收仍需另行执行。
+转换器与时间线可独立诊断；测量运行时使用 `PoseRuntimeConfig`，
+与空间学习配置解耦。完整 MuJoCo + cuVSLAM 行走运行验收仍需另行执行。
 
 当前仅支持单环境、刚性胸部 IMU 和基础场景模型，不支持随机化模型 variant。
 默认 G1 步长对应 150 Hz IMU、30 Hz 双目。启用时按物理子步采样；关闭时保持原批量

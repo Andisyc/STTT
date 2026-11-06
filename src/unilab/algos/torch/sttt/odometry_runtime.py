@@ -35,16 +35,16 @@ from typing import Any, Literal
 
 import numpy as np
 
-from unilab.algos.torch.sttt.online_data import SpatialAdaptationConfig
 from unilab.algos.torch.sttt.pose_conversion import PelvisPoseConverter
 from unilab.algos.torch.sttt.pose_data import (
     ControlInterval,
     OnlinePoseRuntime,
+    PoseRuntimeConfig,
     PoseRuntimeUpdate,
     TimedPelvisPose,
 )
 from unilab.algos.torch.sttt.pose_timeline import PoseTimeline
-from unilab.base.backend.sensors import BackendSensorStream, SensorClock
+from unilab.base.backend.sensors import BackendSensorStream, RigKinematicsSample, SensorClock, StereoFrame
 from unilab.envs.common.rotation import np_matrix_from_quat
 
 __all__ = ["create_pose_runtime"]
@@ -96,7 +96,7 @@ def _env_sim_time_ns(env: Any) -> int:
 class _TimelineEvidence:
     """One measurement timeline plus the freshness bookkeeping both sources share."""
 
-    def __init__(self, spatial: SpatialAdaptationConfig) -> None:
+    def __init__(self, spatial: PoseRuntimeConfig) -> None:
         self._timeline = PoseTimeline(
             max_gap_ns=_nanoseconds(spatial.max_pose_gap_s, "max_pose_gap_s"),
             max_age_ns=_nanoseconds(spatial.max_alignment_age_s, "max_alignment_age_s"),
@@ -187,7 +187,7 @@ class _SimulationPoseRuntime(_TimelineEvidence):
 
     _FRAME_ID = "world"
 
-    def __init__(self, env: Any, spatial: SpatialAdaptationConfig) -> None:
+    def __init__(self, env: Any, spatial: PoseRuntimeConfig) -> None:
         super().__init__(spatial)
         self._env = env
         self._tracking_epoch = 0
@@ -289,7 +289,7 @@ class _SimulationPoseRuntime(_TimelineEvidence):
 class _CuvslamPoseRuntime(_TimelineEvidence):
     """cuVSLAM stereo odometry over the backend stream; truth is never injected."""
 
-    def __init__(self, env: Any, spatial: SpatialAdaptationConfig) -> None:
+    def __init__(self, env: Any, spatial: PoseRuntimeConfig) -> None:
         super().__init__(spatial)
         self._env = env
         self._sensor_config = spatial.sensor
@@ -298,6 +298,8 @@ class _CuvslamPoseRuntime(_TimelineEvidence):
         self._converter = PelvisPoseConverter()
         self._stream: BackendSensorStream | None = None
         self._odometry: Any = None
+        self._reset_frames: tuple[StereoFrame, ...] = ()
+        self._reset_kinematics: tuple[RigKinematicsSample, ...] = ()
 
     # ----------------------------------------------------------------- input
 
@@ -340,8 +342,10 @@ class _CuvslamPoseRuntime(_TimelineEvidence):
             )
         self._timeline.enqueue(control)
 
-        frames = stream.drain()
-        kinematics_rows = stream.drain_kinematics()
+        frames = self._reset_frames + stream.drain()
+        kinematics_rows = self._reset_kinematics + stream.drain_kinematics()
+        self._reset_frames = ()
+        self._reset_kinematics = ()
         # Evaluation-only truth: drained so the stream never backlogs, never used.
         stream.drain_reference_poses()
         if len(frames) != len(kinematics_rows):
@@ -398,17 +402,25 @@ class _CuvslamPoseRuntime(_TimelineEvidence):
     # --------------------------------------------------------------- control
 
     def reset(self) -> None:
-        """Drop the episode before ``env.reset``; the next ``begin_step`` resyncs.
+        """Forget old evidence while retaining an already-produced autoreset frame.
 
-        Nothing is re-opened or captured here: packets left from the old episode
-        are discarded, the timeline is cleared, and the new stream sequence
-        rebuilds the localization anchor lazily from its first valid pose.
+        Manual reset calls this before env.reset; autoreset calls it afterwards.
+        A new-sequence frame at the reset clock is real initialization evidence,
+        not a stale packet. It must reach the tracker exactly once.
         """
         self._require_open()
         stream = self._stream
         if stream is not None:
-            stream.drain()
-            stream.drain_kinematics()
+            frames = self._reset_frames + stream.drain()
+            kinematics = self._reset_kinematics + stream.drain_kinematics()
+            clock = stream.clock
+            self._reset_frames = tuple(
+                item for item in frames
+                if item.sequence_id == clock.sequence_id and item.sequence_id > self._sequence_id
+                and item.timestamp_ns == clock.timestamp_ns
+            )
+            keys = {(item.sequence_id, item.timestamp_ns) for item in self._reset_frames}
+            self._reset_kinematics = tuple(item for item in kinematics if (item.sequence_id, item.timestamp_ns) in keys)
             stream.drain_reference_poses()
         self._clear_evidence()
         self._open_epoch()
@@ -485,7 +497,7 @@ class _CuvslamPoseRuntime(_TimelineEvidence):
         return stream
 
 
-def create_pose_runtime(env: Any, spatial: SpatialAdaptationConfig) -> OnlinePoseRuntime:
+def create_pose_runtime(env: Any, spatial: PoseRuntimeConfig) -> OnlinePoseRuntime:
     """Build the single controller-owned pose source selected by the config."""
     if spatial.odometry_source == "simulation":
         return _SimulationPoseRuntime(env, spatial)

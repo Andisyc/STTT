@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
+
+import torch
 
 from unilab.algos.torch.distill.fada.collection_contract import validate_official_fada_preprocessing
 from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy, PlannerIDMOutput
@@ -23,6 +25,27 @@ class FADARuntimeSpec:
     prediction_horizon: int
     idm_use_current_command_for_history: bool = False
     preprocessing: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class FADAFutureQuery:
+    """Borrowed, read-only inputs for one official future transform.
+
+    Tensors belong to playback and must not be mutated or retained without
+    copying. ``planner_future`` is absolute, checkpoint-scaled, source-ordered.
+    Metadata is bound at controller construction, never read from assets here.
+    """
+
+    observation_history: torch.Tensor
+    action_history: torch.Tensor
+    command: torch.Tensor
+    history_valid_mask: torch.Tensor
+    planner_future: torch.Tensor
+    preprocessing: Mapping[str, Any]
+    profile: OfficialFADAPlaybackProfile
+
+
+FADAFutureTransform = Callable[[FADAFutureQuery], torch.Tensor]
 
 
 def get_fada_runtime_spec(policy: FADAPlannerIDMPolicy | PlannerIDMPolicy) -> FADARuntimeSpec:

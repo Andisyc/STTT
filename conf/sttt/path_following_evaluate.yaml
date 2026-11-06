@@ -1,0 +1,18 @@
+# Explicit requested cases only; implementation/smoke checks never invoke this experiment automatically.
+output_dir: null
+policy_checkpoint: null
+profile_path: null
+response_checkpoint: null  # Required only for oat_path.
+pose_source: simulation  # Explicit truth-based experiment; use cuvslam only on supported Linux/CUDA.
+device: cpu
+modes: []  # Explicit subset of [nominal, oat, oat_path].
+conditions: []  # Explicit subset of [clean, delayed_payload].
+seeds: []
+duration_s: null  # Required finite physical horizon, an integer number of control periods.
+source_overrides: []  # Composed onto task=g1_walk_flat/mujoco and recording_profile=straight_payload.
+thresholds:
+  lateral_tolerance_m: null
+  heading_tolerance_rad: null
+  dwell_s: null
+  crossing_deadband_m: null
+  minimum_forward_progress_m: null

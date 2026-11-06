@@ -21,9 +21,11 @@ from unilab.algos.torch.distill.fada.observation import (
 from unilab.algos.torch.distill.fada.official_model import PlannerIDMPolicy
 from unilab.algos.torch.distill.fada.online_data import FADAInferenceSnapshot
 from unilab.algos.torch.distill.fada.runtime_policy import (
+    FADAFutureQuery,
+    FADAFutureTransform,
     OfficialFADAPlaybackProfile,
     get_fada_runtime_spec,
-    invoke_fada_policy,
+    invoke_fada_idm,
 )
 
 
@@ -44,14 +46,18 @@ class OfficialFADAPlaybackController:
         profile: OfficialFADAPlaybackProfile,
         target_joint_names: Sequence[str],
         device: str | torch.device,
+        future_transform: FADAFutureTransform | None = None,
     ) -> None:
         if not isinstance(policy, PlannerIDMPolicy):
             raise TypeError("official playback requires the official PlannerIDMPolicy")
         if not isinstance(profile, OfficialFADAPlaybackProfile):
             raise TypeError("official playback requires an explicit source-bound control profile")
+        if future_transform is not None and not callable(future_transform):
+            raise TypeError("official future_transform must be callable")
         self.policy = policy
         self.profile = profile
         self.spec = get_fada_runtime_spec(policy)
+        self.future_transform = future_transform
         if self.spec.family != "official" or self.spec.observation_contract != FADA_OFFICIAL_COMPACT_OBSERVATION_CONTRACT:
             raise ValueError("official playback requires the official compact runtime spec")
         if self.spec.obs_dim != 64 or self.spec.action_dim != 29 or self.spec.command_dim != 7:
@@ -188,15 +194,42 @@ class OfficialFADAPlaybackController:
         assert self._action_history is not None
         assert self._history_valid_mask is not None
 
-        output = invoke_fada_policy(
-            self.policy,
-            self.spec,
+        planner_future = self.policy.predict_planner_future(
             self._observation_history,
             self._action_history,
             cmd,
             history_valid_mask=self._history_valid_mask,
         )
-        action = output.action.detach()
+        tracker_future = planner_future
+        if self.future_transform is not None:
+            tracker_future = self.future_transform(FADAFutureQuery(
+                observation_history=self._observation_history,
+                action_history=self._action_history,
+                command=cmd,
+                history_valid_mask=self._history_valid_mask,
+                planner_future=planner_future,
+                preprocessing=self._preprocessing,
+                profile=self.profile,
+            ))
+            if (
+                not isinstance(tracker_future, torch.Tensor)
+                or tracker_future.shape != planner_future.shape
+                or tracker_future.dtype != planner_future.dtype
+                or tracker_future.device != planner_future.device
+            ):
+                raise ValueError("official future_transform must preserve future shape, dtype and device")
+            if not bool(torch.isfinite(tracker_future).all()):
+                raise ValueError("official future_transform must return a finite future")
+        action_chunk = invoke_fada_idm(
+            self.policy.idm,
+            self.spec,
+            self._observation_history,
+            self._action_history,
+            cmd,
+            tracker_future,
+            history_valid_mask=self._history_valid_mask,
+        )
+        action = action_chunk[:, 0].detach()
         expected_action_shape = (obs.shape[0], self.spec.action_dim)
         if tuple(action.shape) != expected_action_shape:
             raise ValueError(
@@ -206,8 +239,8 @@ class OfficialFADAPlaybackController:
         if not bool(torch.isfinite(action).all()):
             raise ValueError("official playback policy produced non-finite actions")
         # Source-semantics clip on the normalized command; only this first
-        # action is executed and recorded. The full predicted nominal future
-        # and action chunk stay untouched for snapshot/online consumers.
+        # action is executed and recorded. Snapshots retain the actual Tracker
+        # target, including any intentional future transform.
         action = torch.clamp(action, -self.profile.clip_actions, self.profile.clip_actions)
         # Record u_t now; it enters the action history at the next observation
         # advance so the snapshot above keeps actions strictly through t-1 and
@@ -218,7 +251,7 @@ class OfficialFADAPlaybackController:
                 observation_history=self._observation_history,
                 action_history=self._action_history,
                 command=cmd,
-                nominal_future=output.predicted_future,
+                nominal_future=tracker_future,
                 action_snapshot=action,
                 observation_contract=FADA_OFFICIAL_COMPACT_OBSERVATION_CONTRACT,
                 history_valid_mask=self._history_valid_mask,

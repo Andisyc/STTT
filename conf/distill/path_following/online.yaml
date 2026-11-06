@@ -1,0 +1,20 @@
+# Opt-in: path_following=online. Backend and commands must already meet the runtime contract.
+enabled: true
+checkpoint_path: null  # Required independent B artifact, not the policy checkpoint.
+learning_config_path: conf/sttt/path_following_online.yaml
+learning: {}  # Direct OmegaConf overrides of the existing A/B learning configuration.
+update_interval_steps: 10
+max_cached_queries: 512
+max_pending_windows: 128
+max_trace_records: 2048
+pose:
+  odometry_source: cuvslam  # Explicit simulation override for ground-truth experiments; no fallback.
+  max_pose_age_s: 0.1
+  max_pose_gap_s: 0.1
+  max_alignment_age_s: 0.2
+  max_pose_samples: 512
+  max_pending_intervals: 512
+  visual_mode: stereo
+  imu_noise: null
+  sensor:
+    capture_initial_frame: true
