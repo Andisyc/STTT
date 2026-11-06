@@ -1,0 +1,8 @@
+# Offline prediction ablation only; no training or environment creation.
+checkpoint_path: null
+validation_dirs: []  # Empty uses the artifact's recorded validation paths and verifies fingerprints.
+batch_size: 128
+shuffle_seed: 0
+shuffle_repeats: 5
+device: cpu
+output_path: null  # Defaults to residual_diagnostics.json next to B; never overwrites an existing file.

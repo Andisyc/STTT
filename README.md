@@ -103,6 +103,32 @@ B 产物格式为 `sttt_path_following_response_model`、版本 1，独立保存
 报告中的 `physical_direction_verified` 始终为 `false`，不能凭低预测误差或导数自洽
 宣称真实响应方向已验证。该离线训练入口不更新 A，也不提供在线控制或训练恢复。
 
+`scripts/diagnose_response_residuals.py` 提供纯离线的残差输入有效性诊断：固定同一份 B、
+起点上下文和实际增量标签，只替换送入 B 的残差为原值、全零或打乱值。
+不修改数据中的 residual/adapted future，不训练、不拟合归一化、不创建环境。
+
+```bash
+uv run python scripts/diagnose_response_residuals.py checkpoint_path=/path/to/response_b.pt
+```
+
+配置为 `conf/sttt/response_residual_diagnostics.yaml`，默认 CPU、batch size 128、
+固定种子 0 和 5 次置换。`validation_dirs=[]` 自动读取 B 产物中记录的验证路径，
+核对分片内容指纹；显式指定新验证集时仍检查响应契约，并拒绝训练目录、复制的训练数据、
+重复输入或已改变的原验证集。没有训练/验证来源记录的 B 产物不能冒充可验证的独立诊断。
+
+每次置换在同一采集的 sequence/epoch/frame 分组内交换完整 29 维向量，
+使用 Sattolo 单环算法保证没有窗口身份固定点，不宣称均匀采样所有无固定点置换。
+不足两个窗口的分组明确拒绝；全组置换与推理 batch size 无关。
+只缓存残差和窗口身份，历史与标签分片按批重读；重复残差导致输入仍相同的比例单独报告。
+
+输出默认是 B 同目录的 `residual_diagnostics.json`，可由 `output_path` 指定，已有文件不覆盖。
+报告保存模型/采集指纹、来源条件、分组、置换设置及映射哈希，
+并分别给出总体与逐采集的 RMSE/MAE，以及 `ablation RMSE - correct RMSE`。
+三通道始终使用米/米/弧度；打乱结果包含各次指标及均值/范围。正差值只代表当前数据上的
+正确残差配对有预测收益，接近零不能单独断言完全没学到响应；5 次置换不是 5 次独立实验。
+`zero_inside_training_residual_bounds` 标记零残差是否处于预训练残差范围。
+此诊断不验证物理干预方向或跨条件泛化，`physical_direction_verified` 始终为 `false`。
+
 ### A 零启动与 A/B 分离更新核心
 
 `residual_model.ResidualModel` 将测量误差 `[e_y,e_psi]` 和起点上下文映射为

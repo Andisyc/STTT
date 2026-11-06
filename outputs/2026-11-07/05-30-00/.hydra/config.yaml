@@ -1,0 +1,7 @@
+checkpoint_path: /var/folders/k_/ww1gp77d2sn65rmlrpq6kwtr0000gn/T/sttt-residual-input-n_rtsxi3/b.pt
+validation_dirs: []
+batch_size: 5
+shuffle_seed: 0
+shuffle_repeats: 5
+device: cpu
+output_path: null
