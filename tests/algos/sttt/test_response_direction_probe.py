@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import runpy
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,10 +11,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from hydra.core.global_hydra import GlobalHydra
+from hydra.core.hydra_config import HydraConfig
+from hydra.errors import ConfigCompositionException
 from omegaconf import DictConfig, OmegaConf
 
 from test_path_following_runtime import ROOT, SyntheticEnv, SyntheticWrapper, runtime_case
 from unilab.algos.torch.distill.fada.checkpoint import LoadedOfficialFADAStudentPolicy
+from unilab.algos.torch.sttt.path_following import response_probe as probe_module
 from unilab.algos.torch.sttt.path_following.response_probe import compare_probe_responses, run_response_direction_probe
 
 
@@ -176,3 +182,44 @@ def test_residual_coverage_and_existing_evidence_fail_before_new_rollouts(tmp_pa
     with pytest.raises(FileExistsError):
         run_response_direction_probe(cfg, root_dir=ROOT, playback_deps=case.deps)
     assert (output / 'keep.json').read_text() == 'user evidence' and not case.environments
+
+
+@pytest.mark.parametrize('invalid_task_override', [False, True])
+def test_real_hydra_main_preserves_outer_context_during_probe_composition(tmp_path, monkeypatch, invalid_task_override):
+    """Enter the decorated CLI, not __wrapped__ or --cfg, with only physical I/O substituted."""
+    case, cfg, _ = probe_case(tmp_path)
+    script = ROOT / 'scripts/probe_response_directions.py'
+    argv = [str(script)]
+    for key in ('policy_checkpoint', 'profile_path', 'response_checkpoint', 'output_dir', 'device', 'seed', 'warmup_steps',
+                'residual_amplitude_rad', 'replay_position_tolerance_m', 'replay_heading_tolerance_rad', 'minimum_effect_m', 'minimum_effect_rad'):
+        argv.append(f'{key}={cfg[key]}')
+    argv.extend([f'hydra.run.dir={tmp_path / "hydra_job"}', 'hydra.output_subdir=null',
+                 'hydra/job_logging=disabled', 'hydra/hydra_logging=disabled'])
+    if invalid_task_override:
+        argv.append("source_overrides=['env.missing_probe_field=1']")
+    observed = []
+    def checked_probe(config, *, root_dir):
+        assert GlobalHydra.instance().is_initialized()
+        outer = GlobalHydra.instance().hydra
+        outer_config = HydraConfig.get()
+        observed.append('entered_real_main')
+        try:
+            result = run_response_direction_probe(config, root_dir=root_dir, playback_deps=case.deps)
+            assert result['complete'] and result['valid']
+            observed.append('completed_four_branches')
+            return result
+        finally:
+            assert GlobalHydra.instance().hydra is outer
+            assert HydraConfig.get() is outer_config
+    monkeypatch.setattr(probe_module, 'run_response_direction_probe', checked_probe)
+    monkeypatch.setattr(sys, 'argv', argv)
+    monkeypatch.setenv('HYDRA_FULL_ERROR', '1')
+    if invalid_task_override:
+        with pytest.raises(ConfigCompositionException):
+            runpy.run_path(str(script), run_name='__main__')
+        assert observed == ['entered_real_main'] and not case.environments
+    else:
+        runpy.run_path(str(script), run_name='__main__')
+        assert observed == ['entered_real_main', 'completed_four_branches']
+        assert len(case.environments) == 4 and all(env.closed for env in case.environments)
+    assert not GlobalHydra.instance().is_initialized()

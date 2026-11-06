@@ -135,6 +135,8 @@ uv run python scripts/diagnose_response_residuals.py checkpoint_path=/path/to/re
 配置为 `conf/sttt/response_direction_probe.yaml`。这是需要显式启动的有限仿真实验，
 不是自动测试或重新训练：固定一个起点、一条随机 29 维方向，执行
 `zero_a -> plus -> minus -> zero_b` 四个分支；中间正负顺序可交换，但不能增加分支或重试挑选。
+探针任务配置由独立加载器组合，不初始化、清空或替换调用方的全局 Hydra。
+同一 API 支持普通 Python 调用与已进入 `@hydra.main` 的 CLI，原启动参数保持不变。
 
 每个分支新建独立的普通 official 播放 session，以相同种子重复零残差热身；
 不新增快照恢复框架、不修改后端，不启用 A、OAT、路径纠偏运行期、相机或视频。

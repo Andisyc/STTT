@@ -16,8 +16,10 @@ from typing import Any
 
 import numpy as np
 import torch
-from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, OmegaConf
+from hydra._internal.config_loader_impl import ConfigLoaderImpl
+from hydra._internal.utils import create_config_search_path
+from hydra.types import RunMode
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from unilab.algos.torch.distill.fada.official_playback import OfficialFADAPlaybackController
 from unilab.algos.torch.sttt.geometry import quat_to_mat, wrap_to_pi
@@ -271,8 +273,16 @@ def run_response_direction_probe(
     candidates = torch.cat((torch.zeros_like(residual), residual, -residual)).to(reference)
     if not bool(((candidates >= loaded.model.residual_min) & (candidates <= loaded.model.residual_max)).all()):
         raise ValueError("zero/positive/negative residual exceeds B training coverage; no clipping or amplitude expansion is allowed")
-    with initialize_config_dir(version_base="1.3", config_dir=str(root / "conf/distill")):
-        playback_cfg = compose(config_name="config", overrides=["task=g1_walk_flat/mujoco", "recording_profile=straight_payload", *list(cfg.source_overrides), "~path_following"])
+    # The CLI already owns GlobalHydra. A local loader composes the task without
+    # initializing, clearing, or replacing that outer application's context.
+    loader = ConfigLoaderImpl(config_search_path=create_config_search_path(str(root / "conf/distill")))
+    playback_cfg = loader.load_configuration(
+        config_name="config", overrides=["task=g1_walk_flat/mujoco", "recording_profile=straight_payload", *list(cfg.source_overrides), "~path_following"],
+        run_mode=RunMode.RUN, from_shell=False,
+    )
+    # Match hydra.compose's ordinary task-only return value.
+    with open_dict(playback_cfg):
+        del playback_cfg["hydra"]
     for key, value in (("training.play_checkpoint_path", str(policy_path)), ("official_playback.profile_path", str(profile_path)),
                        ("online_adaptation.enabled", False), ("env.runtime_payload.enabled", False),
                        ("video_recording.enabled", False), ("demo.figure_eight.enabled", False), ("demo.footprints.enabled", False), ("algo.seed", seed)):
