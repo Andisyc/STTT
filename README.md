@@ -129,6 +129,39 @@ uv run python scripts/diagnose_response_residuals.py checkpoint_path=/path/to/re
 `zero_inside_training_residual_bounds` 标记零残差是否处于预训练残差范围。
 此诊断不验证物理干预方向或跨条件泛化，`physical_direction_verified` 始终为 `false`。
 
+### 最小同起点响应探针
+
+`scripts/probe_response_directions.py` 调用 `path_following.response_probe.run_response_direction_probe`，
+配置为 `conf/sttt/response_direction_probe.yaml`。这是需要显式启动的有限仿真实验，
+不是自动测试或重新训练：固定一个起点、一条随机 29 维方向，执行
+`zero_a -> plus -> minus -> zero_b` 四个分支；中间正负顺序可交换，但不能增加分支或重试挑选。
+
+每个分支新建独立的普通 official 播放 session，以相同种子重复零残差热身；
+不新增快照恢复框架、不修改后端，不启用 A、OAT、路径纠偏运行期、相机或视频。
+环境必须是固定直行、无额外负载、无噪声/随机扰动的 G1 MuJoCo 条件，P/T/B 权重均冻结。
+热身动作与位姿、原生高精度起点状态、相位/命令及首个真实推理上下文均逐字段核对；
+相同种子不等于检查通过。原生状态只通过现有公开快照接口读取一次，不执行恢复，
+也不使用 float32 视频快照。任何起点或上下文不一致即停止本组，不自动放宽检查。
+
+显式提供 policy/profile/B/输出路径、`residual_amplitude_rad`、
+`replay_position_tolerance_m`、`replay_heading_tolerance_rad`、`minimum_effect_m/rad`；
+默认 CPU、种子 0、每分支热身 50 步。正负残差和零残差都必须位于 B 的训练覆盖范围，
+不自动裁剪或扩大。窗口长度和控制周期取 B/实际 profile 契约，而不是另设预测长度。
+当前模型若窗口为 10 步、周期 0.02 秒，四个分支共执行 `4 * (warmup_steps + 10)`
+个控制步，只有每分支末尾 0.2 秒施加对应锁定残差，逐次重规划仍复用该值。
+
+输出目录非空时拒绝覆盖；`source.json` 保存模型身份与配置，四个分支分别保存
+数值 NPZ（物理时间、轨迹、实际 env-input 动作、残差、起点核对字段和首查询上下文），
+`summary.json` 保存实际增量、B 预测和正负差异。异常/终止保留已观察的部分数据并停止后续分支，
+不把失败结果替换为新起点。每个 session 在完成或异常后都关闭。
+
+两次零残差的窗口轨迹用于重复性检查；超过显式位置/航向容差时，本组 `valid=false`。
+比较实际与预测的 `plus - minus` 三通道增量，航向差取主值；实际差异未超过
+最小效果阈值和零重复差异时，标为 `unresolved_effect`，不判 B 对错。其他通道分别标记
+`same_sign`、`opposite_sign` 或 `prediction_negligible`，同时保留幅度误差。
+符号一致不代表幅度准确、全状态雅可比正确或闭环稳定；结论只属于本组有限幅度仿真对照。
+CLI 在分支未完成或重复性无效时返回非零；工具的 CPU 合成 I/O 验收不代替真实仿真结果。
+
 ### A 零启动与 A/B 分离更新核心
 
 `residual_model.ResidualModel` 将测量误差 `[e_y,e_psi]` 和起点上下文映射为

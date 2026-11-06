@@ -1,0 +1,15 @@
+# One start, one random direction, four fresh-session replays. This is an explicit simulation entry.
+policy_checkpoint: null
+profile_path: null
+response_checkpoint: null
+output_dir: null
+device: cpu
+seed: 0
+warmup_steps: 50
+residual_amplitude_rad: null  # Explicit physical radians; both signs must fit B's training coverage.
+replay_position_tolerance_m: null
+replay_heading_tolerance_rad: null
+minimum_effect_m: null
+minimum_effect_rad: null
+source_overrides: []
+branch_order: [zero_a, plus, minus, zero_b]
