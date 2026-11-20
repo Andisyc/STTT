@@ -693,3 +693,35 @@ def test_legacy_capture_pretraining_resume_and_runtime_without_yaml(tmp_path):
     result = run_path_following_evaluation(evaluation, root_dir=ROOT, playback_deps=case.deps)
     assert result["complete"] and len(result["runs"]) == 2
     assert all(env.closed for env in case.environments)
+
+
+def test_legacy_empty_scene_poles_migrate_through_strict_registry(tmp_path):
+    from unilab.algos.torch.distill.fada.legacy_deployment import build_legacy_playback_env_override
+    from unilab.base.registry import apply_cfg_overrides
+    from unilab.base.scene import SceneCfg
+
+    _, original_profile = legacy_case(tmp_path / "inputs")
+    source = deepcopy(original_profile.source_profile)
+    scene = {"model_file": "/ssd1/cyx/TTT/src/unilab/assets/robots/g1/scene_flat.xml",
+             "fragment_files": [], "terrain": None, "task_poles": []}
+    source["environment_config"]["scene"] = scene
+    profile = replace(original_profile, source_profile=source)
+    original = deepcopy(source)
+    restored = build_legacy_playback_env_override(profile, {})
+    target = SceneCfg(model_file="scene_previous.xml")
+    apply_cfg_overrides(target, restored["scene"])
+    expected = {key: value for key, value in scene.items() if key != "task_poles"}
+    assert asdict(target) == expected
+    assert source == original
+
+    scene.pop("task_poles")
+    assert build_legacy_playback_env_override(profile, {})["scene"] == expected
+    for unsupported in (None, [{"position": [1., 0., 0.]}]):
+        scene["task_poles"] = unsupported
+        with pytest.raises(ValueError, match="scene.task_poles must be an empty list"):
+            build_legacy_playback_env_override(profile, {})
+    scene["task_poles"] = []
+    scene["unrecognized_scene_field"] = None
+    restored = build_legacy_playback_env_override(profile, {})
+    with pytest.raises(ValueError, match="has no attribute 'unrecognized_scene_field'"):
+        apply_cfg_overrides(SceneCfg(model_file="scene_previous.xml"), restored["scene"])

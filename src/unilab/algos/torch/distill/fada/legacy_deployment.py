@@ -114,6 +114,11 @@ def validate_execution_preprocessing(value: Mapping[str, Any]) -> dict[str, Any]
 def build_legacy_playback_env_override(profile: LegacyFADAPlaybackProfile, overrides: Mapping[str, Any]) -> dict[str, Any]:
     """Restore the source env, allowing only explicit task-condition overrides."""
     result = deepcopy(dict(profile.source_profile["environment_config"]))
+    scene = result.get("scene")
+    if isinstance(scene, dict) and "task_poles" in scene:
+        if scene["task_poles"] != []:
+            raise ValueError("legacy scene.task_poles must be an empty list; active task poles are unsupported")
+        del scene["task_poles"]
     # Policy I/O and actuator calibration belong to the checkpoint. Task
     # conditions may change without replacing those physical definitions.
     for key in ("commands", "runtime_payload", "domain_rand", "noise_config", "curriculum"):
