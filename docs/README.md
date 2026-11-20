@@ -54,6 +54,8 @@ Pretraining writes resumable `last.pt` and deployment `best.pt`, selected by val
 
 For simulated captures, `world_model_collection.observation_augmentation` configures position/yaw noise, receive delay/jitter and dropout with an independent seed. Only received encoder inputs are augmented; physical motion and risk labels remain unchanged. `capture.json` records the recipe and release times. Zero defaults preserve clean inputs; configure the measured deployment noise and latency explicitly.
 
+For a fixed-start WM action-response contrast, use `scripts/probe_latent_response_directions.py` with `policy_checkpoint`, `world_model_checkpoint`, physical residual amplitude, replay tolerances and minimum detectable effects explicitly set. Legacy 66/29/3 policies use their embedded profile; official policies also require `profile_path`. Four fresh sessions run zero/positive/negative/zero residuals after identical warmup, checking native state, Planner–Tracker histories, causal ego inputs and initial latent equality. Predictions use the actual closed-loop `PlannerTrackerRollout` with common RSSM random numbers. Measured and predicted deltas share the fixed path frame. `summary.json` reports `same_sign`, `opposite_sign`, `prediction_negligible`, `unresolved_effect` or `invalid_replay` per channel; `valid` describes replay validity, not prediction accuracy. Branch NPZs retain actual and predicted actions, poses, inputs and failure evidence. This entry never trains networks or restores native snapshots.
+
 ## Process material
 
 `superpowers/` contains dated implementation plans and design working records produced by the
