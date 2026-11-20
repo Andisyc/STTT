@@ -12,6 +12,7 @@ from unilab.algos.torch.distill.fada.collection_contract import validate_officia
 from unilab.algos.torch.distill.fada.model import FADAPlannerIDMPolicy, PlannerIDMOutput
 from unilab.algos.torch.distill.fada.observation import FADA_OFFICIAL_COMPACT_OBSERVATION_CONTRACT
 from unilab.algos.torch.distill.fada.official_model import PlannerIDMPolicy
+from unilab.algos.torch.distill.fada.legacy_deployment import LegacyFADAPlaybackProfile
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,7 @@ class FADARuntimeSpec:
 
 @dataclass(frozen=True)
 class FADAFutureQuery:
-    """Borrowed, read-only inputs for one official future transform.
+    """Borrowed, read-only inputs for a checkpoint-bound future transform.
 
     Tensors belong to playback and must not be mutated or retained without
     copying. ``planner_future`` is absolute, checkpoint-scaled, source-ordered.
@@ -42,7 +43,7 @@ class FADAFutureQuery:
     history_valid_mask: torch.Tensor
     planner_future: torch.Tensor
     preprocessing: Mapping[str, Any]
-    profile: OfficialFADAPlaybackProfile
+    profile: OfficialFADAPlaybackProfile | LegacyFADAPlaybackProfile
 
 
 FADAFutureTransform = Callable[[FADAFutureQuery], torch.Tensor]
@@ -65,6 +66,7 @@ def get_fada_runtime_spec(policy: FADAPlannerIDMPolicy | PlannerIDMPolicy) -> FA
     return FADARuntimeSpec(
         "legacy", legacy.obs_dim, legacy.action_dim, legacy.command_dim, legacy.observation_contract,
         legacy.history_length, legacy.prediction_horizon,
+        preprocessing=getattr(policy, "legacy_preprocessing", None),
     )
 
 
@@ -89,6 +91,12 @@ def invoke_fada_idm(idm, spec: FADARuntimeSpec, observations, actions, command, 
         command if spec.idm_use_current_command_for_history else None,
         future, history_valid_mask=history_valid_mask,
     )
+
+
+def invoke_fada_planner(policy, spec: FADARuntimeSpec, observations, actions, command, history_valid_mask=None):
+    if spec.family == "legacy":
+        return policy.planner(observations, command)
+    return policy.predict_planner_future(observations, actions, command, history_valid_mask=history_valid_mask)
 
 
 def _vector(value: Any, name: str, *, positive: bool = False, nonnegative: bool = False) -> tuple[float, ...]:

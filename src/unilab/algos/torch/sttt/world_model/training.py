@@ -192,7 +192,12 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
         validation_sampler.num_starts, (batch_size * integers["validation_batches"],),
         generator=torch.Generator().manual_seed(validation_seed),
     ).tolist()
-    config = WorldModelConfig.from_mapping(raw.get("model", {}))
+    model_options = dict(raw.get("model", {}))
+    if model_options.get("obs_dim") is None:
+        model_options["obs_dim"] = contract["data"]["observation_dim"]
+    config = WorldModelConfig.from_mapping(model_options)
+    if config.obs_dim != contract["data"]["observation_dim"] or config.action_dim != contract["data"]["action_dim"]:
+        raise ValueError("training model dimensions disagree with the captured policy contract")
     device = torch.device(raw.get("device", "cpu"))
     if device.type not in {"cpu", "cuda", "mps"}:
         raise ValueError("exact pretraining resume supports CPU, CUDA or MPS")

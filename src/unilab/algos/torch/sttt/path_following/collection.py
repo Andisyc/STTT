@@ -99,6 +99,7 @@ class WindowCollector:
         future = compose_joint_position_residual(
             query.planner_future, residual, ctrl_dt=query.profile.ctrl_dt,
             position_scale=scales["dof_pos"], velocity_scale=scales["dof_vel"],
+            observation_contract=query.preprocessing.get("observation_contract", "official_compact_64_v1"),
         )
         if self.window.step_index == 0:
             if self._active is not None:

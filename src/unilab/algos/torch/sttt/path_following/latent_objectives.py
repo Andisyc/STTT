@@ -69,15 +69,18 @@ def latent_actor_loss(
     if steps % window_steps:
         raise ValueError("latent actor costs require complete residual windows")
     windows = steps // window_steps
+    command_dim = start.command.shape[-1]
+    if command_dim not in (3, 7):
+        raise ValueError("actor costs require an admitted velocity-command contract")
     expected = (
         ("errors", result.errors, (batch, steps + 1, 2)),
         ("actions", result.actions, (batch, steps, 29)),
         ("source_actions", result.source_actions, (batch, steps, 29)),
         ("residuals", result.residuals, (batch, windows, 29)),
         ("risk", result.risk, (batch, steps, 1)),
-        ("commands", result.commands, (batch, steps, 7)),
+        ("commands", result.commands, (batch, steps, command_dim)),
         ("start.errors", start.errors, (batch, 2)),
-        ("start.command", start.command, (batch, 7)),
+        ("start.command", start.command, (batch, command_dim)),
         ("start.previous_residual", start.previous_residual, (batch, 29)),
     )
     if not delta.is_floating_point() or not bool(torch.isfinite(delta).all()):

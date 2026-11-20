@@ -1,4 +1,4 @@
-"""Every-step official playback capture with causal inputs and delayed pose labels."""
+"""Every-step checkpoint-bound playback capture with causal inputs and delayed labels."""
 from __future__ import annotations
 
 import hashlib
@@ -16,6 +16,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from unilab.algos.torch.distill.fada.official_playback import OfficialFADAPlaybackController
+from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
 from unilab.algos.torch.sttt.odometry_runtime import create_pose_runtime
 from unilab.algos.torch.sttt.path_following.intervention import compose_joint_position_residual
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath, pose_identity, pose_matrix
@@ -92,7 +93,9 @@ def window_sequence(sample, records: Mapping[int, dict]) -> dict[str, np.ndarray
     result["window_valid"] = np.ones(1, dtype=bool)
     if result["terminal"].any():
         raise ValueError("completed online windows must not contain terminal transitions")
-    return _arrays(result)
+    query = sample.start_query
+    return _arrays(result, {"data": {"observation_dim": query.observation_history.shape[-1], "action_dim": 29,
+                                    "command_dim": query.command.shape[-1], "observation_contract": query.observation_contract}})
 
 
 class CausalEgoHistory:
@@ -154,8 +157,14 @@ class _CaptureController:
         return self.playback.on_env_step(**kwargs)
 
 
-def proprio_tilt_rad(observation: np.ndarray) -> float:
-    gravity = np.asarray(observation, dtype=np.float64)[-3:]
+def proprio_tilt_rad(observation: np.ndarray, *, observation_contract: str = "official_compact_64_v1") -> float:
+    value = np.asarray(observation, dtype=np.float64)
+    if observation_contract == "official_compact_64_v1" and value.shape == (64,):
+        gravity = value[61:64]
+    elif observation_contract == "g1_fada_state_v2" and value.shape == (66,):
+        gravity = value[3:6]
+    else:
+        raise ValueError("risk observation does not match its declared gravity layout")
     norm = float(np.linalg.norm(gravity))
     if gravity.shape != (3,) or not np.isfinite(gravity).all() or norm <= 1e-8:
         raise ValueError("risk labels require a valid projected gravity vector")
@@ -224,6 +233,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             query.planner_future, capture["residual"], ctrl_dt=query.profile.ctrl_dt,
             position_scale=query.preprocessing["term_scale"]["dof_pos"],
             velocity_scale=query.preprocessing["term_scale"]["dof_vel"],
+            observation_contract=query.preprocessing.get("observation_contract", "official_compact_64_v1"),
         )
 
     capture_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True, enum_to_str=True))
@@ -237,8 +247,8 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
     writer = None
     try:
         controller = session.controller
-        if not isinstance(controller, OfficialFADAPlaybackController) or session.official_adapter is None:
-            raise TypeError("sequence capture requires actual official compact64 playback")
+        if not isinstance(controller, (OfficialFADAPlaybackController, FADAPlaybackController)) or controller.profile is None or controller.spec is None:
+            raise TypeError("sequence capture requires checkpoint-bound supported Planner–Tracker playback")
         profile, spec = controller.profile, controller.spec
         if spec.preprocessing is None or resolved is None:
             raise ValueError("capture requires checkpoint-bound preprocessing and checkpoint identity")
@@ -249,7 +259,8 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
         contract = {
             "data": {"window_steps": int(window_steps), "ctrl_dt": profile.ctrl_dt,
                      "history_length": spec.history_length, "prediction_horizon": spec.prediction_horizon,
-                     "observation_dim": 64, "action_dim": 29},
+                     "observation_dim": spec.obs_dim, "action_dim": spec.action_dim,
+                     "command_dim": spec.command_dim, "observation_contract": spec.observation_contract},
             "source": {"checkpoint_sha256": digest.hexdigest(), "source_profile": asdict(profile),
                 "preprocessing": dict(spec.preprocessing), "target_joint_names": list(session.env.get_actuated_joint_names()),
                 "target_default_joint_angles": np.asarray(session.env.default_angles).reshape(-1).tolist(),
@@ -311,7 +322,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             if query is None or proxy.source_action is None:
                 raise RuntimeError("real playback did not produce its query/source action")
             command = query["command"]
-            if command.shape != (7,) or command[0] <= 0 or not np.allclose(command[1:3], 0., atol=1e-7, rtol=0):
+            if command.shape != (spec.command_dim,) or command[0] <= 0 or not np.allclose(command[1:3], 0., atol=1e-7, rtol=0):
                 raise ValueError("capture requires a forward straight-path velocity command")
             action = np.asarray(session.env.state.info["current_actions"], dtype=np.float32)
             if action.shape != (1, 29):
@@ -335,12 +346,13 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                 else:
                     history.add(update.received_poses)
             next_ego, next_valid, next_age = history.at(after.timestamp_ns)
-            next_obs = controller.project_observation(session.official_adapter.observation())[0].detach().cpu().numpy().copy()
+            next_input = session.official_adapter.observation() if session.official_adapter is not None else session.obs
+            next_obs = controller.project_observation(next_input)[0].detach().cpu().numpy().copy()
             terminated = bool(np.any(session.env.state.terminated | session.env.state.truncated))
             records[step] = {**query, "next_observation": next_obs, "action": action[0].copy(),
                 "source_action": proxy.source_action, "ego_motion": ego, "ego_valid": ego_valid, "ego_age_s": ego_age,
                 "next_ego_motion": next_ego, "next_ego_valid": next_valid, "next_ego_age_s": next_age,
-                "risk": float(bool(np.any(session.env.state.terminated)) or proprio_tilt_rad(next_obs) > risk_tilt_limit_rad),
+                "risk": float(bool(np.any(session.env.state.terminated)) or proprio_tilt_rad(next_obs, observation_contract=spec.observation_contract) > risk_tilt_limit_rad),
                 "risk_valid": True, "terminal": terminated}
             controls.append(control)
             if not invalidated:

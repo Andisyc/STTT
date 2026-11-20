@@ -64,6 +64,7 @@ training:
   play_only: false
   play_render_mode: none
   play_checkpoint_path: null
+  play_use_checkpoint_profile: false
   play_env_num: 16
   play_steps: 200
   dry_run: false

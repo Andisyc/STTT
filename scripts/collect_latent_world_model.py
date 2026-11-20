@@ -1,4 +1,4 @@
-"""Capture executed official Planner–Tracker sequences for world-model training."""
+"""Capture executed checkpoint-bound Planner–Tracker sequences for WM training."""
 from __future__ import annotations
 
 import json

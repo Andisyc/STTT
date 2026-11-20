@@ -37,13 +37,13 @@ class RolloutStart:
 
     def __post_init__(self) -> None:
         obs = self.observation_history
-        if obs.ndim != 3 or obs.shape[-1] != 64 or obs.shape[0] < 1 or obs.shape[1] < 1:
-            raise ValueError("rollout history requires [batch, history, 64] observations")
+        if obs.ndim != 3 or obs.shape[-1] not in (64, 66) or obs.shape[0] < 1 or obs.shape[1] < 1:
+            raise ValueError("rollout history requires [batch, history, observation_dim] observations")
         batch, history = obs.shape[:2]
         fields = (
             (self.action_history, (batch, history, 29)),
             (self.errors, (batch, 2)),
-            (self.command, (batch, 7)),
+            (self.command, (batch, 3 if obs.shape[-1] == 66 else 7)),
             (self.previous_residual, (batch, 29)),
         )
         for value, shape in fields:

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal, Protocol, overload
+from typing import Any, Literal, Protocol, cast, overload
 
 import torch
 
-from unilab.algos.torch.distill.fada.model import FADAArchitectureConfig, PlannerIDMOutput
+from unilab.algos.torch.distill.fada.model import FADAArchitectureConfig, FADAPlannerIDMPolicy, PlannerIDMOutput
 from unilab.algos.torch.distill.fada.observation import (
     FADA_G1_STATE_OBSERVATION_CONTRACT,
     project_fada_observation_tensor,
 )
 from unilab.algos.torch.distill.fada.online_data import FADAInferenceSnapshot
+from unilab.algos.torch.distill.fada.runtime_policy import FADAFutureQuery, get_fada_runtime_spec
 
 
 class FADAPlaybackActionOutput(Protocol):
@@ -35,13 +36,28 @@ class FADAPlaybackPolicy(Protocol):
 class FADAPlaybackController:
     """Own FADA execution histories and emit one receding-horizon action per query."""
 
-    def __init__(self, policy: FADAPlaybackPolicy, *, device: str | torch.device) -> None:
+    def __init__(self, policy: FADAPlaybackPolicy, *, device: str | torch.device,
+                 profile: Any = None, future_transform: Any = None) -> None:
         self.policy = policy
         self.config = policy.config
         self.device = torch.device(device)
         self._observation_history: torch.Tensor | None = None
         self._action_history: torch.Tensor | None = None
         self._pending_reset: torch.Tensor | None = None
+        self.profile = profile
+        self.future_transform = future_transform
+        self.preprocessing = profile.preprocessing if profile is not None else None
+        if profile is not None:
+            if not isinstance(policy, FADAPlannerIDMPolicy):
+                raise TypeError("bound legacy execution requires the native Planner–Tracker model")
+            policy.legacy_preprocessing = self.preprocessing
+        self.spec = get_fada_runtime_spec(policy) if profile is not None else None
+        self._history_valid_mask: torch.Tensor | None = None
+        self._last_source_action: torch.Tensor | None = None
+
+    @property
+    def last_source_action(self) -> torch.Tensor | None:
+        return self._last_source_action
 
     def reset(self, done: Any | None = None) -> None:
         """Reset every history, or mark selected rows for reset at their next observation."""
@@ -49,6 +65,8 @@ class FADAPlaybackController:
         if done is None:
             self._observation_history = None
             self._action_history = None
+            self._history_valid_mask = None
+            self._last_source_action = None
             self._pending_reset = None
             return
         mask = torch.as_tensor(done, dtype=torch.bool, device=self.device).reshape(-1)
@@ -134,7 +152,20 @@ class FADAPlaybackController:
         assert self._action_history is not None
 
         # B3: 查询 Planner-IDM 并仅记录/返回第一动作, 为下一 control step 形成执行 history.
-        output = self.policy(self._observation_history, self._action_history, cmd)
+        if self.future_transform is None:
+            output = self.policy(self._observation_history, self._action_history, cmd)
+        else:
+            if self.profile is None or self.spec is None or self._history_valid_mask is None or self.preprocessing is None:
+                raise ValueError("legacy future transforms require checkpoint-bound execution metadata")
+            policy = cast(FADAPlannerIDMPolicy, self.policy)
+            nominal = policy.planner(self._observation_history, cmd)
+            query = FADAFutureQuery(self._observation_history, self._action_history, cmd,
+                                   self._history_valid_mask, nominal, self.preprocessing, self.profile)
+            adapted = self.future_transform(query)
+            if adapted.shape != nominal.shape or adapted.dtype != nominal.dtype or adapted.device != nominal.device or not bool(torch.isfinite(adapted).all()):
+                raise ValueError("legacy future transform returned an incompatible Planner future")
+            chunk = policy.idm(self._observation_history, self._action_history, adapted)
+            output = PlannerIDMOutput(predicted_future=nominal, action_chunk=chunk, action=chunk[:, 0])
         action = output.action.detach()
         expected_action_shape = (obs.shape[0], self.config.action_dim)
         if tuple(action.shape) != expected_action_shape:
@@ -144,6 +175,7 @@ class FADAPlaybackController:
             )
         if not bool(torch.isfinite(action).all()):
             raise ValueError("FADA playback policy produced non-finite actions")
+        self._last_source_action = action
         if capture_snapshot:
             if not isinstance(output, PlannerIDMOutput):
                 raise TypeError("inference snapshots require native PlannerIDMOutput")
@@ -212,6 +244,9 @@ class FADAPlaybackController:
                 device=self.device,
                 dtype=obs.dtype,
             )
+            if self.profile is not None:
+                self._history_valid_mask = torch.zeros(batch_size, history_length, dtype=torch.bool, device=self.device)
+                self._history_valid_mask[:, -1] = True
             self._pending_reset = None
             return
         if self._observation_history.shape[0] != batch_size:
@@ -222,6 +257,8 @@ class FADAPlaybackController:
         self._observation_history = torch.cat(
             (self._observation_history[:, 1:], obs.unsqueeze(1)), dim=1
         )
+        if self._history_valid_mask is not None:
+            self._history_valid_mask = torch.cat((self._history_valid_mask[:, 1:], torch.ones_like(self._history_valid_mask[:, :1])), dim=1)
         if self._pending_reset is not None:
             mask = self._pending_reset
             if bool(mask.any()):
@@ -230,4 +267,7 @@ class FADAPlaybackController:
                 )
                 assert self._action_history is not None
                 self._action_history[mask] = 0.0
+                if self._history_valid_mask is not None:
+                    self._history_valid_mask[mask] = False
+                    self._history_valid_mask[mask, -1] = True
             self._pending_reset = None

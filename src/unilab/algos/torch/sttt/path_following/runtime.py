@@ -217,8 +217,8 @@ class PathFollowingController(Generic[LearnerT]):
             if before.sequence_id != self._start.sequence_id:
                 raise RuntimeError("physical reset crossed path-following episode")
             velocity = np.asarray(torch.as_tensor(command).detach().cpu(), dtype=np.float64)
-            if velocity.shape != (1, 7):
-                raise ValueError("path following requires the official [1, 7] command")
+            if velocity.shape != (1, self.playback.spec.command_dim):
+                raise ValueError("path following command differs from the bound policy contract")
             velocity = velocity[0, :3].copy()
             if not np.isfinite(velocity).all() or velocity[0] <= 0 or not np.allclose(velocity[1:], 0., atol=1e-8, rtol=0):
                 raise ValueError("path following requires fixed [vx > 0, 0, 0] velocity")

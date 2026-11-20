@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from .model import LatentWorldModel, WorldModelConfig
+from .sequence_data import _contract
 from .reference import SOURCE
 
 FORMAT = "sttt_latent_world_model"
@@ -35,8 +36,15 @@ def canonical_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     required_source = {"checkpoint_sha256", "source_profile", "preprocessing", "target_joint_names", "target_default_joint_angles", "target_action_scale", "delta_frame", "delta_units", "ego_frame"}
     if not isinstance(data, dict) or not isinstance(source, dict) or not required_source <= source.keys():
         raise ValueError("world-model contract requires complete data/source policy identities")
-    if data.get("observation_dim") != 64 or data.get("action_dim") != 29:
-        raise ValueError("world-model contract requires compact64 observations and 29D ENV actions")
+    _contract(canonical)
+    if data.get("observation_dim") not in (64, 66) or data.get("action_dim") != 29:
+        raise ValueError("world-model artifact requires an admitted observation contract and 29D ENV actions")
+    if data["observation_dim"] == 66:
+        from dataclasses import asdict
+        from unilab.algos.torch.distill.fada.legacy_deployment import LegacyFADAPlaybackProfile
+        profile = LegacyFADAPlaybackProfile.from_source(source["source_profile"].get("source_profile"))
+        if json.loads(json.dumps(asdict(profile), allow_nan=False)) != source["source_profile"] or profile.preprocessing != source["preprocessing"]:
+            raise ValueError("legacy WM source profile/preprocessing metadata disagree")
     if source["delta_frame"] != "fixed_straight_path" or source["delta_units"] != ["m", "m", "rad"]:
         raise ValueError("world-model motion labels must use fixed straight path meters/radians")
     if not isinstance(source["checkpoint_sha256"], str) or not source["checkpoint_sha256"] or len(source["target_joint_names"]) != 29 or len(source["target_default_joint_angles"]) != 29:
@@ -87,6 +95,8 @@ def _save_world_model(path: str | Path, model: LatentWorldModel, contract: Mappi
         if not isinstance(previous, dict) or previous.get("format") != FORMAT or previous.get("training_state", {}).get("run_id") != replace_run_id:
             raise FileExistsError(f"refusing to replace another run's checkpoint: {target}")
     canonical = canonical_contract(contract)
+    if model.config.obs_dim != canonical["data"]["observation_dim"] or model.config.action_dim != canonical["data"]["action_dim"]:
+        raise ValueError("world-model architecture differs from the data contract")
     _validate_model(model)
     payload = {
         "format": FORMAT, "schema_version": SCHEMA_VERSION, "model_source": dict(SOURCE),
@@ -130,6 +140,8 @@ def load_world_model(path: str | Path, *, device: str | torch.device = "cpu", ex
     if expected_contract is not None and contract != canonical_contract(expected_contract):
         raise ValueError("world-model artifact has an incompatible source/data contract")
     config = WorldModelConfig.from_mapping(payload["model_config"])
+    if config.obs_dim != contract["data"]["observation_dim"] or config.action_dim != contract["data"]["action_dim"]:
+        raise ValueError("loaded model dimensions differ from the data contract")
     state = payload["state_dict"]
     if not isinstance(state, Mapping) or not state or any(not isinstance(value, torch.Tensor) for value in state.values()):
         raise ValueError("world-model state_dict must contain tensors")

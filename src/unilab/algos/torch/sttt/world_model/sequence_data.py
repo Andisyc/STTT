@@ -21,7 +21,13 @@ _INT = {"timestamps_ns", "window_start", "window_end"}
 _KEYS = set(_STATE) | set(_TRANSITION) | set(_WINDOW)
 
 
-def _arrays(sequence: Mapping[str, Any]) -> dict[str, np.ndarray]:
+def _sequence_specs(contract: Mapping[str, Any] | None = None) -> tuple[dict, dict]:
+    data = {} if contract is None else contract.get("data", {})
+    return ({**_STATE, "observations": (data.get("observation_dim", 64),)},
+            {**_TRANSITION, "commands": (data.get("command_dim", 7),)})
+
+
+def _arrays(sequence: Mapping[str, Any], contract: Mapping[str, Any] | None = None) -> dict[str, np.ndarray]:
     if set(sequence) != _KEYS:
         raise ValueError(f"sequence keys mismatch: missing={sorted(_KEYS-set(sequence))}, extra={sorted(set(sequence)-_KEYS)}")
     result = {}
@@ -47,7 +53,8 @@ def _arrays(sequence: Mapping[str, Any]) -> dict[str, np.ndarray]:
     w = result["window_start"].shape[0] if result["window_start"].ndim else -1
     if t < 1 or w < 0:
         raise ValueError("a sequence requires at least one transition")
-    for spec, length in ((_STATE, t + 1), (_TRANSITION, t), (_WINDOW, w)):
+    state_spec, transition_spec = _sequence_specs(contract)
+    for spec, length in ((state_spec, t + 1), (transition_spec, t), (_WINDOW, w)):
         for key, tail in spec.items():
             if result[key].shape != (length, *tail):
                 raise ValueError(f"{key} must have shape {(length, *tail)}, got {result[key].shape}")
@@ -86,9 +93,14 @@ def _contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     dt = data.get("ctrl_dt")
     if dt is not None and (isinstance(dt, bool) or not isinstance(dt, (int, float)) or not np.isfinite(dt) or dt <= 0 or round(dt*1e9) < 1):
         raise ValueError("contract.data.ctrl_dt must be a finite positive physical period")
-    for name, expected in (("observation_dim", 64), ("action_dim", 29)):
-        if name in data and data[name] != expected:
-            raise ValueError(f"contract.data.{name} must be {expected}")
+    obs_dim = data.get("observation_dim", 64)
+    if obs_dim == 66:
+        if data.get("observation_contract") != "g1_fada_state_v2" or data.get("command_dim") != 3:
+            raise ValueError("66D data requires the explicit g1_fada_state_v2 / command3 contract")
+    elif obs_dim != 64 or data.get("command_dim", 7) != 7 or data.get("observation_contract", "official_compact_64_v1") != "official_compact_64_v1":
+        raise ValueError("unsupported observation/command contract")
+    if data.get("action_dim", 29) != 29:
+        raise ValueError("contract.data.action_dim must be 29")
     return result
 
 
@@ -112,7 +124,7 @@ class SequenceDatasetWriter:
     def append(self, sequence: dict[str, Any]) -> None:
         if self._closed:
             raise RuntimeError("sequence writer is closed")
-        arrays = _arrays(sequence)
+        arrays = _arrays(sequence, self.contract)
         dt = self.contract.get("data", {}).get("ctrl_dt")
         if dt is not None and (not np.isfinite(dt) or dt <= 0 or np.any(np.abs(np.diff(arrays["timestamps_ns"]) - round(dt * 1e9)) > 1)):
             raise ValueError("physical sample periods disagree with contract.ctrl_dt")
@@ -169,7 +181,7 @@ def iter_sequences(path: str | Path) -> Iterator[dict[str, torch.Tensor]]:
     count = 0
     for name in manifest["sequences"]:
         with np.load(root / name, allow_pickle=False) as shard:
-            arrays = _arrays(dict(shard))
+            arrays = _arrays(dict(shard), manifest["contract"])
         dt = manifest["contract"].get("data", {}).get("ctrl_dt")
         if dt is not None and (not np.isfinite(dt) or dt <= 0 or np.any(np.abs(np.diff(arrays["timestamps_ns"]) - round(dt * 1e9)) > 1)):
             raise ValueError("stored physical periods disagree with source contract")
@@ -179,10 +191,13 @@ def iter_sequences(path: str | Path) -> Iterator[dict[str, torch.Tensor]]:
         raise ValueError("sequence manifest transition count mismatch")
 
 
-def batch_sequences(sequences: Sequence[Mapping[str, Any]], *, device: str | torch.device = "cpu") -> dict[str, torch.Tensor]:
+def batch_sequences(sequences: Sequence[Mapping[str, Any]], *, device: str | torch.device = "cpu",
+                    contract: Mapping[str, Any] | None = None) -> dict[str, torch.Tensor]:
     if not sequences:
         raise ValueError("cannot batch an empty sequence list")
-    arrays = [_arrays(s) for s in sequences]
+    if contract is not None:
+        _contract(contract)
+    arrays = [_arrays(s, contract) for s in sequences]
     shapes = {k: v.shape for k, v in arrays[0].items()}
     if any(any(s[k].shape != shape for k, shape in shapes.items()) for s in arrays[1:]):
         raise ValueError("batch requires equal sequence and window shapes; padding is not implicit")

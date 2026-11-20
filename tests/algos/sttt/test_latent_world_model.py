@@ -493,3 +493,203 @@ def test_pose_augmentation_is_causal_reproducible_and_reset_scoped():
     delayed.add((ReceivedPose(pose(0, arrival_epoch=2), 0),))
     new_epoch = delayed.release(40_000_000)
     assert len(new_epoch) == 1 and new_epoch[0].pose.tracking_epoch == 2
+
+
+def legacy_case(directory, case=None):
+    """Native schema-5 policy with explicit analytical physical I/O."""
+    from unilab.algos.torch.distill.fada.model import FADAArchitectureConfig, FADAPlannerIDMPolicy
+    from unilab.algos.torch.distill.fada.checkpoint import load_fada_policy_checkpoint, _canonical_state_dict_sha256
+    from unilab.algos.torch.distill.fada.legacy_deployment import LegacyFADAPlaybackProfile, RAW_LAYOUT
+
+    case = runtime_case(directory, enabled=False) if case is None else case
+    if "path_following" in case.cfg:
+        del case.cfg.path_following
+    case.cfg.online_adaptation.enabled = False
+    case.cfg.official_playback.profile_path = None
+    environment = {
+        "ctrl_dt": .02, "sim_dt": .005, "gait_phase_enabled": True, "gait_clock_mode": "continuous",
+        "control_config": {"action_scale": .5, "simulate_action_latency": False},
+        "reward_config": {"gait_frequency": 1., "scales": {"alive": 1.}},
+        "commands": {"resampling_time": 0., "heading_command": False},
+        "noise_config": {"level": 0.}, "domain_rand": {}, "runtime_payload": {"enabled": False},
+    }
+    source = {"kind": "unilab_oracle", "version": 1, "student_observation_contract": "g1_fada_state_v2",
+              "environment_config": environment, "control_contract": {
+                  "observation_layout": [list(x) for x in RAW_LAYOUT],
+                  "actuated_joint_names": [f"j{i}" for i in reversed(range(29))],
+                  "ctrl_dt": .02, "sim_dt": .005, "action_scale": .5,
+                  "default_joint_pos": [0.] * 29, "kp": [50.] * 29, "kd": [2.] * 29}}
+    profile = LegacyFADAPlaybackProfile.from_source(source)
+    architecture = FADAArchitectureConfig(66, 29, 3, "g1_fada_state_v2", history_length=4,
+        prediction_horizon=3, hidden_dim=16, num_heads=4, planner_layers=1,
+        idm_encoder_layers=1, idm_decoder_layers=1, feedforward_dim=32)
+    with torch.random.fork_rng():
+        torch.manual_seed(7)
+        policy = FADAPlannerIDMPolicy(architecture).eval()
+    policy.legacy_preprocessing = profile.preprocessing
+    checkpoint = case.deps["resolve_checkpoint"](None)
+    torch.save({"schema_version": 5, "architecture": asdict(architecture),
+        "planner_state_dict": policy.planner.state_dict(), "idm_state_dict": policy.idm.state_dict(),
+        "idm_sha256": _canonical_state_dict_sha256(policy.idm.state_dict()),
+        "training_schedule": "alternating_idm_then_planner", "completed_iterations": 31, "samples_seen": 16,
+        "planner_optimizer_state_dict": torch.optim.AdamW(policy.planner.parameters()).state_dict(),
+        "idm_optimizer_state_dict": torch.optim.AdamW(policy.idm.parameters()).state_dict(),
+        "runtime_config": {"source_profile": source}, "quality_metrics": {}}, checkpoint)
+    case.cfg.training.play_checkpoint_path = str(checkpoint)
+    case.deps["load_fada_policy"] = load_fada_policy_checkpoint
+    original_wrapper = case.deps["wrapper_cls"]
+
+    class LegacyObservations:
+        num_obs = 98
+        def __init__(self, env, **kwargs):
+            self.env, self.inner = env, original_wrapper(env, **kwargs)
+        def observation(self):
+            obs = torch.zeros(1, 98)
+            obs[:, 3:6] = torch.tensor([0., 0., -1.])
+            obs[:, 6:35] = torch.as_tensor(self.env.get_dof_pos()).float()
+            obs[:, 64:93] = torch.as_tensor(self.env.state.info["current_actions"]).float()
+            obs[:, 93:96] = torch.as_tensor(self.env.state.info["commands"]).float()
+            obs[:, 96:98] = torch.as_tensor(self.env.state.info["gait_phase"]).float()
+            return {"actor": obs}
+        def reset(self):
+            _, info = self.inner.reset()
+            self.env.state.info["gait_phase"][:] = [0., math.pi]
+            self.env.state.info["current_actions"][:] = 0.
+            return self.observation(), info
+        def step(self, action):
+            _, reward, done, info = self.inner.step(action)
+            self.env.state.info["current_actions"][:] = action.detach().numpy()
+            self.env.state.info["gait_phase"][:] = (np.array([0., math.pi]) + self.env.tick * 2 * math.pi * .02) % (2 * math.pi)
+            return self.observation(), reward, done, info
+        def close(self):
+            self.inner.close()
+
+    case.deps["wrapper_cls"] = LegacyObservations
+    case.policy = policy
+    return case, profile
+
+
+def test_legacy_native_zero_residual_history_and_multistep_credit(tmp_path):
+    from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
+    from unilab.algos.torch.sttt.path_following.intervention import compose_joint_position_residual
+    from unilab.algos.torch.sttt.world_model.sequence_collection import proprio_tilt_rad
+
+    case, profile = legacy_case(tmp_path / "inputs")
+    queries = []
+    def transform(query):
+        queries.append(query)
+        return compose_joint_position_residual(query.planner_future, torch.zeros(1, 29), ctrl_dt=.02,
+            position_scale=1., velocity_scale=.05, observation_contract="g1_fada_state_v2")
+    bound = FADAPlaybackController(case.policy, device="cpu", profile=profile, future_transform=transform)
+    plain = FADAPlaybackController(case.policy, device="cpu")
+    observation = torch.linspace(-.1, .1, 66).reshape(1, 66)
+    observation[:, 3:6] = torch.tensor([0., 0., -1.])
+    observation[:, 64:66] = torch.tensor([0., math.pi])
+    command = torch.tensor([[.4, 0., 0.]])
+    for index in range(4):
+        if index == 2:
+            bound.reset(torch.tensor([True]))
+            plain.reset(torch.tensor([True]))
+        actual = bound.act_projected(observation, command)
+        torch.testing.assert_close(actual, plain.act_projected(observation, command), rtol=0, atol=0)
+        observation[:, 6:64] += .001
+        observation[:, 64:66] = (observation[:, 64:66] + 2 * math.pi * .02).remainder(2 * math.pi)
+    query = queries[-1]
+    assert query.history_valid_mask[0].tolist() == [False, False, True, True]
+    model = LatentWorldModel(replace(model_config(), obs_dim=66)).eval().requires_grad_(False)
+    rollout = PlannerTrackerRollout(model, case.policy, profile, profile.preprocessing,
+        target_joint_names=profile.joint_names, target_default_joint_angles=profile.default_joint_pos,
+        target_action_scale=profile.action_scale)
+    start = rollout.encode_start(query, errors=torch.tensor([[.2, .1]]), previous_residual=torch.zeros(1, 29))
+    actor = LatentResidualActor(model.feature_dim, [8], [.02] * 29, command_dim=3)
+    phases = []
+    handle = case.policy.planner.register_forward_pre_hook(lambda _, args: phases.append(args[0][:, -1, 64:66].detach().clone()))
+    try:
+        result = rollout.run(start, actor, window_steps=2, horizon_windows=2)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(result.source_actions[:, 0], actual, rtol=1e-6, atol=1e-6)
+    for index, phase in enumerate(phases):
+        torch.testing.assert_close(phase, (start.observation_history[:, -1, 64:66] + index * 2 * math.pi * .02).remainder(2 * math.pi))
+    latent_actor_loss(result, start, ctrl_dt=.02, window_steps=2, config=LatentCostConfig())["loss"].backward()
+    assert sum(float(p.grad.square().sum()) for p in actor.parameters() if p.grad is not None) > 0
+    assert all(p.grad is None for p in (*case.policy.parameters(), *model.parameters()))
+    residual = torch.full((1, 29), .02)
+    adapted = compose_joint_position_residual(torch.zeros(1, 3, 66), residual, ctrl_dt=.02,
+        position_scale=1., velocity_scale=.05, observation_contract="g1_fada_state_v2")
+    torch.testing.assert_close(adapted[:, 0, 6:35], residual)
+    torch.testing.assert_close(adapted[:, 0, 35:64], residual * 2.5)
+    assert not bool(adapted[:, :, 3:6].any()) and not bool(adapted[:, :, 64:66].any())
+    assert proprio_tilt_rad(query.observation_history[0, -1].numpy(), observation_contract="g1_fada_state_v2") < .01
+
+
+def test_legacy_capture_pretraining_resume_and_runtime_without_yaml(tmp_path):
+    from test_path_following_evaluation import evaluation_case
+    from unilab.algos.torch.sttt.path_following.evaluation import run_path_following_evaluation
+    from unilab.algos.torch.sttt.world_model.sequence_collection import collect_world_model_sequences
+    from unilab.algos.torch.sttt.world_model.sequence_data import read_sequence_metadata
+
+    base, original, _ = evaluation_case(tmp_path / "case", modes=("nominal", "latent_wm_frozen"))
+    case, profile = legacy_case(tmp_path / "case" / "inputs", case=base)
+    for name, seed in (("train", 1), ("validation", 2)):
+        collect_world_model_sequences(case.cfg, root_dir=ROOT, output_dir=tmp_path / name,
+            num_steps=6, window_steps=2, residual_amplitude_rad=.01, risk_tilt_limit_rad=.8,
+            seed=seed, device="cpu", playback_deps=case.deps)
+    contract = read_sequence_metadata(tmp_path / "train")
+    assert contract["data"]["observation_dim"] == 66 and contract["data"]["command_dim"] == 3
+    captured = list(iter_sequences(tmp_path / "train"))[0]
+    assert captured["observations"].shape == (7, 66) and captured["commands"].shape == (6, 3)
+    assert not bool(captured["risk"].any())
+    torch.testing.assert_close(captured["actions"], torch.stack(case.wrappers[0].actions)[:, 0])
+    options = asdict(model_config())
+    options["obs_dim"] = None
+    cfg = {"data": {"train_dirs": [str(tmp_path / "train")], "validation_dirs": [str(tmp_path / "validation")]},
+           "model": options, "training": {"max_updates": 2, "batch_size": 1, "validation_every": 1,
+                                         "validation_batches": 1, "checkpoint_every": 1},
+           "seed": 7, "device": "cpu", "output_dir": str(tmp_path / "continuous")}
+    full = train_world_model(cfg)
+    split = deepcopy(cfg)
+    split["output_dir"] = str(tmp_path / "split")
+    split["training"]["max_updates"] = 1
+    first = train_world_model(split)
+    split["training"].update(max_updates=2, resume_checkpoint=first["checkpoint_path"])
+    second = train_world_model(split)
+    expected, restored = load_world_model(full["checkpoint_path"]), load_world_model(second["checkpoint_path"])
+    for key, value in expected.model.state_dict().items():
+        torch.testing.assert_close(value, restored.model.state_dict()[key], rtol=0, atol=0)
+    assert restored.model.config.obs_dim == 66 and restored.training_state["optimizer_steps"] == 2
+    node = OmegaConf.load(ROOT / "conf/distill/path_following/latent_wm.yaml")
+    node.checkpoint_path = second["best_checkpoint_path"]
+    node.pose.odometry_source = "simulation"
+    node.update_interval_steps = 2
+    node.learning = {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8],
+                               "calibration_windows": 1, "horizon_windows": 1,
+                               "replay_sequence_windows": 1, "lora_rank": 2}}
+    case.cfg.path_following = node
+    session = create_session(case)
+    before = {name: value.clone() for name, value in session.controller.playback.policy.state_dict().items()}
+    try:
+        for _ in range(6):
+            session.step_once()
+        updater = session.controller.updater
+        assert updater.actor.command_dim == 3 and updater.actor_updates > 0 and updater.response_updates > 0
+        for name, value in session.controller.playback.policy.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        updater.save(tmp_path / "online.pt")
+        def factory(physical):
+            return PlannerTrackerRollout(physical, case.policy, profile, profile.preprocessing,
+                target_joint_names=profile.joint_names, target_default_joint_angles=profile.default_joint_pos,
+                target_action_scale=profile.action_scale)
+        resumed = LatentPathFollowingUpdater.restore(tmp_path / "online.pt", factory, expected_contract=contract)
+        for name, value in updater.actor.state_dict().items():
+            torch.testing.assert_close(value, resumed.actor.state_dict()[name], rtol=0, atol=0)
+    finally:
+        session.close()
+    evaluation = OmegaConf.merge(OmegaConf.load(ROOT / "conf/sttt/latent_path_following_evaluate.yaml"), original,
+        {"profile_path": None, "world_model_checkpoint": second["best_checkpoint_path"],
+         "latent_learning": node.learning, "source_overrides": ["path_following.update_interval_steps=2"]})
+    # The optional path_following group exists only in the latent mode.
+    evaluation.source_overrides = ["++path_following.update_interval_steps=2"]
+    result = run_path_following_evaluation(evaluation, root_dir=ROOT, playback_deps=case.deps)
+    assert result["complete"] and len(result["runs"]) == 2
+    assert all(env.closed for env in case.environments)

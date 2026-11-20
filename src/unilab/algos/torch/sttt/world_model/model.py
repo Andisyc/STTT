@@ -38,8 +38,8 @@ class WorldModelConfig:
         integer_fields = ("obs_dim", "action_dim", "embed_dim", "hidden_dim", "belief_dim", "stoch_groups", "stoch_classes", "num_blocks", "dynamics_layers", "prior_layers", "posterior_layers", "encoder_layers", "decoder_layers", "head_layers")
         if any(type(getattr(self, key)) is not int or getattr(self, key) < 1 for key in integer_fields):
             raise ValueError("world-model dimensions and layer counts must be positive integers")
-        if self.obs_dim != 64 or self.action_dim != 29:
-            raise ValueError("world model requires compact64 observations and target-joint-order 29D actions")
+        if self.obs_dim not in (64, 66) or self.action_dim != 29:
+            raise ValueError("world model requires an admitted 64D/66D observation and 29D ENV actions")
         if self.stoch_classes < 2 or self.recurrent_model not in ("gru", "block_gru"):
             raise ValueError("invalid categorical classes or recurrent model")
         if self.recurrent_model == "block_gru" and self.belief_dim % self.num_blocks:
@@ -68,7 +68,8 @@ class LatentWorldModel(nn.Module):
         self.encoder = MLP(cfg.obs_dim + 5, cfg.embed_dim, cfg.hidden_dim, cfg.encoder_layers, cfg.norm_eps)
         self.prior_net = RSSMPrior(state_dim=cfg.stoch_groups * cfg.stoch_classes, action_dim=cfg.action_dim, hidden_dim=cfg.hidden_dim, belief_dim=cfg.belief_dim, groups=cfg.stoch_groups, classes=cfg.stoch_classes, recurrent_model=cfg.recurrent_model, blocks=cfg.num_blocks, layers=cfg.dynamics_layers, prior_layers=cfg.prior_layers, eps=cfg.norm_eps)
         self.posterior_net = RSSMPosterior(cfg.belief_dim, cfg.embed_dim, cfg.hidden_dim, cfg.stoch_groups, cfg.stoch_classes, cfg.posterior_layers, cfg.norm_eps)
-        self.proprio_decoder = VectorDecoder(self.feature_dim, (3, 29, 29, 3), cfg.hidden_dim, cfg.decoder_layers, cfg.norm_eps)
+        groups = (3, 29, 29, 3) if cfg.obs_dim == 64 else (3, 3, 29, 29, 2)
+        self.proprio_decoder = VectorDecoder(self.feature_dim, groups, cfg.hidden_dim, cfg.decoder_layers, cfg.norm_eps)
         self.motion_head = MLP(self.feature_dim + cfg.action_dim + 2, 3, cfg.hidden_dim, cfg.head_layers, cfg.norm_eps)
         self.risk_head = MLP(self.feature_dim + cfg.action_dim, 1, cfg.hidden_dim, cfg.head_layers, cfg.norm_eps)
 
@@ -98,7 +99,7 @@ class LatentWorldModel(nn.Module):
     def posterior(self, previous: LatentState, previous_action: torch.Tensor, observation: torch.Tensor, *, ego_motion: torch.Tensor | None = None, ego_valid: torch.Tensor | None = None, ego_age_s: torch.Tensor | None = None, is_first: torch.Tensor | None = None) -> tuple[LatentState, torch.Tensor, torch.Tensor]:
         batch = observation.shape[0]
         if observation.shape != (batch, self.config.obs_dim) or previous_action.shape != (batch, self.config.action_dim):
-            raise ValueError("posterior requires batched compact64 observation and 29D previous action")
+            raise ValueError("posterior observation/action dimensions differ from the model contract")
         if is_first is not None:
             if is_first.shape != (batch,) or is_first.dtype != torch.bool:
                 raise ValueError("is_first must be boolean [batch]")
@@ -141,7 +142,7 @@ class LatentWorldModel(nn.Module):
 
     def encode_history(self, observations: torch.Tensor, previous_actions: torch.Tensor, valid_mask: torch.Tensor, *, ego_motion: torch.Tensor | None = None, ego_valid: torch.Tensor | None = None, ego_age_s: torch.Tensor | None = None) -> LatentState:
         if observations.ndim != 3 or observations.shape[-1] != self.config.obs_dim:
-            raise ValueError("history observations must have shape [batch,time,64]")
+            raise ValueError("history observation width differs from the model contract")
         batch, steps = observations.shape[:2]
         if previous_actions.shape != (batch, steps, self.config.action_dim) or valid_mask.shape != (batch, steps) or valid_mask.dtype != torch.bool or steps < 1:
             raise ValueError("history requires matched previous actions and boolean validity")

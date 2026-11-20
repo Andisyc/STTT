@@ -11,17 +11,18 @@ import torch
 
 from unilab.algos.torch.distill.fada.collection_contract import validate_official_fada_preprocessing
 from unilab.algos.torch.distill.fada.runtime_policy import OfficialFADAPlaybackProfile
-from unilab.algos.torch.sttt.path_following.contract import _integer
+from unilab.algos.torch.sttt.path_following.contract import InterventionQueryRecord, _integer
 
 if TYPE_CHECKING:
     from unilab.algos.torch.distill.fada.runtime_policy import FADAFutureQuery
-    from unilab.algos.torch.sttt.path_following.contract import InterventionQueryRecord
 
 CONTEXT_SCHEMA = "query_history_nominal_v1"
 
 
-def context_dimension(history_length: int, prediction_horizon: int) -> int:
-    return 94 * history_length + 64 * prediction_horizon + 7
+def context_dimension(history_length: int, prediction_horizon: int, *, observation_dim: int = 64, command_dim: int = 7) -> int:
+    if (observation_dim, command_dim) not in ((64, 7), (66, 3)):
+        raise ValueError("unsupported context observation/command dimensions")
+    return (observation_dim + 30) * history_length + observation_dim * prediction_horizon + command_dim
 
 
 def normalized_context_parts(
@@ -41,13 +42,20 @@ def pack_response_context(query: FADAFutureQuery | InterventionQueryRecord) -> t
     """Pack only pre-intervention fields; neither outcomes nor adapted future enter z."""
     obs, act, mask = query.observation_history, query.action_history, query.history_valid_mask
     future, command = query.planner_future, query.command
+    contract = query.observation_contract if isinstance(query, InterventionQueryRecord) else query.preprocessing.get("observation_contract", "official_compact_64_v1")
+    if contract == "g1_fada_state_v2":
+        width, command_dim = 66, 3
+    elif contract == "official_compact_64_v1":
+        width, command_dim = 64, 7
+    else:
+        raise ValueError("unsupported query context observation contract")
     if (
-        obs.ndim != 3 or obs.shape[0] < 1 or obs.shape[1] < 1 or obs.shape[2] != 64
+        obs.ndim != 3 or obs.shape[0] < 1 or obs.shape[1] < 1 or obs.shape[2] != width
         or act.shape != (*obs.shape[:2], 29) or mask.shape != obs.shape[:2]
-        or mask.dtype != torch.bool or command.shape != (obs.shape[0], 7)
-        or future.ndim != 3 or future.shape[0] != obs.shape[0] or future.shape[1] < 1 or future.shape[2] != 64
+        or mask.dtype != torch.bool or command.shape != (obs.shape[0], command_dim)
+        or future.ndim != 3 or future.shape[0] != obs.shape[0] or future.shape[1] < 1 or future.shape[2] != width
     ):
-        raise ValueError("response context requires aligned Hx64/Hx29 histories, mask, command7 and Kx64 nominal future")
+        raise ValueError("query context shapes differ from the declared observation/command layout")
     for value in (act, command, future):
         if value.dtype != obs.dtype or value.device != obs.device:
             raise ValueError("context tensors must share dtype and device")

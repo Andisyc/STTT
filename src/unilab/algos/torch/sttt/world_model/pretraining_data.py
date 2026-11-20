@@ -15,7 +15,7 @@ from zipfile import ZipFile
 import numpy as np
 import torch
 
-from .sequence_data import _BOOL, _INT, _STATE, _TRANSITION, _WINDOW, _arrays, _contract, _manifest
+from .sequence_data import _BOOL, _INT, _WINDOW, _arrays, _contract, _manifest, _sequence_specs
 
 
 @dataclass(frozen=True)
@@ -157,7 +157,7 @@ class PretrainingSequenceSampler:
             self._cache.move_to_end(index)
             return self._cache[index]
         with np.load(shard.path, allow_pickle=False) as archive:
-            arrays = _arrays(dict(archive))
+            arrays = _arrays(dict(archive), self.contract)
         if len(arrays["actions"]) != shard.steps:
             raise ValueError(f"sequence length changed after indexing: {shard.path}")
         if not arrays["is_first"][0]:
@@ -191,12 +191,13 @@ class PretrainingSequenceSampler:
         horizon = self.prediction_steps
         history = self.history_steps
         sequence: dict[str, np.ndarray] = {}
-        for spec, length in ((_STATE, horizon + 1), (_TRANSITION, horizon),
+        state_spec, transition_spec = _sequence_specs(self.contract)
+        for spec, length in ((state_spec, horizon + 1), (transition_spec, horizon),
                              (_WINDOW, self.rollout_windows)):
             for key, tail in spec.items():
                 dtype = np.bool_ if key in _BOOL else np.int64 if key in _INT else np.float32
                 sequence[key] = np.zeros((batch_size, length, *tail), dtype=dtype)
-        history_observations = np.zeros((batch_size, history, 64), dtype=np.float32)
+        history_observations = np.zeros((batch_size, history, self.contract["data"]["observation_dim"]), dtype=np.float32)
         history_previous_actions = np.zeros((batch_size, history, 29), dtype=np.float32)
         history_valid_mask = np.zeros((batch_size, history), dtype=np.bool_)
         history_ego_motion = np.zeros((batch_size, history, 3), dtype=np.float32)
@@ -215,9 +216,9 @@ class PretrainingSequenceSampler:
             raw = self._load_shard(shard_index)
             stop = min(origin + horizon, shard.steps)
             transitions = stop - origin
-            for key in _STATE:
+            for key in state_spec:
                 sequence[key][row, :transitions + 1] = raw[key][origin:stop + 1]
-            for key in _TRANSITION:
+            for key in transition_spec:
                 sequence[key][row, :transitions] = raw[key][origin:stop]
             observation_mask[row, :transitions + 1] = True
             transition_mask[row, :transitions] = True

@@ -1,7 +1,7 @@
 # Finite same-condition evaluation only; no cases run until explicitly selected.
 output_dir: null
 policy_checkpoint: null
-profile_path: null
+profile_path: null  # Official policies require a file; g1_fada_state_v2 uses its embedded profile.
 response_checkpoint: null  # Required only when also selecting oat_path.
 world_model_checkpoint: null  # Required for latent_wm and latent_wm_frozen; independent of response_checkpoint.
 latent_learning:

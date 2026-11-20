@@ -180,7 +180,8 @@ class LatentPathFollowingUpdater:
         parameter = next(self.model.parameters())
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(config.seed)
-            self.actor = LatentResidualActor(self.model.feature_dim, config.actor_hidden_dims, config.residual_limit_rad).to(parameter)
+            self.actor = LatentResidualActor(self.model.feature_dim, config.actor_hidden_dims, config.residual_limit_rad,
+                                              command_dim=rollout.spec.command_dim).to(parameter)
         self.model_optimizer = torch.optim.AdamW(self.adapters, lr=config.wm_learning_rate, weight_decay=config.lora_weight_decay)
         self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), lr=config.actor_learning_rate, weight_decay=0.0)
         self.replay: deque[tuple[Any, dict[str, Any]]] = deque(maxlen=config.replay_capacity_windows)
@@ -218,15 +219,16 @@ class LatentPathFollowingUpdater:
         data = self.contract["data"]
         history, horizon = data["history_length"], data["prediction_horizon"]
         context = decision.context
-        if context.shape != (1, context_dimension(history, horizon)):
+        width, command_dim = self.model.config.obs_dim, self.rollout.spec.command_dim
+        if context.shape != (1, context_dimension(history, horizon, observation_dim=width, command_dim=command_dim)):
             raise ValueError("decision history is incompatible with the loaded control contract")
-        obs_end = 64 * history
+        obs_end = width * history
         act_end = obs_end + 29 * history
         mask_end = act_end + history
-        query = FADAFutureQuery(context[:, :obs_end].reshape(1, history, 64),
+        query = FADAFutureQuery(context[:, :obs_end].reshape(1, history, width),
                                context[:, obs_end:act_end].reshape(1, history, 29),
-                               context[:, mask_end:mask_end + 7], context[:, act_end:mask_end].bool(),
-                               context[:, mask_end + 7:].reshape(1, horizon, 64),
+                               context[:, mask_end:mask_end + command_dim], context[:, act_end:mask_end].bool(),
+                               context[:, mask_end + command_dim:].reshape(1, horizon, width),
                                self.contract["source"]["preprocessing"], self.rollout.profile)
         ego = np.zeros((history, 3), dtype=np.float32)
         valid = np.zeros((history, 1), dtype=bool)
@@ -260,7 +262,7 @@ class LatentPathFollowingUpdater:
             if left.reference != right.reference or left.controls[-1].end_ns != right.controls[0].start_ns:
                 return None
         sequence = _join_windows([entry for _, entry in entries])
-        return batch_sequences([sequence], device=next(self.model.parameters()).device)
+        return batch_sequences([sequence], device=next(self.model.parameters()).device, contract=self.contract)
 
     @torch.enable_grad()
     def update(self, completed_windows: Sequence[Any], actor_context: ActorUpdateContext | None = None) -> LatentUpdateResult:

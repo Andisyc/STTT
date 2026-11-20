@@ -112,10 +112,12 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
         if _canonical(source.get(name)) != expected:
             raise ValueError(f"WM artifact is incompatible with actual {name}")
     expected_data = {"ctrl_dt": profile.ctrl_dt, "history_length": spec.history_length,
-                     "prediction_horizon": spec.prediction_horizon, "observation_dim": 64, "action_dim": 29}
+                     "prediction_horizon": spec.prediction_horizon, "observation_dim": spec.obs_dim, "action_dim": spec.action_dim}
     for name, expected in expected_data.items():
         if data.get(name) != expected:
             raise ValueError(f"WM artifact is incompatible with actual {name}")
+    if data.get("command_dim", 7) != spec.command_dim or data.get("observation_contract", "official_compact_64_v1") != spec.observation_contract:
+        raise ValueError("WM artifact has an incompatible command or observation identity")
     _positive_count(data["window_steps"], "window_steps")
     counts = {name: _positive_count(values[name], name) for name in
               ("update_interval_steps", "max_cached_queries", "max_pending_windows", "max_trace_records")}
@@ -384,15 +386,15 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
             tilt = None
             if next_is_real and next_observation is not None:
                 compact = self.playback.project_observation(next_observation).detach()
-                if compact.shape != (1, 64):
-                    raise ValueError("real WM posterior requires compact64 [1,64]")
+                if compact.shape != (1, self.updater.model.config.obs_dim):
+                    raise ValueError("real WM posterior observation differs from its execution contract")
                 if not bool(torch.isfinite(compact).all()):
                     if not terminal:
-                        raise ValueError("real WM posterior requires finite compact64")
+                        raise ValueError("real WM posterior requires finite proprioception")
                     compact = None
                 if compact is not None:
                     try:
-                        tilt = proprio_tilt_rad(compact[0].cpu().numpy())
+                        tilt = proprio_tilt_rad(compact[0].cpu().numpy(), observation_contract=self.playback.spec.observation_contract)
                     except ValueError:
                         if not terminal:
                             raise

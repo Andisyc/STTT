@@ -176,7 +176,8 @@ def _run_episode(
         "evaluation_pose_source": "simulation_ground_truth_score_only",
         "controller_pose_source": OmegaConf.select(playback_cfg, "path_following.pose.odometry_source", default=None),
         "policy": _file_identity(playback_cfg.training.play_checkpoint_path),
-        "profile": _file_identity(playback_cfg.official_playback.profile_path),
+        "profile": (_file_identity(playback_cfg.official_playback.profile_path)
+                    if playback_cfg.official_playback.profile_path else {"source": "checkpoint.runtime_config.source_profile"}),
         "response": _file_identity(playback_cfg.path_following.checkpoint_path) if mode == "oat_path" else None,
         "world_model": _file_identity(playback_cfg.path_following.checkpoint_path) if mode in _LATENT_MODES else None,
     }
@@ -381,9 +382,16 @@ def run_path_following_evaluation(
             raise ValueError("output, policy and source-profile paths must be explicit; oat_path requires B and latent modes require WM")
         path = Path(str(value)).expanduser()
         return (path if path.is_absolute() else root / path).resolve()
-    policy, profile = resolve(cfg.policy_checkpoint), resolve(cfg.profile_path)
+    policy = resolve(cfg.policy_checkpoint)
+    profile = resolve(cfg.profile_path) if cfg.profile_path else None
     _file_identity(policy)
-    _file_identity(profile)
+    if profile is not None:
+        _file_identity(profile)
+    else:
+        from unilab.algos.torch.distill.fada.legacy_deployment import legacy_profile_from_checkpoint
+        legacy_profile_from_checkpoint(torch.load(policy, map_location="meta", weights_only=True))
+        if "oat_path" in modes:
+            raise ValueError("legacy embedded-profile evaluation supports nominal/oat/latent modes, not the official-only response model")
     response = resolve(cfg.response_checkpoint) if "oat_path" in modes else None
     if response is not None:
         _file_identity(response)
@@ -404,7 +412,8 @@ def run_path_following_evaluation(
                     overrides.append("path_following=online" if mode == "oat_path" else "~path_following")
                 playback_cfg = compose(config_name="config", overrides=overrides)
                 OmegaConf.update(playback_cfg, "training.play_checkpoint_path", str(policy))
-                OmegaConf.update(playback_cfg, "official_playback.profile_path", str(profile))
+                OmegaConf.update(playback_cfg, "official_playback.profile_path", str(profile) if profile is not None else None)
+                OmegaConf.update(playback_cfg, "training.play_use_checkpoint_profile", profile is None, force_add=True)
                 OmegaConf.update(playback_cfg, "online_adaptation.enabled", mode in ("oat", "oat_path"))
                 OmegaConf.update(playback_cfg, "env.runtime_payload.enabled", condition == "delayed_payload")
                 if mode == "oat_path":

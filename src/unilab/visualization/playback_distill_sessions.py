@@ -403,6 +403,7 @@ def create_fada_playback_session(
     controller = None
     architecture = None
     official_profile = None
+    legacy_profile = None
     official_adapter = None
     if playback_cfg.action_mode == "policy":
         if checkpoint is None or not Path(checkpoint).is_file():
@@ -422,19 +423,24 @@ def create_fada_playback_session(
                 cfg, root_dir=root_dir, source_identity=loaded.checkpoint["source_identity"]
             )
         else:
-            if future_transform is not None:
-                raise ValueError("future_transform requires an official Planner-IDM checkpoint")
             architecture = loaded.policy.config
+            if future_transform is not None or (path_enabled and path_mode == "latent_wm") or OmegaConf.select(cfg, "training.play_use_checkpoint_profile", default=False):
+                from unilab.algos.torch.distill.fada.legacy_deployment import legacy_profile_from_checkpoint
+                from unilab.algos.torch.distill.fada.runtime_policy import get_fada_runtime_spec
+                legacy_profile = legacy_profile_from_checkpoint(loaded.checkpoint)
+                loaded.policy.legacy_preprocessing = legacy_profile.preprocessing
+                architecture = get_fada_runtime_spec(loaded.policy)
 
         if path_enabled:
-            if official_profile is None:
-                raise ValueError("path following requires an official Planner-IDM checkpoint")
+            if official_profile is None and (legacy_profile is None or path_mode != "latent_wm"):
+                raise ValueError("response path following requires official playback; latent mode also admits bound g1_fada_state_v2")
             if path_mode == "latent_wm":
                 from unilab.algos.torch.sttt.path_following.latent_runtime import prepare_latent_path_following
 
                 latent_setup = prepare_latent_path_following(
                     path_node, cfg=cfg, playback_cfg=playback_cfg, root_dir=root_dir,
-                    checkpoint_path=checkpoint_path, policy=loaded.policy, profile=official_profile,
+                    checkpoint_path=checkpoint_path, policy=loaded.policy,
+                    profile=official_profile if official_profile is not None else legacy_profile,
                     spec=architecture, device=device_name,
                 )
             else:
@@ -487,6 +493,9 @@ def create_fada_playback_session(
             build_official_playback_env_override,
         )
         env_cfg_override = build_official_playback_env_override(official_profile, env_cfg_override)
+    elif legacy_profile is not None:
+        from unilab.algos.torch.distill.fada.legacy_deployment import build_legacy_playback_env_override
+        env_cfg_override = build_legacy_playback_env_override(legacy_profile, env_cfg_override)
     if playback_cfg.keyboard:
         log("Keyboard playback reset: standing command with zero base velocity.")
     env = create_env(
@@ -567,6 +576,12 @@ def create_fada_playback_session(
                     f"checkpoint_raw=({expected_raw_obs_dim}, {architecture.action_dim}) "
                     f"environment=({observed_obs_dim}, {observed_action_dim})"
                 )
+            if legacy_profile is not None:
+                from unilab.algos.torch.distill.fada.legacy_deployment import validate_legacy_deployment
+                validate_legacy_deployment(legacy_profile, env)
+                controller = FADAPlaybackController(loaded.policy, device=device_name,
+                                                    profile=legacy_profile, future_transform=future_transform)
+                official_playback = controller
 
         if online is not None:
             from unilab.algos.torch.distill.fada.adaptation import FADALoRAConfig

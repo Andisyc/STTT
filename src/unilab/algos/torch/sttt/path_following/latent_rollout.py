@@ -11,9 +11,9 @@ from typing import Any, Iterator
 import torch
 from torch import nn
 
-from unilab.algos.torch.distill.fada.collection_contract import validate_official_fada_preprocessing
+from unilab.algos.torch.distill.fada.legacy_deployment import LegacyFADAPlaybackProfile, validate_execution_preprocessing
 from unilab.algos.torch.distill.fada.runtime_policy import (
-    FADAFutureQuery, OfficialFADAPlaybackProfile, get_fada_runtime_spec, invoke_fada_idm,
+    FADAFutureQuery, OfficialFADAPlaybackProfile, get_fada_runtime_spec, invoke_fada_idm, invoke_fada_planner,
 )
 from unilab.algos.torch.sttt.geometry import wrap_to_pi
 from unilab.algos.torch.sttt.path_following.intervention import compose_joint_position_residual
@@ -70,7 +70,7 @@ class PlannerTrackerRollout:
         self,
         model: nn.Module,
         policy: nn.Module,
-        profile: OfficialFADAPlaybackProfile,
+        profile: OfficialFADAPlaybackProfile | LegacyFADAPlaybackProfile,
         preprocessing: Mapping[str, Any],
         *,
         target_joint_names: Sequence[str],
@@ -81,13 +81,18 @@ class PlannerTrackerRollout:
         self.policy = policy
         self.profile = profile
         self.spec = get_fada_runtime_spec(policy)
-        if self.spec.family != "official" or (self.spec.obs_dim, self.spec.action_dim, self.spec.command_dim) != (64, 29, 7):
-            raise ValueError("latent rollout requires the official 64/29/7 policy")
+        expected = (64, 29, 7) if self.spec.family == "official" else (66, 29, 3)
+        if (self.spec.obs_dim, self.spec.action_dim, self.spec.command_dim) != expected or model.config.obs_dim != self.spec.obs_dim:
+            raise ValueError("latent rollout model and policy execution dimensions differ")
+        if self.spec.family == "legacy" and not isinstance(profile, LegacyFADAPlaybackProfile):
+            raise ValueError("legacy rollout requires its embedded execution profile")
         if profile.gait_clock_mode not in {"continuous", "command_fixed"}:
             raise ValueError("latent rollout requires a continuous or command_fixed source clock")
-        if any(not math.isfinite(value) or value <= 0 for value in (profile.ctrl_dt, profile.gait_frequency, profile.clip_actions)):
-            raise ValueError("latent rollout requires positive finite source timing and action clip")
-        self.preprocessing = validate_official_fada_preprocessing(preprocessing)
+        if any(not math.isfinite(value) or value <= 0 for value in (profile.ctrl_dt, profile.gait_frequency)):
+            raise ValueError("latent rollout requires positive finite source timing")
+        if profile.clip_actions is not None and (not math.isfinite(profile.clip_actions) or profile.clip_actions <= 0):
+            raise ValueError("invalid source action clip")
+        self.preprocessing = validate_execution_preprocessing(preprocessing)
         if self.spec.preprocessing is not None and self.preprocessing != self.spec.preprocessing:
             raise ValueError("rollout preprocessing differs from the policy checkpoint")
         scales = self.preprocessing["term_scale"]
@@ -111,6 +116,7 @@ class PlannerTrackerRollout:
         self._action_gain = (source_scale / scale).detach()
         self._action_bias = ((source_default - default) / scale).detach()
         phase_delta = 2.0 * math.pi * profile.gait_frequency * profile.ctrl_dt
+        self._phase_delta = phase_delta
         self._phase_sin, self._phase_cos = math.sin(phase_delta), math.cos(phase_delta)
         # The original Planner/Tracker are never optimization variables. Do not
         # use their no-grad playback entrypoints: A needs the input Jacobians.
@@ -134,8 +140,8 @@ class PlannerTrackerRollout:
     def _validate_history(
         self, observations: torch.Tensor, actions: torch.Tensor, valid: torch.Tensor,
     ) -> None:
-        if observations.ndim != 3 or observations.shape[0] < 1 or observations.shape[1:] != (self.spec.history_length, 64):
-            raise ValueError("rollout observation history must be [B,H,64] with the checkpoint history length")
+        if observations.ndim != 3 or observations.shape[0] < 1 or observations.shape[1:] != (self.spec.history_length, self.spec.obs_dim):
+            raise ValueError("rollout observation history differs from the checkpoint dimensions")
         batch, history = observations.shape[:2]
         if actions.shape != (batch, history, 29) or valid.shape != (batch, history) or valid.dtype != torch.bool or valid.device != self.device:
             raise ValueError("rollout requires aligned SOURCE action history and boolean valid mask")
@@ -144,8 +150,8 @@ class PlannerTrackerRollout:
                 raise ValueError("rollout history must be finite and match the policy dtype and device")
         if not bool(valid[:, -1].all()) or bool((valid[:, :-1] & ~valid[:, 1:]).any()):
             raise ValueError("rollout history must have a nonempty valid suffix")
-        if bool((observations[~valid] != 0).any()) or bool((actions[~valid] != 0).any()):
-            raise ValueError("rollout history padding must be zero")
+        if self.spec.family == "official" and (bool((observations[~valid] != 0).any()) or bool((actions[~valid] != 0).any())):
+            raise ValueError("official rollout history padding must be zero")
 
     @torch.no_grad()
     def encode_start(
@@ -166,7 +172,7 @@ class PlannerTrackerRollout:
         SOURCE command. Padding and the first valid reset action remain zero
         after conversion to ENV semantics (even with nonzero affine bias).
         """
-        if query.profile != self.profile or validate_official_fada_preprocessing(query.preprocessing) != self.preprocessing:
+        if query.profile != self.profile or validate_execution_preprocessing(query.preprocessing) != self.preprocessing:
             raise ValueError("rollout query source profile or preprocessing mismatch")
         observations = query.observation_history.detach().clone()
         source_actions = query.action_history.detach().clone()
@@ -194,11 +200,13 @@ class PlannerTrackerRollout:
     def _validate_context(
         self, batch: int, errors: torch.Tensor, command: torch.Tensor, residual: torch.Tensor,
     ) -> None:
-        for name, value, width in (("errors", errors, 2), ("command", command, 7), ("previous_residual", residual, 29)):
+        for name, value, width in (("errors", errors, 2), ("command", command, self.spec.command_dim), ("previous_residual", residual, 29)):
             if value.shape != (batch, width) or value.dtype != self.dtype or value.device != self.device or not bool(torch.isfinite(value).all()):
                 raise ValueError(f"rollout {name} must be finite [B,{width}] with the policy dtype and device")
 
     def _advance_command(self, command: torch.Tensor) -> torch.Tensor:
+        if self.spec.family == "legacy":
+            return command
         sine, cosine = command[:, 3:5], command[:, 5:7]
         next_phase = torch.cat((
             sine * self._phase_cos + cosine * self._phase_sin,
@@ -234,28 +242,37 @@ class PlannerTrackerRollout:
                 # At future ticks, decode the just-advanced prior and pair it
                 # with the preceding clipped SOURCE command, never ENV action.
                 if step:
-                    observations = torch.cat((observations[:, 1:], self.model.decode(latent).unsqueeze(1)), dim=1)
+                    predicted_observation = self.model.decode(latent)
+                    if self.spec.family == "legacy":
+                        phase = (observations[:, -1, 64:66] + self._phase_delta).remainder(2. * math.pi)
+                        if self.profile.gait_clock_mode == "command_fixed":
+                            phase = torch.where((command != 0).any(-1, keepdim=True), phase, observations[:, -1, 64:66])
+                        predicted_observation = torch.cat((predicted_observation[:, :64], phase), dim=-1)
+                    observations = torch.cat((observations[:, 1:], predicted_observation.unsqueeze(1)), dim=1)
                     valid = torch.cat((valid[:, 1:], torch.ones_like(valid[:, :1])), dim=1)
                     history_actions = torch.cat((history_actions[:, 1:], source_actions[-1].unsqueeze(1)), dim=1)
-                    observations = observations.masked_fill(~valid.unsqueeze(-1), 0.)
-                    history_actions = history_actions.masked_fill(~valid.unsqueeze(-1), 0.)
+                    if self.spec.family == "official":
+                        observations = observations.masked_fill(~valid.unsqueeze(-1), 0.)
+                        history_actions = history_actions.masked_fill(~valid.unsqueeze(-1), 0.)
                     command = self._advance_command(command)
                 if step % window_steps == 0:
                     held_residual = actor(latent.feature(), errors, command)
                     residuals.append(held_residual)
                 assert held_residual is not None
-                nominal = self.policy.predict_planner_future(
-                    observations, history_actions, command, history_valid_mask=valid,
-                )
+                nominal = invoke_fada_planner(self.policy, self.spec,
+                    observations, history_actions, command, history_valid_mask=valid)
                 adapted = compose_joint_position_residual(
                     nominal, held_residual, ctrl_dt=self.profile.ctrl_dt,
                     position_scale=self.position_scale, velocity_scale=self.velocity_scale,
+                    observation_contract=self.spec.observation_contract,
                 )
                 chunk = invoke_fada_idm(
                     self.policy.idm, self.spec, observations, history_actions,
                     command, adapted, history_valid_mask=valid,
                 )
-                source_action = chunk[:, 0].clamp(-self.profile.clip_actions, self.profile.clip_actions)
+                source_action = chunk[:, 0]
+                if self.profile.clip_actions is not None:
+                    source_action = source_action.clamp(-self.profile.clip_actions, self.profile.clip_actions)
                 action = self.source_to_env(source_action)
                 delta = self.model.motion(latent, errors[:, 1:2], action)
                 risk = self.model.risk(latent, action).sigmoid()

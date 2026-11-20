@@ -2,7 +2,7 @@ data:
   train_dirs: []
   validation_dirs: []
 model:
-  obs_dim: 64
+  obs_dim: null  # Resolved from the captured observation contract.
   action_dim: 29
   embed_dim: 128
   hidden_dim: 128

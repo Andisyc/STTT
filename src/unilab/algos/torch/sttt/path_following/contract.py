@@ -45,6 +45,7 @@ class InterventionQueryRecord:
     ctrl_dt: float
     position_scale: float
     velocity_scale: float
+    observation_contract: str = "official_compact_64_v1"
 
     def __post_init__(self) -> None:
         _validate_scales(self.ctrl_dt, self.position_scale, self.velocity_scale)
@@ -53,15 +54,21 @@ class InterventionQueryRecord:
             raise ValueError("intervention requires 29 distinct source joint names")
         object.__setattr__(self, "joint_names", names)
         obs, future = self.observation_history, self.planner_future
-        if obs.ndim != 3 or obs.shape[0] < 1 or obs.shape[1] < 1 or obs.shape[2] != 64:
-            raise ValueError("intervention requires nonempty [batch, history, 64] observations")
+        if self.observation_contract == "official_compact_64_v1":
+            width, command_dim = 64, 7
+        elif self.observation_contract == "g1_fada_state_v2":
+            width, command_dim = 66, 3
+        else:
+            raise ValueError("unsupported intervention observation contract")
+        if obs.ndim != 3 or obs.shape[0] < 1 or obs.shape[1] < 1 or obs.shape[2] != width:
+            raise ValueError("intervention observation history differs from its declared layout")
         batch, history = obs.shape[:2]
-        if future.ndim != 3 or future.shape[0] != batch or future.shape[1] < 1 or future.shape[2] != 64:
-            raise ValueError("intervention requires a nonempty compact64 Planner future")
+        if future.ndim != 3 or future.shape[0] != batch or future.shape[1] < 1 or future.shape[2] != width:
+            raise ValueError("intervention Planner future differs from its declared layout")
         expected = {
             "observation_history": obs.shape,
             "action_history": (batch, history, 29),
-            "command": (batch, 7),
+            "command": (batch, command_dim),
             "planner_future": future.shape,
             "adapted_future": future.shape,
             "residual_rad": (batch, 29),
@@ -77,8 +84,8 @@ class InterventionQueryRecord:
             raise ValueError("intervention requires an aligned boolean history_valid_mask")
         if not bool(mask[:, -1].all()) or bool((mask[:, :-1] & ~mask[:, 1:]).any()):
             raise ValueError("intervention history mask must be a valid suffix")
-        if bool((obs[~mask] != 0).any()) or bool((self.action_history[~mask] != 0).any()):
-            raise ValueError("intervention history padding must be zero")
+        if self.observation_contract == "official_compact_64_v1" and (bool((obs[~mask] != 0).any()) or bool((self.action_history[~mask] != 0).any())):
+            raise ValueError("official intervention history padding must be zero")
         for name in (*expected, "history_valid_mask"):
             object.__setattr__(self, name, getattr(self, name).detach().clone())
 
@@ -99,6 +106,7 @@ class InterventionQueryRecord:
             ctrl_dt=query.profile.ctrl_dt,
             position_scale=float(scales["dof_pos"]),
             velocity_scale=float(scales["dof_vel"]),
+            observation_contract=query.preprocessing.get("observation_contract", "official_compact_64_v1"),
         )
 
 
