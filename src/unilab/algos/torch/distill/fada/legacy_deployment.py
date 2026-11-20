@@ -5,7 +5,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import numpy as np
@@ -134,6 +134,18 @@ def build_legacy_playback_env_override(profile: LegacyFADAPlaybackProfile, overr
             "soft_dof_pos_limit",
         ):
             reward.pop(key, None)
+        if "reward_config" in overrides:
+            task_reward = overrides["reward_config"]
+            if not isinstance(task_reward, Mapping) or not isinstance(task_reward.get("scales"), Mapping):
+                raise ValueError("task reward_config must declare a scales mapping")
+            execution_values = {
+                key: reward[key]
+                for key in ("gait_frequency", "base_height_target", "min_base_height", "max_tilt_deg")
+                if key in reward
+            }
+            reward = deepcopy(dict(task_reward))
+            reward.update(execution_values)
+            result["reward_config"] = reward
     # Policy I/O and actuator calibration belong to the checkpoint. Task
     # conditions may change without replacing those physical definitions.
     for key in ("commands", "runtime_payload", "domain_rand", "noise_config", "curriculum"):
@@ -154,6 +166,9 @@ def build_legacy_playback_env_override(profile: LegacyFADAPlaybackProfile, overr
     if nested_gains is not None and nested_gains != gains:
         raise ValueError("legacy control_config.position_actuator_gains disagrees with control_contract")
     result["position_actuator_gains"] = gains
+    effective_profile = replace(profile, source_profile={**profile.source_profile, "environment_config": result})
+    if effective_profile.preprocessing != profile.preprocessing:
+        raise ValueError("task reward configuration changes checkpoint observation scaling")
     return result
 
 

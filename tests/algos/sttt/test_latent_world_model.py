@@ -731,13 +731,25 @@ def test_legacy_full_environment_migration_preserves_execution_contract(tmp_path
     from unilab.algos.torch.distill.fada.legacy_deployment import build_legacy_playback_env_override
     from unilab.base.registry import apply_cfg_overrides
     from unilab.envs.locomotion.g1.walk_config import G1WalkFlatCfg, G1WalkRewardConfig
+    from hydra import compose, initialize_config_dir
+    from unilab.envs.locomotion.g1.walk_reward_bindings import G1WalkRewardBindings
+    from unilab.envs.locomotion.g1.walk_observation_bindings import G1WalkObservationBindings
+    from unilab.envs.locomotion.g1.walk_observation import assemble_walk_observation
+    from unilab.training.backend_adapter import BackendAdapter
 
     _, profile = legacy_case(tmp_path / "inputs")
     source = deepcopy(profile.source_profile)
     environment = asdict(G1WalkFlatCfg())
     environment.update(source["environment_config"])
     environment["reward_config"] = asdict(G1WalkRewardConfig(
-        scales={"alive": 1.}, tracking_sigma=.25, gait_frequency=profile.gait_frequency,
+        scales={"alive": .15, "base_height": -10., "energy": -2e-5, "feet_clearance": 1.,
+                "feet_slide": -.2, "gait": .5, "penalty_action_rate": -.2,
+                "penalty_ang_vel_xy": -.5, "penalty_close_feet_xy": -5.,
+                "penalty_dof_acc": -2.5e-7, "penalty_dof_pos_limits": -5.,
+                "penalty_dof_vel": -.001, "penalty_feet_ori": -2.,
+                "penalty_lin_vel_z": -2., "penalty_orientation": -10., "pose": -.5,
+                "tracking_ang_vel": 2.5, "tracking_lin_vel": 4.5, "undesired_contacts": -1.},
+        tracking_sigma=.25, gait_frequency=profile.gait_frequency,
         feet_phase_swing_height=.09, feet_phase_tracking_sigma=.04,
         base_height_target=.754, min_base_height=.3, max_tilt_deg=65.))
     environment["reward_config"].update({
@@ -752,14 +764,42 @@ def test_legacy_full_environment_migration_preserves_execution_contract(tmp_path
     source["environment_config"] = environment
     profile = replace(profile, source_profile=source)
     original = deepcopy(source)
-    restored = build_legacy_playback_env_override(profile, {"runtime_payload": {"added_mass_kg": 3.}})
+    with initialize_config_dir(config_dir=str(ROOT / "conf/distill"), version_base=None):
+        task_cfg = compose(config_name="config", overrides=[
+            "task=g1_walk_flat/mujoco", "recording_profile=straight_payload",
+            "env.runtime_payload.enabled=false", "online_adaptation.enabled=false"])
+    task_overrides = BackendAdapter(task_cfg, root_dir=ROOT, algo_name="distill").build_play_env_cfg_override()
+    task_overrides["reward_config"].update(
+        gait_frequency=2., base_height_target=.9, min_base_height=.6, max_tilt_deg=45.)
+    task_overrides["runtime_payload"]["added_mass_kg"] = 3.
+    restored = build_legacy_playback_env_override(profile, task_overrides)
     target = G1WalkFlatCfg()
     apply_cfg_overrides(target, restored)
     target.validate()
+    binding = G1WalkRewardBindings()
+    binding._reward_cfg = target.reward_config
+    binding._init_reward_functions()
+    observations = G1WalkObservationBindings()
+    observations._cfg = target
+    observations._reward_cfg = target.reward_config
+    gyro = np.array([[1., 2., 3.]], dtype=np.float32)
+    dof_vel = np.arange(1, 30, dtype=np.float32).reshape(1, 29)
+    zeros = np.zeros((1, 3), dtype=np.float32)
+    joints = np.zeros((1, 29), dtype=np.float32)
+    actual = assemble_walk_observation(
+        noisy_gyro=gyro, noisy_gravity=zeros, noisy_diff=joints, noisy_dof_vel=dof_vel,
+        gyro=gyro, gravity=zeros, diff=joints, dof_vel=dof_vel, last_actions=joints,
+        command_obs=zeros, gait_phase=np.zeros((1, 2), dtype=np.float32),
+        mode_obs=np.zeros((1, 1), dtype=np.float32), linvel=zeros, mode_observation=False,
+        walk_profile=observations._uses_walk_observation_profile(), fada_privileged=False,
+        privileged_strength=None, fada_privileged_obs=None, dtype=np.float32)["obs"]
+    np.testing.assert_allclose(actual[:, :3], gyro * profile.preprocessing["term_scale"]["base_ang_vel"])
+    np.testing.assert_allclose(actual[:, 35:64], dof_vel * profile.preprocessing["term_scale"]["dof_vel"])
     assert (target.ctrl_dt, target.sim_dt, target.control_config.action_scale) == (.02, .005, .5)
     assert target.gait_clock_mode == profile.gait_clock_mode
     assert target.reward_config.gait_frequency == profile.gait_frequency
-    assert target.reward_config.scales == environment["reward_config"]["scales"]
+    assert target.reward_config.scales == task_overrides["reward_config"]["scales"]
+    assert target.reward_config.base_height_target == .754
     assert (target.reward_config.min_base_height, target.reward_config.max_tilt_deg) == (.3, 65.)
     assert target.runtime_payload.added_mass_kg == 3.
     assert target.position_actuator_gains == {
@@ -785,3 +825,14 @@ def test_legacy_full_environment_migration_preserves_execution_contract(tmp_path
     with pytest.raises((TypeError, ValueError), match="unknown_reward_parameter"):
         apply_cfg_overrides(G1WalkFlatCfg(), build_legacy_playback_env_override(
             replace(profile, source_profile=incompatible), {}))
+    incompatible_task = deepcopy(task_overrides)
+    incompatible_task["reward_config"]["scales"] = {"orientation": -1.}
+    with pytest.raises(ValueError, match="observation scaling"):
+        build_legacy_playback_env_override(profile, incompatible_task)
+    incompatible_task = deepcopy(task_overrides)
+    incompatible_task["reward_config"]["scales"]["unknown_reward_term"] = 1.
+    target = G1WalkFlatCfg()
+    apply_cfg_overrides(target, build_legacy_playback_env_override(profile, incompatible_task))
+    binding._reward_cfg = target.reward_config
+    with pytest.raises(ValueError, match="unknown_reward_term"):
+        binding._init_reward_functions()
