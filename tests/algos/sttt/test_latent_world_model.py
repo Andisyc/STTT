@@ -725,3 +725,63 @@ def test_legacy_empty_scene_poles_migrate_through_strict_registry(tmp_path):
     restored = build_legacy_playback_env_override(profile, {})
     with pytest.raises(ValueError, match="has no attribute 'unrecognized_scene_field'"):
         apply_cfg_overrides(SceneCfg(model_file="scene_previous.xml"), restored["scene"])
+
+
+def test_legacy_full_environment_migration_preserves_execution_contract(tmp_path):
+    from unilab.algos.torch.distill.fada.legacy_deployment import build_legacy_playback_env_override
+    from unilab.base.registry import apply_cfg_overrides
+    from unilab.envs.locomotion.g1.walk_config import G1WalkFlatCfg, G1WalkRewardConfig
+
+    _, profile = legacy_case(tmp_path / "inputs")
+    source = deepcopy(profile.source_profile)
+    environment = asdict(G1WalkFlatCfg())
+    environment.update(source["environment_config"])
+    environment["reward_config"] = asdict(G1WalkRewardConfig(
+        scales={"alive": 1.}, tracking_sigma=.25, gait_frequency=profile.gait_frequency,
+        feet_phase_swing_height=.09, feet_phase_tracking_sigma=.04,
+        base_height_target=.754, min_base_height=.3, max_tilt_deg=65.))
+    environment["reward_config"].update({
+        "tracking_ang_sigma": .25, "contact_force_threshold": 1., "contact_history_steps": 3,
+        "feet_clearance_std": .05, "feet_clearance_tanh_mult": 2., "feet_clearance_target": .05,
+        "gait_duty_factor": .55, "gait_period_randomization_width": .2,
+        "min_command_threshold": .1, "soft_dof_pos_limit": .95})
+    environment["scene"]["task_poles"] = []
+    environment["slope_evaluation"] = None
+    environment["control_config"]["position_actuator_gains"] = None
+    environment["runtime_payload"].update(additional_mass_events=[], requested_mass_levels_kg=[])
+    source["environment_config"] = environment
+    profile = replace(profile, source_profile=source)
+    original = deepcopy(source)
+    restored = build_legacy_playback_env_override(profile, {"runtime_payload": {"added_mass_kg": 3.}})
+    target = G1WalkFlatCfg()
+    apply_cfg_overrides(target, restored)
+    target.validate()
+    assert (target.ctrl_dt, target.sim_dt, target.control_config.action_scale) == (.02, .005, .5)
+    assert target.gait_clock_mode == profile.gait_clock_mode
+    assert target.reward_config.gait_frequency == profile.gait_frequency
+    assert target.reward_config.scales == environment["reward_config"]["scales"]
+    assert (target.reward_config.min_base_height, target.reward_config.max_tilt_deg) == (.3, 65.)
+    assert target.runtime_payload.added_mass_kg == 3.
+    assert target.position_actuator_gains == {
+        "joint_names": list(profile.joint_names), "kp": list(profile.stiffness), "kd": list(profile.damping)}
+    assert "position_actuator_gains" not in restored["control_config"]
+    assert source == original
+
+    for section, key, value in (
+        (None, "slope_evaluation", {"enabled": True}),
+        ("runtime_payload", "additional_mass_events", [{"time_s": 1., "mass_kg": 3.}]),
+        ("runtime_payload", "requested_mass_levels_kg", [3.]),
+        ("control_config", "position_actuator_gains", {"kp": [1.] * 29}),
+    ):
+        incompatible = deepcopy(source)
+        values = incompatible["environment_config"]
+        if section is not None:
+            values = values[section]
+        values[key] = value
+        with pytest.raises(ValueError, match=key):
+            build_legacy_playback_env_override(replace(profile, source_profile=incompatible), {})
+    incompatible = deepcopy(source)
+    incompatible["environment_config"]["reward_config"]["unknown_reward_parameter"] = 1.
+    with pytest.raises((TypeError, ValueError), match="unknown_reward_parameter"):
+        apply_cfg_overrides(G1WalkFlatCfg(), build_legacy_playback_env_override(
+            replace(profile, source_profile=incompatible), {}))

@@ -119,6 +119,21 @@ def build_legacy_playback_env_override(profile: LegacyFADAPlaybackProfile, overr
         if scene["task_poles"] != []:
             raise ValueError("legacy scene.task_poles must be an empty list; active task poles are unsupported")
         del scene["task_poles"]
+    if "slope_evaluation" in result:
+        if result["slope_evaluation"] is not None:
+            raise ValueError("legacy slope_evaluation must be null; slope evaluation is unsupported")
+        del result["slope_evaluation"]
+    reward = result.get("reward_config")
+    if isinstance(reward, dict):
+        # Retired reward knobs do not belong to the current reward constructor.
+        # Preserve source weights, gait frequency and termination thresholds.
+        for key in (
+            "tracking_ang_sigma", "contact_force_threshold", "contact_history_steps",
+            "feet_clearance_std", "feet_clearance_tanh_mult", "feet_clearance_target",
+            "gait_duty_factor", "gait_period_randomization_width", "min_command_threshold",
+            "soft_dof_pos_limit",
+        ):
+            reward.pop(key, None)
     # Policy I/O and actuator calibration belong to the checkpoint. Task
     # conditions may change without replacing those physical definitions.
     for key in ("commands", "runtime_payload", "domain_rand", "noise_config", "curriculum"):
@@ -127,8 +142,18 @@ def build_legacy_playback_env_override(profile: LegacyFADAPlaybackProfile, overr
     for key in ("max_episode_seconds", "reset_base_qvel_limit", "standing_reset_base_qvel_limit"):
         if key in overrides:
             result[key] = deepcopy(overrides[key])
-    result["position_actuator_gains"] = {"joint_names": list(profile.joint_names), "kp": list(profile.stiffness), "kd": list(profile.damping)}
-    result["control_config"] = {**result["control_config"], "position_actuator_gains": result["position_actuator_gains"]}
+    payload = result.get("runtime_payload")
+    if isinstance(payload, dict):
+        for key in ("additional_mass_events", "requested_mass_levels_kg"):
+            if key in payload:
+                if payload[key] != []:
+                    raise ValueError(f"legacy runtime_payload.{key} must be an empty list")
+                del payload[key]
+    gains = {"joint_names": list(profile.joint_names), "kp": list(profile.stiffness), "kd": list(profile.damping)}
+    nested_gains = result["control_config"].pop("position_actuator_gains", None)
+    if nested_gains is not None and nested_gains != gains:
+        raise ValueError("legacy control_config.position_actuator_gains disagrees with control_contract")
+    result["position_actuator_gains"] = gains
     return result
 
 

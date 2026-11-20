@@ -30,7 +30,7 @@ The WM consumes target-order env-input actions. Tracker history retains source-o
 
 Both the official 64/29/7 and source-bound 66/29/3 execution layouts use the same collection/training/runtime pipeline. Joint intervention and gravity decoding follow the declared layout. Legacy Tracker histories preserve their repeated-observation cold start; WM history masks identify real observations. Imagination advances the source gait clock instead of learning its deterministic phase. Set `profile_path=null` for embedded-profile evaluation; nominal and adapted modes restore the same source environment. Existing plain playback stays unchanged unless `training.play_use_checkpoint_profile=true` is explicitly selected.
 
-Embedded legacy scenes migrate `task_poles: []` to the current empty-scene representation without changing checkpoint metadata. Active task poles are rejected; other unknown scene fields retain strict registry validation.
+Embedded legacy configuration migration removes retired reward-only parameters, translates empty scene/slope/payload-schedule declarations and restores PD gains at the environment root. Source checkpoint metadata, control timing, gait frequency and termination thresholds are preserved. Active unsupported scene/schedule features and conflicting nested gains are rejected; other unknown fields retain strict registry validation.
 
 From the repository root, a clean, zero-residual baseline capture for the uploaded policy is:
 
