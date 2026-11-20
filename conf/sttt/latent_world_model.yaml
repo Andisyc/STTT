@@ -1,0 +1,47 @@
+data:
+  train_dirs: []
+  validation_dirs: []
+model:
+  obs_dim: 64
+  action_dim: 29
+  embed_dim: 128
+  hidden_dim: 128
+  belief_dim: 128
+  stoch_groups: 8
+  stoch_classes: 8
+  recurrent_model: block_gru
+  num_blocks: 4
+  dynamics_layers: 1
+  prior_layers: 2
+  posterior_layers: 1
+  encoder_layers: 2
+  decoder_layers: 2
+  head_layers: 2
+  norm_eps: 0.0001
+  unimix: 0.01
+  action_scale: null
+training:
+  max_updates: 200000
+  batch_size: 16
+  rollout_windows: 2
+  cache_size: 2
+  validation_every: 1000
+  validation_batches: 16
+  checkpoint_every: 1000
+  learning_rate: 0.0003
+  weight_decay: 0.000001
+  gradient_clip_norm: 100.0
+  resume_checkpoint: null
+  loss:
+    free_nats: 1.0
+    kl_scale: 1.0
+    kl_balance: 0.8
+    reconstruction_scale: 1.0
+    motion_scale: 1.0
+    risk_scale: 1.0
+    overshoot_scale: 1.0
+    prior_reconstruction_scale: 1.0
+    window_scale: 1.0
+device: cpu
+seed: 0
+output_dir: null

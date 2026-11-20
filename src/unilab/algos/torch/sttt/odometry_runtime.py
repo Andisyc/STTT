@@ -41,6 +41,7 @@ from unilab.algos.torch.sttt.pose_data import (
     OnlinePoseRuntime,
     PoseRuntimeConfig,
     PoseRuntimeUpdate,
+    ReceivedPose,
     TimedPelvisPose,
 )
 from unilab.algos.torch.sttt.pose_timeline import PoseTimeline
@@ -108,6 +109,7 @@ class _TimelineEvidence:
         self._last_valid_ns: int | None = None
         self._lost = False
         self._closed = False
+        self._received_poses: list[ReceivedPose] = []
 
     # ----------------------------------------------------------------- state
 
@@ -124,6 +126,7 @@ class _TimelineEvidence:
     def _clear_evidence(self) -> None:
         """Drop every cached pose and queued interval; nothing is kept silently."""
         self._timeline.reset()
+        self._received_poses.clear()
         self._last_valid_ns = None
         self._lost = False
 
@@ -134,8 +137,9 @@ class _TimelineEvidence:
         self._lost = True
 
     def _record(self, pose: TimedPelvisPose) -> None:
-        """Cache one measurement and refresh the last valid capture time."""
+        """Cache raw truth with its actual first controller availability."""
         self._timeline.add_pose(pose)
+        self._received_poses.append(ReceivedPose(pose, int(self.clock.timestamp_ns)))
         if pose.valid:
             self._last_valid_ns = int(pose.timestamp_ns)
             self._lost = False
@@ -157,6 +161,8 @@ class _TimelineEvidence:
 
     def _update(self, *, now_ns: int, tracking_epoch: int, invalidated: bool) -> PoseRuntimeUpdate:
         aligned = self._timeline.drain_ready(now_ns=now_ns)
+        received = tuple(self._received_poses)
+        self._received_poses.clear()
         return PoseRuntimeUpdate(
             aligned=aligned,
             status=self._status,
@@ -166,6 +172,7 @@ class _TimelineEvidence:
             # discard is hidden and no counter silently resets on a new epoch.
             dropped_intervals=self._timeline.dropped_intervals,
             invalidated=invalidated,
+            received_poses=received,
         )
 
     def _require_control_sequence(self, control: ControlInterval) -> None:
@@ -382,6 +389,7 @@ class _CuvslamPoseRuntime(_TimelineEvidence):
                     # anchors that epoch exactly once.
                     self._mark_lost()
                     invalidated = True
+                self._received_poses.append(ReceivedPose(pose, int(stream.clock.timestamp_ns)))
                 continue
             self._record(pose)
         if kinematics_by_key:

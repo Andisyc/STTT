@@ -1,0 +1,23 @@
+# Finite same-condition evaluation only; no cases run until explicitly selected.
+output_dir: null
+policy_checkpoint: null
+profile_path: null
+response_checkpoint: null  # Required only when also selecting oat_path.
+world_model_checkpoint: null  # Required for latent_wm and latent_wm_frozen; independent of response_checkpoint.
+latent_learning:
+  online:
+    residual_limit_rad: null  # Required: 29 positive source-order physical joint limits in radians.
+  costs: {}  # Optional overrides of conf/sttt/latent_path_following_online.yaml costs.
+pose_source: simulation  # Score-only truth remains separate; cuvslam requires supported Linux/CUDA.
+device: cpu
+modes: []  # Explicit subset of [nominal, oat, oat_path, latent_wm, latent_wm_frozen].
+conditions: []  # Explicit subset of [clean, delayed_payload].
+seeds: []
+duration_s: null  # Required finite physical horizon, an integer number of control periods.
+source_overrides: []  # Composed onto task=g1_walk_flat/mujoco and recording_profile=straight_payload.
+thresholds:
+  lateral_tolerance_m: null
+  heading_tolerance_rad: 3.141592653589793  # Allow crab trim; heading error is still recorded/scored unchanged.
+  dwell_s: null
+  crossing_deadband_m: null
+  minimum_forward_progress_m: null  # Positive forward progress is still mandatory.

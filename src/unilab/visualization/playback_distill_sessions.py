@@ -360,6 +360,10 @@ def create_fada_playback_session(
     path_node = getattr(cfg, "path_following", None)
     path_enabled = bool(getattr(path_node, "enabled", False))
     path_setup = None
+    latent_setup = None
+    path_mode = getattr(path_node, "mode", "response")
+    if path_enabled and path_mode not in {"response", "latent_wm"}:
+        raise ValueError(f"unknown path_following mode: {path_mode}")
     official_playback = None
     if path_enabled and (future_transform is not None or prepare_rollout_branch):
         raise ValueError("path following owns the future transform and cannot use isolated rollouts")
@@ -425,13 +429,22 @@ def create_fada_playback_session(
         if path_enabled:
             if official_profile is None:
                 raise ValueError("path following requires an official Planner-IDM checkpoint")
-            from unilab.algos.torch.sttt.path_following.runtime import prepare_path_following
+            if path_mode == "latent_wm":
+                from unilab.algos.torch.sttt.path_following.latent_runtime import prepare_latent_path_following
 
-            path_setup = prepare_path_following(
-                path_node, cfg=cfg, playback_cfg=playback_cfg, root_dir=root_dir,
-                checkpoint_path=checkpoint_path, policy=loaded.policy, profile=official_profile,
-                spec=architecture, device=device_name,
-            )
+                latent_setup = prepare_latent_path_following(
+                    path_node, cfg=cfg, playback_cfg=playback_cfg, root_dir=root_dir,
+                    checkpoint_path=checkpoint_path, policy=loaded.policy, profile=official_profile,
+                    spec=architecture, device=device_name,
+                )
+            else:
+                from unilab.algos.torch.sttt.path_following.runtime import prepare_path_following
+
+                path_setup = prepare_path_following(
+                    path_node, cfg=cfg, playback_cfg=playback_cfg, root_dir=root_dir,
+                    checkpoint_path=checkpoint_path, policy=loaded.policy, profile=official_profile,
+                    spec=architecture, device=device_name,
+                )
 
         if online is not None:
             from unilab.algos.torch.distill.fada.observation import (
@@ -454,7 +467,7 @@ def create_fada_playback_session(
             f"horizon={architecture.prediction_horizon}"
         )
 
-    if path_enabled and path_setup is None:
+    if path_enabled and path_setup is None and latent_setup is None:
         raise ValueError("path following requires official policy action mode")
 
     # B2: 通过 distill task config 构造环境, 键盘模式先收敛为静止零速 reset, 再核对 policy IO.
@@ -588,7 +601,22 @@ def create_fada_playback_session(
                 f"lora_alpha={lora_config.alpha}, lora_dropout={lora_config.dropout}"
             )
 
-        if path_setup is not None:
+        if latent_setup is not None:
+            from unilab.algos.torch.sttt.path_following.latent_runtime import LatentPathFollowingController
+
+            path_updater = latent_setup.bind(official_playback, env)
+            path_config = latent_setup.runtime
+            pose_factory = resolved_deps.get("create_pose_runtime")
+            controller = LatentPathFollowingController(
+                controller, official_playback, env, path_updater, path_config,
+                pose_runtime=(pose_factory(env, path_config.pose) if pose_factory is not None else None),
+                save_checkpoint_path=latent_setup.save_checkpoint_path,
+            )
+            log(
+                f"Latent WM path following enabled: source={path_config.pose.odometry_source}, "
+                f"window_steps={path_updater.window_steps}, horizon_windows={path_updater.config.horizon_windows}"
+            )
+        elif path_setup is not None:
             from unilab.algos.torch.sttt.path_following.runtime import PathFollowingController
 
             path_updater, path_config = path_setup

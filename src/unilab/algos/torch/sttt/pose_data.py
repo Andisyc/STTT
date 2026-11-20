@@ -93,6 +93,18 @@ class AlignedPoseInterval:
 
 
 @dataclass(frozen=True)
+class ReceivedPose:
+    """Raw measurement and first controller availability on the physical clock.
+
+    ``pose.timestamp_ns`` is capture time; ``available_at_ns`` is receive time
+    in the same sequence clock, never wall time or interpolated label time.
+    """
+
+    pose: TimedPelvisPose
+    available_at_ns: int
+
+
+@dataclass(frozen=True)
 class PoseRuntimeUpdate:
     aligned: tuple[AlignedPoseInterval, ...]
     status: Literal["waiting", "tracking", "lost"]
@@ -100,6 +112,7 @@ class PoseRuntimeUpdate:
     tracking_epoch: int
     dropped_intervals: int = 0
     invalidated: bool = False
+    received_poses: tuple[ReceivedPose, ...] = ()
 
 
 class OnlinePoseRuntime(Protocol):

@@ -88,6 +88,11 @@ class OfficialFADAPlaybackController:
         self._pending_reset: torch.Tensor | None = None
         self._pending_action: torch.Tensor | None = None
 
+    @property
+    def last_source_action(self) -> torch.Tensor | None:
+        """Borrow the last clipped SOURCE command, independently of env feedback."""
+        return self._pending_action
+
     def reset(self, done: Any | None = None) -> None:
         """Reset every history, or mark selected rows for reset at their next observation."""
 

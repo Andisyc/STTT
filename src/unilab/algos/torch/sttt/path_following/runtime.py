@@ -5,7 +5,7 @@ import hashlib
 from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, Protocol, Sequence, TypeVar
 
 import numpy as np
 import torch
@@ -90,7 +90,27 @@ def prepare_path_following(
     return updater, PathFollowingRuntimeConfig(pose=pose, **counts)
 
 
-class PathFollowingController:
+class PathFollowingLearner(Protocol):
+    contract: dict[str, Any]
+    actor_updates: int
+    response_updates: int
+
+    @property
+    def actor(self) -> torch.nn.Module: ...
+
+    @property
+    def calibration_complete(self) -> bool: ...
+
+    def begin_episode(self, reference: Any) -> None: ...
+
+    def update(self, completed_windows: Sequence[PathFollowingWindowSample],
+               actor_context: ActorUpdateContext | None = None) -> Any: ...
+
+
+LearnerT = TypeVar("LearnerT", bound=PathFollowingLearner)
+
+
+class PathFollowingController(Generic[LearnerT]):
     """Outermost controller; only the session steps physics. Failures halt until reset.
 
     Cache queries through alignment, not just through the prediction horizon.
@@ -100,7 +120,7 @@ class PathFollowingController:
 
     def __init__(
         self, inner: Any, playback: OfficialFADAPlaybackController, env: Any,
-        updater: PathFollowingUpdater, config: PathFollowingRuntimeConfig, *,
+        updater: LearnerT, config: PathFollowingRuntimeConfig, *,
         pose_runtime: OnlinePoseRuntime | None = None,
     ) -> None:
         if playback.future_transform is not None:

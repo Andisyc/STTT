@@ -1,0 +1,16 @@
+output_dir: null
+num_steps: null
+window_steps: null
+residual_amplitude_rad: null
+risk_tilt_limit_rad: null
+seed: 0
+device: cpu
+pose:
+  odometry_source: simulation
+observation_augmentation:
+  position_noise_std_m: 0.0
+  yaw_noise_std_rad: 0.0
+  delay_s: 0.0
+  jitter_s: 0.0
+  dropout_probability: 0.0
+  seed: 0

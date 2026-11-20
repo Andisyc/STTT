@@ -25,7 +25,8 @@ from unilab.algos.torch.sttt.pose_data import TimedPelvisPose
 from unilab.visualization.playback_distill_sessions import create_fada_playback_session
 from unilab.visualization.playback_sessions import RslRlPlaybackConfig
 
-_MODES = {"nominal", "oat", "oat_path"}
+_LATENT_MODES = {"latent_wm", "latent_wm_frozen"}
+_MODES = {"nominal", "oat", "oat_path"} | _LATENT_MODES
 _CONDITIONS = {"clean", "delayed_payload"}
 _HEADER = (
     "timestamp_ns", "elapsed_s", "completed_step", "valid", "x_m", "y_m", "z_m",
@@ -100,6 +101,9 @@ class _RuntimeEvidence:
         self.records = self.steps = self.covered_steps = self.unique = 0
         self.age_sum = self.age_max = 0
         self.latest: dict[str, Any] = {}
+        self.update_count = self.saturation_count = 0
+        self.update_seconds = self.update_max_seconds = 0.
+        self.saturation_sum = self.saturation_max = 0.
 
     def drain(self, controller: Any, arrival_ns: int | None) -> None:
         if not isinstance(controller, PathFollowingController):
@@ -121,12 +125,22 @@ class _RuntimeEvidence:
                         self.age_max = max(self.age_max, age)
                         new_measurement = True
                 self.latest = record
+                elapsed = record.get("online_update_elapsed_s")
+                if elapsed is not None:
+                    self.update_count += 1
+                    self.update_seconds += elapsed
+                    self.update_max_seconds = max(self.update_max_seconds, elapsed)
+                saturation = record.get("residual_saturation_fraction")
+                if saturation is not None:
+                    self.saturation_count += 1
+                    self.saturation_sum += saturation
+                    self.saturation_max = max(self.saturation_max, saturation)
             row["new_measurement"] = new_measurement
             self.handle.write(json.dumps(_plain(row), allow_nan=False) + "\n")
             self.records += 1
 
     def summary(self, enabled: bool) -> dict[str, Any]:
-        return {
+        result = {
             "enabled": enabled, "records": self.records, "control_records": self.steps,
             "paired_control_fraction": self.covered_steps / self.steps if self.steps else None,
             "unique_measurements": self.unique,
@@ -136,6 +150,17 @@ class _RuntimeEvidence:
             "dropped_windows": self.latest.get("dropped_windows", {}),
             "expired_queries": self.latest.get("expired_queries"),
         }
+        if self.update_count:
+            result["online_walltime"] = {
+                "update_count": self.update_count, "total_s": self.update_seconds,
+                "mean_s": self.update_seconds / self.update_count, "max_s": self.update_max_seconds,
+            }
+        if self.saturation_count:
+            result["residual_saturation"] = {
+                "control_records": self.saturation_count,
+                "mean_fraction": self.saturation_sum / self.saturation_count, "max_fraction": self.saturation_max,
+            }
+        return result
 
 
 def _run_episode(
@@ -153,6 +178,7 @@ def _run_episode(
         "policy": _file_identity(playback_cfg.training.play_checkpoint_path),
         "profile": _file_identity(playback_cfg.official_playback.profile_path),
         "response": _file_identity(playback_cfg.path_following.checkpoint_path) if mode == "oat_path" else None,
+        "world_model": _file_identity(playback_cfg.path_following.checkpoint_path) if mode in _LATENT_MODES else None,
     }
     _publish(output / "source.json", source)
     metrics = PathFollowingMetrics(thresholds)
@@ -301,8 +327,10 @@ def _run_episode(
         "actual_payload_event_start_ns": attach_time_ns,
         "condition_observed": condition_observed,
         "tracking_success": complete and condition_observed and tracking_ok and metric_summary["progress_pass"],
-        "runtime": evidence.summary(mode == "oat_path"),
+        "runtime": evidence.summary(mode == "oat_path" or mode in _LATENT_MODES),
     }
+    if mode in _LATENT_MODES:
+        summary["risk_diagnostics"] = session.controller.risk_diagnostics() if session is not None else None
     _publish(output / "summary.json", summary)
     return summary
 
@@ -314,8 +342,9 @@ def run_path_following_evaluation(
     if not isinstance(cfg, DictConfig):
         raise TypeError("evaluation requires the independent Hydra configuration")
     expected = {"output_dir", "policy_checkpoint", "profile_path", "response_checkpoint", "pose_source", "device", "modes", "conditions", "seeds", "duration_s", "source_overrides", "thresholds"}
-    if set(cfg) != expected:
-        raise ValueError("use conf/sttt/path_following_evaluate.yaml")
+    latent_keys = {"world_model_checkpoint", "latent_learning"}
+    if set(cfg) != expected and set(cfg) != expected | latent_keys:
+        raise ValueError("use conf/sttt/path_following_evaluate.yaml or conf/sttt/latent_path_following_evaluate.yaml")
     raw_thresholds = OmegaConf.to_container(cfg.thresholds, resolve=True)
     if not isinstance(raw_thresholds, dict) or set(raw_thresholds) != set(PathFollowingThresholds.__dataclass_fields__):
         raise ValueError("provide all five explicit physical evaluation thresholds")
@@ -330,6 +359,17 @@ def run_path_following_evaluation(
     modes, conditions, seeds = list(cfg.modes), list(cfg.conditions), list(cfg.seeds)
     if not modes or not conditions or not seeds or len(set(modes)) != len(modes) or len(set(conditions)) != len(conditions) or len(set(seeds)) != len(seeds) or not set(modes) <= _MODES or not set(conditions) <= _CONDITIONS:
         raise ValueError("provide explicit unique modes, conditions and seeds; no automatic sweep is selected")
+    latent_learning = None
+    if set(modes) & _LATENT_MODES:
+        if not latent_keys <= set(cfg):
+            raise ValueError("latent modes require world_model_checkpoint and latent_learning")
+        latent_learning = _plain(cfg.latent_learning)
+        if not isinstance(latent_learning, dict) or not {"online"} <= set(latent_learning) <= {"online", "costs"} or not isinstance(latent_learning["online"], dict):
+            raise ValueError("latent_learning requires online overrides and optional costs overrides")
+        if "costs" in latent_learning and not isinstance(latent_learning["costs"], dict):
+            raise ValueError("latent_learning.costs must contain cost overrides")
+        from unilab.algos.torch.sttt.world_model.online import LatentOnlineConfig
+        LatentOnlineConfig.from_mapping(latent_learning["online"])
     for seed in seeds:
         if _integer(seed, "seed") >= 2**32:
             raise ValueError("evaluation seed must be less than 2**32")
@@ -338,7 +378,7 @@ def run_path_following_evaluation(
     root = Path(root_dir) if root_dir is not None else Path(__file__).resolve().parents[6]
     def resolve(value: Any) -> Path:
         if not value:
-            raise ValueError("output, policy and source-profile paths must be explicit; oat_path also requires B")
+            raise ValueError("output, policy and source-profile paths must be explicit; oat_path requires B and latent modes require WM")
         path = Path(str(value)).expanduser()
         return (path if path.is_absolute() else root / path).resolve()
     policy, profile = resolve(cfg.policy_checkpoint), resolve(cfg.profile_path)
@@ -347,6 +387,9 @@ def run_path_following_evaluation(
     response = resolve(cfg.response_checkpoint) if "oat_path" in modes else None
     if response is not None:
         _file_identity(response)
+    world_model = resolve(cfg.world_model_checkpoint) if set(modes) & _LATENT_MODES else None
+    if world_model is not None:
+        _file_identity(world_model)
     output = resolve(cfg.output_dir)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"evaluation output must be empty: {output}")
@@ -355,15 +398,24 @@ def run_path_following_evaluation(
         for condition in conditions:
             for mode in modes:
                 overrides = ["task=g1_walk_flat/mujoco", "recording_profile=straight_payload", *list(cfg.source_overrides)]
-                overrides.append("path_following=online" if mode == "oat_path" else "~path_following")
+                if mode in _LATENT_MODES:
+                    overrides.append("path_following=latent_wm")
+                else:
+                    overrides.append("path_following=online" if mode == "oat_path" else "~path_following")
                 playback_cfg = compose(config_name="config", overrides=overrides)
                 OmegaConf.update(playback_cfg, "training.play_checkpoint_path", str(policy))
                 OmegaConf.update(playback_cfg, "official_playback.profile_path", str(profile))
-                OmegaConf.update(playback_cfg, "online_adaptation.enabled", mode != "nominal")
+                OmegaConf.update(playback_cfg, "online_adaptation.enabled", mode in ("oat", "oat_path"))
                 OmegaConf.update(playback_cfg, "env.runtime_payload.enabled", condition == "delayed_payload")
                 if mode == "oat_path":
                     OmegaConf.update(playback_cfg, "path_following.checkpoint_path", str(response))
                     OmegaConf.update(playback_cfg, "path_following.pose.odometry_source", cfg.pose_source)
+                elif mode in _LATENT_MODES:
+                    OmegaConf.update(playback_cfg, "path_following.checkpoint_path", str(world_model))
+                    OmegaConf.update(playback_cfg, "path_following.learning", latent_learning, merge=True, force_add=True)
+                    OmegaConf.update(playback_cfg, "path_following.pose.odometry_source", cfg.pose_source)
+                    if mode == "latent_wm_frozen":
+                        OmegaConf.update(playback_cfg, "path_following.learning.online.adapt_world_model", False, force_add=True)
                 if playback_cfg.training.task_name != "G1WalkFlat" or playback_cfg.training.sim_backend != "mujoco":
                     raise ValueError("evaluation is limited to g1_walk_flat/mujoco")
                 if OmegaConf.select(playback_cfg, "interactive.keyboard") or OmegaConf.select(playback_cfg, "demo.figure_eight.enabled") or OmegaConf.select(playback_cfg, "env.commands.heading_command") or OmegaConf.select(playback_cfg, "env.commands.resampling_time") != 0:
