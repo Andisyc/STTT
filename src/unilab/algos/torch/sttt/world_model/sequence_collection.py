@@ -20,8 +20,10 @@ from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
 from unilab.algos.torch.sttt.odometry_runtime import create_pose_runtime
 from unilab.algos.torch.sttt.path_following.intervention import compose_joint_position_residual
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath, pose_identity, pose_matrix
+from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory, TrajectoryConfig
 from unilab.algos.torch.sttt.pose_data import ControlInterval, PoseRuntimeConfig
 from unilab.algos.torch.sttt.world_model.observation_augmentation import ObservationAugmentationConfig, PoseInputAugmenter
+from unilab.algos.torch.sttt.world_model.motion import MOTION_FRAME
 from unilab.algos.torch.sttt.world_model.sequence_data import SequenceDatasetWriter, _arrays
 
 
@@ -29,14 +31,15 @@ def _wrap(value):
     return (value + np.pi) % (2 * np.pi) - np.pi
 
 
-def _path_delta(start, end, reference) -> np.ndarray:
-    if pose_identity(start) != pose_identity(end) or pose_identity(start) != (reference.sequence_id, reference.tracking_epoch, reference.frame_id):
-        raise ValueError("window endpoints must share the fixed path localization identity")
+def _path_delta(start, end) -> np.ndarray:
+    if pose_identity(start) != pose_identity(end):
+        raise ValueError("motion endpoints must share one localization identity")
     if end.timestamp_ns <= start.timestamp_ns:
         raise ValueError("window endpoints must increase in physical time")
     a, b = pose_matrix(start), pose_matrix(end)
     dx, dy = b[:2, 3] - a[:2, 3]
-    c, s = math.cos(reference.heading_rad), math.sin(reference.heading_rad)
+    heading = math.atan2(a[1, 0], a[0, 0])
+    c, s = math.cos(heading), math.sin(heading)
     yaw = _wrap(math.atan2(b[1, 0], b[0, 0]) - math.atan2(a[1, 0], a[0, 0]))
     return np.asarray([c*dx + s*dy, -s*dx + c*dy, yaw], dtype=np.float32)
 
@@ -59,11 +62,11 @@ def _record_sequence(controls, records: Mapping[int, dict]) -> dict[str, np.ndar
         "actions": np.asarray([r["action"] for r in rows], dtype=np.float32),
         "source_actions": np.asarray([r["source_action"] for r in rows], dtype=np.float32),
         "commands": np.asarray([r["command"] for r in rows], dtype=np.float32),
+        "residuals": np.asarray([r["residual"] for r in rows], dtype=np.float32),
         "is_first": np.asarray([True] + [False]*n, dtype=bool),
         "ego_motion": np.asarray([r["ego_motion"] for r in rows] + [last.get("next_ego_motion", np.zeros(3))], dtype=np.float32),
         "ego_valid": np.asarray([r["ego_valid"] for r in rows] + [last.get("next_ego_valid", False)], dtype=bool).reshape(n+1, 1),
         "ego_age_s": np.asarray([r["ego_age_s"] for r in rows] + [last.get("next_ego_age_s", 0.)], dtype=np.float32).reshape(n+1, 1),
-        "errors": np.zeros((n+1, 2), dtype=np.float32),
         "path_delta": np.zeros((n, 3), dtype=np.float32), "motion_valid": np.zeros(n, dtype=bool),
         "risk": np.asarray([r.get("risk", 0.) for r in rows], dtype=np.float32).reshape(n, 1),
         "risk_valid": np.asarray([r.get("risk_valid", False) for r in rows], dtype=bool),
@@ -79,17 +82,15 @@ def window_sequence(sample, records: Mapping[int, dict]) -> dict[str, np.ndarray
     """Assemble online evidence; only measured endpoints supervise sparse motion.
 
     Records contain causal ego inputs captured at query time, never reconstructed
-    from delayed labels. Interior errors remain zero and are NOT dense labels.
+    from delayed labels.
     """
     result = _record_sequence(sample.controls, records)
     n = len(sample.controls)
     if sample.start_pose.timestamp_ns != sample.controls[0].start_ns or sample.end_pose.timestamp_ns != sample.controls[-1].end_ns:
         raise ValueError("window pose labels do not match executed physical endpoints")
-    result["errors"][0] = sample.reference.errors(sample.start_pose)
-    result["errors"][-1] = sample.reference.errors(sample.end_pose)
     result["window_start"] = np.asarray([0], dtype=np.int64)
     result["window_end"] = np.asarray([n], dtype=np.int64)
-    result["window_delta"] = _path_delta(sample.start_pose, sample.end_pose, sample.reference)[None]
+    result["window_delta"] = _path_delta(sample.start_pose, sample.end_pose)[None]
     result["window_valid"] = np.ones(1, dtype=bool)
     if result["terminal"].any():
         raise ValueError("completed online windows must not contain terminal transitions")
@@ -134,17 +135,20 @@ class CausalEgoHistory:
                       if p.valid and pose_identity(p) == pose_identity(end) and p.timestamp_ns < end.timestamp_ns), None)
         if prior is None:
             return np.zeros(3, dtype=np.float32), False, age
-        return _path_delta(prior, end, FixedStraightPath.from_initial_pose(prior)), True, age
+        return _path_delta(prior, end), True, age
 
 
 class _CaptureController:
     """Observe the real source action return, before the deployment mapping."""
 
-    def __init__(self, playback):
+    def __init__(self, playback, command_transform=None):
         self.playback = playback
+        self.command_transform = command_transform
         self.source_action = None
 
     def act(self, mapping, command):
+        if self.command_transform is not None:
+            command = self.command_transform(command)
         action = self.playback.act(mapping, command)
         self.source_action = action[0].detach().cpu().numpy().copy()
         return action
@@ -173,7 +177,8 @@ def proprio_tilt_rad(observation: np.ndarray, *, observation_contract: str = "of
 
 def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, window_steps,
                                   residual_amplitude_rad, seed, risk_tilt_limit_rad,
-                                  device=None, playback_deps=None, observation_augmentation=None) -> dict[str, Any]:
+                                  device=None, playback_deps=None, observation_augmentation=None,
+                                  trajectory=None, actor_checkpoint=None, world_model_checkpoint=None) -> dict[str, Any]:
     """Capture one real episode without changing existing B collection or training."""
     from unilab.visualization.playback_distill_sessions import create_fada_playback_session
     from unilab.visualization.playback_sessions import RslRlPlaybackConfig
@@ -195,7 +200,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
     if OmegaConf.select(cfg, "path_following.enabled", default=False) or OmegaConf.select(cfg, "online_adaptation.enabled", default=False):
         raise ValueError("offline capture cannot run simultaneous path following or Tracker adaptation")
     if OmegaConf.select(cfg, "interactive.keyboard", default=False) or OmegaConf.select(cfg, "demo.figure_eight.enabled", default=False):
-        raise ValueError("capture requires an explicit noninteractive straight-path command")
+        raise ValueError("capture requires explicit noninteractive velocity commands")
     raw_pose = OmegaConf.select(cfg, "world_model_collection.pose", default={})
     pose_kwargs = OmegaConf.to_container(raw_pose, resolve=True) if OmegaConf.is_config(raw_pose) else dict(raw_pose)
     pose_config = PoseRuntimeConfig(**pose_kwargs)
@@ -221,6 +226,24 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
         raise FileExistsError(output)
     rng = np.random.default_rng(seed)
     capture = {"query": None, "residual": None}
+    task_config = None if trajectory is None else (trajectory if isinstance(trajectory, TrajectoryConfig) else TrajectoryConfig.from_mapping(trajectory))
+    if actor_checkpoint is not None and (world_model_checkpoint is None or task_config is None):
+        raise ValueError("actor capture requires its WM checkpoint and reference trajectory")
+    if task_config is not None and pose_config.odometry_source != "simulation":
+        raise ValueError("offline reference capture requires simulation truth")
+    actor = rollout = task_reference = None
+    history = CausalEgoHistory()
+    before = None
+    step = 0
+    label_poses = {}
+
+    def command_transform(command):
+        if task_reference is None or before is None:
+            return command
+        measured = label_poses.get(before.timestamp_ns)
+        if measured is None:
+            raise ValueError("reference control requires a current measured pose")
+        return task_reference.state_at(measured).command(command)
 
     def transform(query):
         if query.observation_history.shape[0] != 1:
@@ -229,6 +252,23 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             "observation": query.observation_history[0, -1].detach().cpu().numpy().copy(),
             "command": query.command[0].detach().cpu().numpy().copy(),
         }
+        if actor is not None and task_reference is not None and step % window_steps == 0:
+            if before is None or rollout is None:
+                raise RuntimeError("actor capture lacks its physical decision point")
+            state = task_reference.state_at(label_poses[before.timestamp_ns])
+            count = query.observation_history.shape[1]
+            samples = [history.at(max(0, before.timestamp_ns - (count - 1 - index) * round(query.profile.ctrl_dt * 1e9))) for index in range(count)]
+            parameter = query.command
+            with torch.no_grad():
+                start = rollout.encode_start(
+                    query, errors=state.errors(), previous_residual=capture["previous_residual"],
+                    ego_motion=parameter.new_tensor(np.stack([row[0] for row in samples]))[None],
+                    ego_valid=torch.tensor([[row[1]] for row in samples], device=parameter.device, dtype=torch.bool)[None],
+                    ego_age_s=parameter.new_tensor([[row[2]] for row in samples])[None], path_state=state,
+                )
+                proposed = actor(start.latent.feature(), start.errors, start.command, state.preview()) + capture["residual"]
+                limits = actor.residual_limit_rad29
+                capture["residual"] = proposed.clamp(-limits, limits)
         return compose_joint_position_residual(
             query.planner_future, capture["residual"], ctrl_dt=query.profile.ctrl_dt,
             position_scale=query.preprocessing["term_scale"]["dof_pos"],
@@ -265,7 +305,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                 "preprocessing": dict(spec.preprocessing), "target_joint_names": list(session.env.get_actuated_joint_names()),
                 "target_default_joint_angles": np.asarray(session.env.default_angles).reshape(-1).tolist(),
                 "target_action_scale": np.broadcast_to(np.asarray(session.env.cfg.control_config.action_scale), (29,)).tolist(),
-                "delta_frame": "fixed_straight_path", "delta_units": ["m", "m", "rad"],
+                "delta_frame": MOTION_FRAME, "delta_units": ["m", "m", "rad"],
                 "ego_frame": "previous_measurement_horizontal_heading",
                 "risk_tilt_limit_rad": float(risk_tilt_limit_rad)},
         }
@@ -277,15 +317,29 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             "reference": "initial_physical_pose_never_reanchored", "checkpoint_path": str(resolved),
             "source_config": OmegaConf.to_container(capture_cfg, resolve=True, enum_to_str=True),
         }
+        if task_config is not None:
+            provenance["trajectory"] = asdict(task_config)
+        if actor_checkpoint is not None:
+            from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint
+            from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
+            from unilab.algos.torch.sttt.world_model.checkpoint import load_world_model
+            loaded = load_world_model(world_model_checkpoint, device=device or "cpu", expected_contract=contract)
+            loaded.model.eval().requires_grad_(False)
+            rollout = PlannerTrackerRollout(loaded.model, controller.policy, profile, spec.preprocessing,
+                target_joint_names=contract["source"]["target_joint_names"],
+                target_default_joint_angles=contract["source"]["target_default_joint_angles"],
+                target_action_scale=contract["source"]["target_action_scale"])
+            actor, _ = load_actor_checkpoint(actor_checkpoint, loaded.model, contract, task_config)
+            provenance["actor_checkpoint"] = str(Path(actor_checkpoint).resolve())
+            provenance["world_model_checkpoint"] = str(Path(world_model_checkpoint).resolve())
         writer = SequenceDatasetWriter(output, contract)
         controller.policy.eval().requires_grad_(False)
-        proxy = _CaptureController(controller)
+        proxy = _CaptureController(controller, command_transform if task_config is not None else None)
         session.controller = proxy
         session.set_autoreset(False)
         session.reset()
         poses = create_pose_runtime(session.env, pose_config)
         poses.reset()
-        history = CausalEgoHistory()
         all_receipts = []
         records, controls, label_poses = {}, [], {}
         reference = None
@@ -293,6 +347,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
         terminated = invalidated = reset_crossed = False
         ref_parameter = next(controller.policy.parameters())
         executed = 0
+        capture["previous_residual"] = torch.zeros(1, 29, device=ref_parameter.device, dtype=ref_parameter.dtype)
         for step in range(int(num_steps)):
             before = poses.begin_step()
             if controls and (before.sequence_id != controls[-1].sequence_id or before.timestamp_ns != controls[-1].end_ns):
@@ -301,6 +356,8 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                 augmenter.clear()
                 break
             if step % window_steps == 0:
+                if capture["residual"] is not None:
+                    capture["previous_residual"] = capture["residual"].detach().clone()
                 residual = rng.uniform(-1., 1., (1, 29)) * amplitude
                 capture["residual"] = torch.as_tensor(residual, dtype=ref_parameter.dtype, device=ref_parameter.device)
             if pose_config.odometry_source == "simulation":
@@ -322,8 +379,8 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             if query is None or proxy.source_action is None:
                 raise RuntimeError("real playback did not produce its query/source action")
             command = query["command"]
-            if command.shape != (spec.command_dim,) or command[0] <= 0 or not np.allclose(command[1:3], 0., atol=1e-7, rtol=0):
-                raise ValueError("capture requires a forward straight-path velocity command")
+            if command.shape != (spec.command_dim,) or not np.isfinite(command).all():
+                raise ValueError("capture requires finite checkpoint-shaped velocity commands")
             action = np.asarray(session.env.state.info["current_actions"], dtype=np.float32)
             if action.shape != (1, 29):
                 raise ValueError("current_actions must be actual target-order env-input [1,29]")
@@ -350,6 +407,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             next_obs = controller.project_observation(next_input)[0].detach().cpu().numpy().copy()
             terminated = bool(np.any(session.env.state.terminated | session.env.state.truncated))
             records[step] = {**query, "next_observation": next_obs, "action": action[0].copy(),
+                "residual": capture["residual"][0].detach().cpu().numpy().copy(),
                 "source_action": proxy.source_action, "ego_motion": ego, "ego_valid": ego_valid, "ego_age_s": ego_age,
                 "next_ego_motion": next_ego, "next_ego_valid": next_valid, "next_ego_age_s": next_age,
                 "risk": float(bool(np.any(session.env.state.terminated)) or proprio_tilt_rad(next_obs, observation_contract=spec.observation_contract) > risk_tilt_limit_rad),
@@ -368,16 +426,14 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                 initial = label_poses.get(controls[0].start_ns)
                 if reference is None and initial is not None:
                     reference = FixedStraightPath.from_initial_pose(initial)
+                    if task_config is not None:
+                        task_reference = MeasuredTrajectory(initial, task_config, device=ref_parameter.device, dtype=ref_parameter.dtype)
             if terminated or invalidated:
                 break
         if controls:
             sequence = _record_sequence(controls, records)
             times = sequence["timestamps_ns"]
             if reference is not None:
-                for i, timestamp in enumerate(times):
-                    pose = label_poses.get(int(timestamp))
-                    if pose is not None and pose_identity(pose) == (reference.sequence_id, reference.tracking_epoch, reference.frame_id):
-                        sequence["errors"][i] = reference.errors(pose)
                 starts, ends, deltas = [], [], []
                 for s in range(0, len(controls), int(window_steps)):
                     e = s + int(window_steps)
@@ -385,13 +441,13 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                         break
                     a, b = label_poses.get(int(times[s])), label_poses.get(int(times[e]))
                     if a is not None and b is not None and not sequence["terminal"][s:e].any():
-                        starts.append(s); ends.append(e); deltas.append(_path_delta(a, b, reference))
+                        starts.append(s); ends.append(e); deltas.append(_path_delta(a, b))
                 # Dense labels are allowed only for exact simulation truth.
                 if pose_config.odometry_source == "simulation":
                     for i in range(len(controls)):
                         a, b = label_poses.get(int(times[i])), label_poses.get(int(times[i+1]))
                         if a is not None and b is not None and not sequence["terminal"][i]:
-                            sequence["path_delta"][i] = _path_delta(a, b, reference)
+                            sequence["path_delta"][i] = _path_delta(a, b)
                             sequence["motion_valid"][i] = True
                 sequence["window_start"] = np.asarray(starts, dtype=np.int64)
                 sequence["window_end"] = np.asarray(ends, dtype=np.int64)

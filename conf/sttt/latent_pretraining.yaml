@@ -1,0 +1,25 @@
+defaults:
+  - latent_world_model@wm
+  - latent_actor_pretraining@actor
+  - latent_reference_evaluation@evaluation
+  - _self_
+
+output_dir: null
+policy_checkpoint: null
+profile_path: null  # Omit only for a legacy checkpoint with an embedded source profile.
+device: cpu
+seed: 0
+source_overrides: []  # Physical load/friction settings; measurements remain noiseless.
+refinement_cycles: 2
+refine_wm_updates: 10000
+refine_actor_updates: 5000
+capture:
+  initial: true  # Set false to use wm.data.train_dirs / validation_dirs.
+  initial_train_episodes: 4
+  initial_validation_episodes: 1
+  episodes_per_cycle: 2
+  num_steps: 3000
+  window_steps: 10
+  residual_amplitude_rad: null
+  risk_tilt_limit_rad: null
+

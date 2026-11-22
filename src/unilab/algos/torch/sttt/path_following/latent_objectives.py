@@ -47,17 +47,7 @@ def latent_actor_loss(
     window_steps: int,
     config: LatentCostConfig,
 ) -> dict[str, torch.Tensor]:
-    """Return total and unweighted ``*_loss`` scalar tensors.
-
-    Lateral offset uses all future ticks; actual lateral and forward velocities
-    use summed fixed-path displacements over each complete actor window. The
-    nominal forward velocity is the initial body command projected into the
-    path frame with the initial heading, then detached and held fixed. Residual
-    smoothness penalizes changes per window duration, including the transition
-    from ``start.previous_residual``. Risk is probability integrated in seconds.
-    There is no heading-to-zero, residual-magnitude or survival-discount term:
-    nonzero heading/joint trim is free when it produces the desired motion.
-    """
+    """Five costs, with reference-relative velocities and detached target speed."""
     if isinstance(ctrl_dt, bool) or not math.isfinite(ctrl_dt) or ctrl_dt <= 0:
         raise ValueError("ctrl_dt must be positive and finite")
     if isinstance(window_steps, bool) or not isinstance(window_steps, Integral) or window_steps < 1:
@@ -79,6 +69,7 @@ def latent_actor_loss(
         ("residuals", result.residuals, (batch, windows, 29)),
         ("risk", result.risk, (batch, steps, 1)),
         ("commands", result.commands, (batch, steps, command_dim)),
+        ("target_speed", result.target_speed, (batch, steps)),
         ("start.errors", start.errors, (batch, 2)),
         ("start.command", start.command, (batch, command_dim)),
         ("start.previous_residual", start.previous_residual, (batch, 29)),
@@ -94,10 +85,7 @@ def latent_actor_loss(
     window_delta = delta.reshape(batch, windows, window_steps, 3).sum(dim=2)
     lateral_velocity = window_delta[..., 1] / duration
     forward_velocity = window_delta[..., 0] / duration
-    nominal_forward = (
-        start.command[:, 0] * torch.cos(start.errors[:, 1])
-        - start.command[:, 1] * torch.sin(start.errors[:, 1])
-    ).detach().unsqueeze(1)
+    nominal_forward = result.target_speed.detach().reshape(batch, windows, window_steps).mean(-1)
     previous = torch.cat((start.previous_residual.detach().unsqueeze(1), result.residuals[:, :-1]), dim=1)
     residual_velocity = (result.residuals - previous) / duration
     losses = {

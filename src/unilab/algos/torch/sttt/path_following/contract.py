@@ -13,6 +13,7 @@ from unilab.algos.torch.distill.fada.runtime_policy import FADAFutureQuery
 from unilab.algos.torch.sttt.path_following.reference import (
     FixedStraightPath, measured_window_delta, pose_identity, pose_matrix,
 )
+from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory
 from unilab.algos.torch.sttt.pose_data import ControlInterval, TimedPelvisPose
 
 
@@ -160,7 +161,7 @@ class PathFollowingWindowSample:
     controls: tuple[ControlInterval, ...]
     start_pose: TimedPelvisPose
     end_pose: TimedPelvisPose
-    reference: FixedStraightPath
+    reference: FixedStraightPath | MeasuredTrajectory
     delta: np.ndarray = field(init=False)
     path_errors: np.ndarray = field(init=False)
 
@@ -180,7 +181,7 @@ class PathFollowingWindowSample:
                 or control.transition_id != first.transition_id + index
                 or abs(control.end_ns - control.start_ns - dt_ns) > 1
                 or (index and control.start_ns != controls[index - 1].end_ns)
-                or not np.allclose(control.command, command, rtol=0, atol=1e-7)
+                or (isinstance(self.reference, FixedStraightPath) and not np.allclose(control.command, command, rtol=0, atol=1e-7))
             ):
                 raise ValueError("response window must have contiguous fixed-period controls and one velocity command")
         start, end = _owned_pose(self.start_pose), _owned_pose(self.end_pose)

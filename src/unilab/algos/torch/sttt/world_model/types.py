@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from unilab.algos.torch.sttt.path_following.trajectory import PathState
+
 
 @dataclass(frozen=True)
 class LatentState:
@@ -34,6 +36,7 @@ class RolloutStart:
     errors: torch.Tensor
     command: torch.Tensor
     previous_residual: torch.Tensor
+    path_state: PathState | None = None
 
     def __post_init__(self) -> None:
         obs = self.observation_history
@@ -55,3 +58,7 @@ class RolloutStart:
             raise ValueError("rollout requires a current valid observation on the history device")
         if self.latent.belief.shape[0] != batch or self.latent.state.shape[0] != batch:
             raise ValueError("rollout latent and history batches differ")
+        if self.path_state is not None:
+            pose = self.path_state.pose
+            if pose.shape != (batch, 3) or pose.device != obs.device or pose.dtype != obs.dtype:
+                raise ValueError("reference path state must match the rollout batch/device/dtype")

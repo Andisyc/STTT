@@ -29,6 +29,7 @@ from unilab.algos.torch.sttt.path_following.response_probe import (
 )
 from unilab.algos.torch.sttt.pose_data import ReceivedPose, TimedPelvisPose
 from unilab.algos.torch.sttt.world_model.checkpoint import load_world_model
+from unilab.algos.torch.sttt.world_model.motion import MOTION_FRAME, motion_prefix
 from unilab.algos.torch.sttt.world_model.sequence_collection import CausalEgoHistory, _path_delta
 from unilab.visualization.playback_distill_sessions import create_fada_playback_session
 from unilab.visualization.playback_sessions import RslRlPlaybackConfig
@@ -45,7 +46,7 @@ class _HeldResidual(nn.Module):
         super().__init__()
         self.register_buffer("residual", residual.detach().clone())
 
-    def forward(self, feature, _errors, _command):
+    def forward(self, feature, _errors, _command, _preview):
         return self.residual.expand(feature.shape[0], -1)
 
 
@@ -111,7 +112,8 @@ class _Intervention:
                         if not np.array_equal(value, self.canonical[key]):
                             raise ValueError(f"probe start {key} differs from the canonical branch")
                 self.prediction = rollout.run(start, _HeldResidual(self.residual),
-                    window_steps=self.loaded.contract["data"]["window_steps"], horizon_windows=self.horizon)
+                    window_steps=self.loaded.contract["data"]["window_steps"], horizon_windows=self.horizon,
+                    update_reference_commands=False)
         residual = self.residual.to(query.planner_future) if self.step >= self.warmup else torch.zeros_like(self.residual).to(query.planner_future)
         scales = query.preprocessing["term_scale"]
         return compose_joint_position_residual(query.planner_future, residual, ctrl_dt=query.profile.ctrl_dt,
@@ -128,7 +130,7 @@ def _bind(loaded, controller, env, policy_identity) -> PlannerTrackerRollout:
         raise ValueError("probe requires a torch policy and checkpoint-bound preprocessing")
     expected = {
         "checkpoint_sha256": policy_identity["sha256"], "source_profile": asdict(profile),
-        "preprocessing": spec.preprocessing, "delta_frame": "fixed_straight_path",
+        "preprocessing": spec.preprocessing, "delta_frame": MOTION_FRAME,
         "delta_units": ["m", "m", "rad"], "ego_frame": "previous_measurement_horizontal_heading",
         "target_joint_names": list(env.get_actuated_joint_names()),
         "target_default_joint_angles": np.asarray(env.default_angles).reshape(-1).tolist(),
@@ -213,11 +215,11 @@ def _run_branch(name, residual, cfg, *, root, output, seed, warmup, horizon, loa
         predicted_actions = intervention.prediction.actions[0].cpu().numpy()
         if not np.allclose(predicted_actions[0], actions[warmup], rtol=1e-6, atol=1e-6):
             raise ValueError("first imagined action differs from actual Planner–Tracker execution")
-        delta = intervention.prediction.path_delta[0].sum(0).cpu().numpy().copy()
+        delta = motion_prefix(intervention.prediction.body_delta)[0, -1].cpu().numpy().copy()
         delta[2] = math.atan2(math.sin(delta[2]), math.cos(delta[2]))
         if not np.isfinite(delta).all():
             raise ValueError("WM produced non-finite probe motion")
-        result.update(complete=True, delta_m_m_rad=_path_delta(first_probe_pose, pose, intervention.reference).tolist(),
+        result.update(complete=True, delta_m_m_rad=_path_delta(first_probe_pose, pose).tolist(),
             predicted_delta_m_m_rad=delta.tolist(), context_sha256=hashlib.sha256(intervention.context.numpy().tobytes()).hexdigest())
         start.update(context=intervention.context.numpy().copy(), **intervention.encoded)
     except Exception as error:
@@ -236,6 +238,7 @@ def _run_branch(name, residual, cfg, *, root, output, seed, warmup, horizon, loa
             arrays.update(predicted_actions=intervention.prediction.actions[0].cpu().numpy(),
                           predicted_source_actions=intervention.prediction.source_actions[0].cpu().numpy(),
                           predicted_path_delta=intervention.prediction.path_delta[0].cpu().numpy())
+            arrays["predicted_body_delta"] = intervention.prediction.body_delta[0].cpu().numpy()
         np.savez_compressed(output / f"{name}.npz", **arrays)
     return result, start, np.asarray(poses[warmup:])
 

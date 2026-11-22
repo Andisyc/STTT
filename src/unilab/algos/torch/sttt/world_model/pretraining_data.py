@@ -28,9 +28,9 @@ class PretrainingBatch:
     history_ego_age_s: torch.Tensor
     sequence: dict[str, torch.Tensor]
     previous_action: torch.Tensor
+    previous_residual: torch.Tensor
     observation_mask: torch.Tensor
     transition_mask: torch.Tensor
-    heading_valid: torch.Tensor
     origins: tuple[tuple[str, int], ...]
 
 
@@ -204,9 +204,9 @@ class PretrainingSequenceSampler:
         history_ego_valid = np.zeros((batch_size, history, 1), dtype=np.bool_)
         history_ego_age_s = np.zeros((batch_size, history, 1), dtype=np.float32)
         previous_action = np.zeros((batch_size, 29), dtype=np.float32)
+        previous_residual = np.zeros((batch_size, 29), dtype=np.float32)
         observation_mask = np.zeros((batch_size, horizon + 1), dtype=np.bool_)
         transition_mask = np.zeros((batch_size, horizon), dtype=np.bool_)
-        heading_valid = np.zeros(batch_size, dtype=np.bool_)
         origins: list[tuple[str, int]] = []
         for row, selected_index in enumerate(selected):
             shard_index = bisect_right(self._ends, int(selected_index))
@@ -224,6 +224,7 @@ class PretrainingSequenceSampler:
             transition_mask[row, :transitions] = True
             if origin:
                 previous_action[row] = raw["actions"][origin - 1]
+                previous_residual[row] = raw["residuals"][origin - 1]
             history_start = max(0, origin - history)
             history_count = origin - history_start
             if history_count:
@@ -252,16 +253,6 @@ class PretrainingSequenceSampler:
                 sequence["window_end"][row, slot] = int(raw["window_end"][window]) - origin
                 sequence["window_delta"][row, slot] = raw["window_delta"][window]
                 sequence["window_valid"][row, slot] = raw["window_valid"][window]
-            # Zero errors alone do not establish a known heading. Actual dense
-            # endpoints or a valid window endpoint provide the source evidence.
-            known_window_endpoint = raw["window_valid"] & (
-                (raw["window_start"] == origin) | (raw["window_end"] == origin)
-            )
-            heading_valid[row] = bool(
-                raw["motion_valid"][origin]
-                or (origin > 0 and raw["motion_valid"][origin - 1])
-                or np.any(known_window_endpoint)
-            )
             origins.append((str(shard.path), origin))
         as_tensor = lambda array: torch.as_tensor(array, device=device)
         return PretrainingBatch(
@@ -273,9 +264,9 @@ class PretrainingSequenceSampler:
             history_ego_age_s=as_tensor(history_ego_age_s),
             sequence={key: as_tensor(value) for key, value in sequence.items()},
             previous_action=as_tensor(previous_action),
+            previous_residual=as_tensor(previous_residual),
             observation_mask=as_tensor(observation_mask),
             transition_mask=as_tensor(transition_mask),
-            heading_valid=as_tensor(heading_valid),
             origins=tuple(origins),
         )
 

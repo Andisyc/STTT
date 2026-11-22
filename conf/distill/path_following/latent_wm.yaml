@@ -1,6 +1,7 @@
 enabled: true
 mode: latent_wm
 checkpoint_path: null
+pretrained_actor_checkpoint: null
 learning_config_path: conf/sttt/latent_path_following_online.yaml
 learning: {}
 resume_checkpoint_path: null

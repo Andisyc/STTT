@@ -15,6 +15,18 @@ online:
   max_grad_norm: 10.0
   adapt_world_model: true
   risk_threshold: 0.5
+  adapt_actor: true
+  trajectory:
+    kind: straight
+    length_m: 30.0
+    radius_m: 2.0
+    speed_m_s: 0.4
+    samples: 1024
+    preview_points: 8
+    preview_spacing_m: 0.15
+    projection_window_m: 0.5
+    initial_lateral_m: 0.0
+    initial_heading_rad: 0.0
 costs:
   lateral_weight: 1.0
   lateral_velocity_weight: 1.0

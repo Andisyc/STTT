@@ -11,11 +11,12 @@ from typing import Any
 import torch
 
 from .model import LatentWorldModel, WorldModelConfig
+from .motion import MOTION_FRAME
 from .sequence_data import _contract
 from .reference import SOURCE
 
 FORMAT = "sttt_latent_world_model"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -45,8 +46,8 @@ def canonical_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         profile = LegacyFADAPlaybackProfile.from_source(source["source_profile"].get("source_profile"))
         if json.loads(json.dumps(asdict(profile), allow_nan=False)) != source["source_profile"] or profile.preprocessing != source["preprocessing"]:
             raise ValueError("legacy WM source profile/preprocessing metadata disagree")
-    if source["delta_frame"] != "fixed_straight_path" or source["delta_units"] != ["m", "m", "rad"]:
-        raise ValueError("world-model motion labels must use fixed straight path meters/radians")
+    if source["delta_frame"] != MOTION_FRAME or source["delta_units"] != ["m", "m", "rad"]:
+        raise ValueError("world-model motion labels must use control-start heading meters/radians")
     if not isinstance(source["checkpoint_sha256"], str) or not source["checkpoint_sha256"] or len(source["target_joint_names"]) != 29 or len(source["target_default_joint_angles"]) != 29:
         raise ValueError("world-model source checkpoint/joint mapping is incomplete")
     return canonical

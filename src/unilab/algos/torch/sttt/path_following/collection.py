@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -13,6 +14,7 @@ from unilab.algos.torch.sttt.path_following.contract import (
 )
 from unilab.algos.torch.sttt.path_following.intervention import compose_joint_position_residual
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath, pose_identity
+from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory
 from unilab.algos.torch.sttt.path_following.window import ConstantResidualWindow
 from unilab.algos.torch.sttt.pose_data import AlignedPoseInterval, ControlInterval, PoseRuntimeUpdate
 from unilab.base.backend.sensors import SensorClock
@@ -37,12 +39,15 @@ class WindowCollector:
     loss. Returned samples and dropped-window counts survive collector.close().
     """
 
-    def __init__(self, window_steps: int, *, max_alignment_age_ns: int) -> None:
+    def __init__(self, window_steps: int, *, max_alignment_age_ns: int,
+                 reference_factory: Callable | None = None, allow_command_changes: bool = False) -> None:
         self.window = ConstantResidualWindow(window_steps)
         self.max_alignment_age_ns = _integer(max_alignment_age_ns, "max_alignment_age_ns")
         if self.max_alignment_age_ns < 1:
             raise ValueError("max_alignment_age_ns must be positive")
-        self.reference: FixedStraightPath | None = None
+        self.reference: FixedStraightPath | MeasuredTrajectory | None = None
+        self.reference_factory = reference_factory or FixedStraightPath.from_initial_pose
+        self.allow_command_changes = allow_command_changes
         self.completed_windows = 0
         self.dropped_windows: Counter[str] = Counter()
         self.halted = False
@@ -132,7 +137,7 @@ class WindowCollector:
         active = self._active
         active.controls.append(control)
         self._owners[control.transition_id] = active
-        if not np.array_equal(control.command, active.controls[0].command):
+        if not self.allow_command_changes and not np.array_equal(control.command, active.controls[0].command):
             active.invalid_reason = "command_changed"
         self._last_end_ns = control.end_ns
         self._next_transition += 1
@@ -191,10 +196,13 @@ class WindowCollector:
             if transition != 0 or self._task_clock is None or start.timestamp_ns != self._task_clock.timestamp_ns:
                 self._stop("initial_pose_missing")
                 return
-            self.reference = FixedStraightPath.from_initial_pose(start)
+            self.reference = self.reference_factory(start)
         if pose_identity(start) != (self.reference.sequence_id, self.reference.tracking_epoch, self.reference.frame_id):
             self._stop("localization_changed")
             return
+        if isinstance(self.reference, MeasuredTrajectory):
+            self.reference.state_at(start)
+            self.reference.state_at(end)
         owner.aligned[transition] = aligned
 
     def _remove(self, evidence: _Evidence, reason: str | None = None) -> None:

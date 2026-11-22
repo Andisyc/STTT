@@ -70,7 +70,7 @@ class LatentWorldModel(nn.Module):
         self.posterior_net = RSSMPosterior(cfg.belief_dim, cfg.embed_dim, cfg.hidden_dim, cfg.stoch_groups, cfg.stoch_classes, cfg.posterior_layers, cfg.norm_eps)
         groups = (3, 29, 29, 3) if cfg.obs_dim == 64 else (3, 3, 29, 29, 2)
         self.proprio_decoder = VectorDecoder(self.feature_dim, groups, cfg.hidden_dim, cfg.decoder_layers, cfg.norm_eps)
-        self.motion_head = MLP(self.feature_dim + cfg.action_dim + 2, 3, cfg.hidden_dim, cfg.head_layers, cfg.norm_eps)
+        self.motion_head = MLP(self.feature_dim + cfg.action_dim, 3, cfg.hidden_dim, cfg.head_layers, cfg.norm_eps)
         self.risk_head = MLP(self.feature_dim + cfg.action_dim, 1, cfg.hidden_dim, cfg.head_layers, cfg.norm_eps)
 
     @property
@@ -131,10 +131,9 @@ class LatentWorldModel(nn.Module):
     def decode(self, latent: LatentState) -> torch.Tensor:
         return self.proprio_decoder(latent.feature())
 
-    def motion(self, latent: LatentState, heading: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        if heading.shape != (*latent.belief.shape[:-1], 1):
-            raise ValueError("motion heading must have shape [batch,1]")
-        raw = self.motion_head(latent.feature(), self.normalize_action(action), heading.sin(), heading.cos())
+    def motion(self, latent: LatentState, action: torch.Tensor) -> torch.Tensor:
+        """One control interval in its starting horizontal body-heading frame."""
+        raw = self.motion_head(latent.feature(), self.normalize_action(action))
         return torch.cat((raw[..., :2], torch.atan2(raw[..., 2:].sin(), raw[..., 2:].cos())), -1)
 
     def risk(self, latent: LatentState, action: torch.Tensor) -> torch.Tensor:

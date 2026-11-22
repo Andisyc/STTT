@@ -9,10 +9,12 @@ from typing import Any
 import numpy as np
 import torch
 
-FORMAT = "sttt_world_model_sequences_v1"
+from .motion import MOTION_FRAME, motion_prefix
+
+FORMAT = "sttt_world_model_sequences_v2"
 _STATE = {"observations": (64,), "is_first": (), "ego_motion": (3,), "ego_valid": (1,),
-          "ego_age_s": (1,), "errors": (2,), "timestamps_ns": ()}
-_TRANSITION = {"actions": (29,), "source_actions": (29,), "commands": (7,),
+          "ego_age_s": (1,), "timestamps_ns": ()}
+_TRANSITION = {"actions": (29,), "source_actions": (29,), "commands": (7,), "residuals": (29,),
                "path_delta": (3,), "motion_valid": (), "risk": (1,),
                "risk_valid": (), "terminal": ()}
 _WINDOW = {"window_start": (), "window_end": (), "window_delta": (3,), "window_valid": ()}
@@ -73,7 +75,7 @@ def _arrays(sequence: Mapping[str, Any], contract: Mapping[str, Any] | None = No
             raise ValueError(f"{key} headings must be wrapped to [-pi,pi]")
     for s, e, delta, valid in zip(start, end, result["window_delta"], result["window_valid"]):
         if valid and result["motion_valid"][s:e].all():
-            dense = result["path_delta"][s:e].sum(axis=0, dtype=np.float64)
+            dense = motion_prefix(torch.from_numpy(result["path_delta"][s:e].astype(np.float64)))[-1].numpy()
             dense[2] = (dense[2] + np.pi) % (2*np.pi) - np.pi
             if not np.allclose(dense, delta, atol=2e-5, rtol=1e-4):
                 raise ValueError("window label disagrees with its valid dense physical labels")
@@ -101,6 +103,9 @@ def _contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported observation/command contract")
     if data.get("action_dim", 29) != 29:
         raise ValueError("contract.data.action_dim must be 29")
+    source = result.get("source", {})
+    if "delta_frame" in source and source["delta_frame"] != MOTION_FRAME:
+        raise ValueError("motion data must use each control interval's starting heading frame")
     return result
 
 

@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -23,6 +23,7 @@ from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostC
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.online_learning import ActorUpdateContext
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath
+from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory, TrajectoryConfig
 from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel
 from unilab.algos.torch.sttt.world_model.losses import world_model_loss
 from unilab.algos.torch.sttt.world_model.model import LatentWorldModel, WorldModelConfig
@@ -61,6 +62,8 @@ class LatentOnlineConfig:
     max_grad_norm: float = 10.0
     adapt_world_model: bool = True
     risk_threshold: float = 0.5
+    trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
+    adapt_actor: bool = True
 
     def __post_init__(self) -> None:
         if len(self.residual_limit_rad) != 29:
@@ -83,6 +86,8 @@ class LatentOnlineConfig:
             raise ValueError("seed must be a nonnegative integer")
         if not isinstance(self.adapt_world_model, bool):
             raise ValueError("adapt_world_model must be boolean")
+        if not isinstance(self.adapt_actor, bool) or not isinstance(self.trajectory, TrajectoryConfig):
+            raise ValueError("adapt_actor/trajectory have invalid types")
         if isinstance(self.risk_threshold, bool) or not math.isfinite(self.risk_threshold) or not 0 < self.risk_threshold < 1:
             raise ValueError("risk_threshold must be a probability in (0,1)")
 
@@ -94,6 +99,8 @@ class LatentOnlineConfig:
         raw["residual_limit_rad"] = tuple(raw["residual_limit_rad"])
         if "actor_hidden_dims" in raw:
             raw["actor_hidden_dims"] = tuple(raw["actor_hidden_dims"])
+        if "trajectory" in raw:
+            raw["trajectory"] = TrajectoryConfig.from_mapping(raw["trajectory"])
         return cls(**raw)
 
 
@@ -125,7 +132,7 @@ def _join_windows(sequences: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Join contiguous windows without inserting artificial recurrent resets."""
     if not sequences:
         raise ValueError("identification requires at least one complete window")
-    observation_keys = {"observations", "ego_motion", "ego_valid", "ego_age_s", "errors", "is_first", "timestamps_ns"}
+    observation_keys = {"observations", "ego_motion", "ego_valid", "ego_age_s", "is_first", "timestamps_ns"}
     window_keys = {"window_start", "window_end", "window_delta", "window_valid"}
     result: dict[str, Any] = {}
     for key in sequences[0]:
@@ -181,13 +188,14 @@ class LatentPathFollowingUpdater:
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(config.seed)
             self.actor = LatentResidualActor(self.model.feature_dim, config.actor_hidden_dims, config.residual_limit_rad,
-                                              command_dim=rollout.spec.command_dim).to(parameter)
+                                              command_dim=rollout.spec.command_dim,
+                                              preview_points=config.trajectory.preview_points).to(parameter)
         self.model_optimizer = torch.optim.AdamW(self.adapters, lr=config.wm_learning_rate, weight_decay=config.lora_weight_decay)
         self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), lr=config.actor_learning_rate, weight_decay=0.0)
         self.replay: deque[tuple[Any, dict[str, Any]]] = deque(maxlen=config.replay_capacity_windows)
         self.records: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self.actor_updates = self.response_updates = self.zero_calibration_windows = 0
-        self._reference: FixedStraightPath | None = None
+        self._reference: FixedStraightPath | MeasuredTrajectory | None = None
         self._last_window_id = -1
         self.previous_residual = torch.zeros(1, 29, device=parameter.device, dtype=parameter.dtype)
         self.ego_history: Any = None
@@ -246,12 +254,15 @@ class LatentPathFollowingUpdater:
                 ego_motion=torch.as_tensor(ego, device=parameter.device, dtype=parameter.dtype).unsqueeze(0),
                 ego_valid=torch.as_tensor(valid, device=parameter.device).unsqueeze(0),
                 ego_age_s=torch.as_tensor(age, device=parameter.device, dtype=parameter.dtype).unsqueeze(0),
+                path_state=decision.path_state,
             )
 
     def candidate(self, decision: ActorUpdateContext) -> torch.Tensor:
         start = self.start_from_decision(decision)
         with torch.no_grad():
-            return self.actor(start.latent.feature(), start.errors, start.command)
+            if start.path_state is None:
+                raise ValueError("A requires the current reference preview")
+            return self.actor(start.latent.feature(), start.errors, start.command, start.path_state.preview())
 
     def _recent_batch(self) -> dict[str, torch.Tensor] | None:
         count = self.config.replay_sequence_windows
@@ -301,6 +312,8 @@ class LatentPathFollowingUpdater:
                 self.model_optimizer.zero_grad(set_to_none=True)
                 self.model.eval()
         reason = "calibration" if not self.calibration_complete else ("missing_context" if actor_context is None else None)
+        if not self.config.adapt_actor:
+            reason = "frozen_actor"
         if reason is None:
             assert actor_context is not None
             if actor_context.reference != self._reference:
@@ -339,7 +352,7 @@ class LatentPathFollowingUpdater:
                     name = target + "." + name[len(target + ".base."):]
                     break
             base_state[name] = value.detach().cpu()
-        payload = {"format": "sttt_latent_path_following_online", "schema_version": 1,
+        payload = {"format": "sttt_latent_path_following_online", "schema_version": 2,
                    "model_config": asdict(self.model.config), "contract": self.contract,
                    "base_state": base_state, "adapters": adapters, "adapter_targets": list(self.adapter_targets),
                    "actor": self.actor.state_dict(), "config": asdict(self.config), "costs": asdict(self.costs),
@@ -353,7 +366,7 @@ class LatentPathFollowingUpdater:
     @classmethod
     def restore(cls, path: str | Path, rollout_factory: Any, *, device: str = "cpu", expected_contract: Mapping[str, Any] | None = None) -> LatentPathFollowingUpdater:
         payload = torch.load(path, map_location=device, weights_only=True)
-        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 1:
+        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 2:
             raise ValueError("expected an independent latent online checkpoint")
         if expected_contract is not None and payload["contract"] != dict(expected_contract):
             raise ValueError("online checkpoint control contract differs from deployment")

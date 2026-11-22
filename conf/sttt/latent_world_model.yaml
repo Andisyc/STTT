@@ -32,6 +32,7 @@ training:
   weight_decay: 0.000001
   gradient_clip_norm: 100.0
   resume_checkpoint: null
+  initial_checkpoint: null  # Warm start on newly collected data, with a fresh optimizer.
   loss:
     free_nats: 1.0
     kl_scale: 1.0

@@ -12,6 +12,8 @@ from torch import nn
 class LatentResidualActor(nn.Module):
     """Emit bounded radians in source joint order, initially exactly zero."""
 
+    residual_limit_rad29: torch.Tensor
+
     def __init__(
         self,
         feature_dim: int,
@@ -20,6 +22,7 @@ class LatentResidualActor(nn.Module):
         *,
         hidden_init_std: float = .01,
         command_dim: int = 7,
+        preview_points: int = 8,
     ) -> None:
         super().__init__()
         widths = tuple(hidden_dims)
@@ -31,6 +34,9 @@ class LatentResidualActor(nn.Module):
         if type(command_dim) is not int or command_dim not in (3, 7):
             raise ValueError("latent actor requires an admitted 3D or 7D command")
         self.command_dim = command_dim
+        if type(preview_points) is not int or preview_points < 2:
+            raise ValueError("latent actor requires at least two reference preview points")
+        self.preview_points = preview_points
         if isinstance(hidden_init_std, bool) or not math.isfinite(hidden_init_std) or hidden_init_std <= 0:
             raise ValueError("hidden_init_std must be positive and finite")
         limits = torch.as_tensor(residual_limit_rad29, dtype=torch.float32).detach().clone()
@@ -40,7 +46,7 @@ class LatentResidualActor(nn.Module):
         self.hidden_dims = tuple(int(width) for width in widths)
         self.register_buffer("residual_limit_rad29", limits)
         layers: list[nn.Module] = []
-        previous = self.feature_dim + 2 + self.command_dim
+        previous = self.feature_dim + 2 + self.command_dim + 5 * self.preview_points
         for width in self.hidden_dims:
             layer = nn.Linear(previous, width)
             nn.init.normal_(layer.weight, std=hidden_init_std)
@@ -53,15 +59,17 @@ class LatentResidualActor(nn.Module):
         layers.append(output)
         self.net = nn.Sequential(*layers)
 
-    def forward(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
+                preview: torch.Tensor) -> torch.Tensor:
         if (
             features.ndim != 2 or features.shape[0] < 1 or features.shape[1] != self.feature_dim
             or errors.shape != (features.shape[0], 2) or command.shape != (features.shape[0], self.command_dim)
+            or preview.shape != (features.shape[0], self.preview_points, 5)
         ):
             raise ValueError("latent actor feature/error/command shapes differ from its execution contract")
-        for value in (features, errors, command):
+        for value in (features, errors, command, preview):
             if value.dtype != self.residual_limit_rad29.dtype or value.device != self.residual_limit_rad29.device:
                 raise ValueError("latent actor inputs must match its floating-point dtype and device")
             if not bool(torch.isfinite(value).all()):
                 raise ValueError("latent actor inputs must be finite")
-        return torch.tanh(self.net(torch.cat((features, errors, command), dim=-1))) * self.residual_limit_rad29
+        return torch.tanh(self.net(torch.cat((features, errors, command, preview.flatten(1)), dim=-1))) * self.residual_limit_rad29

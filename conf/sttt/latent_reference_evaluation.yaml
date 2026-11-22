@@ -1,0 +1,7 @@
+enabled: true
+num_steps: 1500
+seeds: [10000]
+trajectories:
+  - {kind: straight, speed_m_s: 0.35, initial_lateral_m: 0.15}
+  - {kind: circle, radius_m: 2.3, speed_m_s: 0.35, initial_lateral_m: 0.15}
+  - {kind: figure_eight, radius_m: 2.3, speed_m_s: 0.35, initial_lateral_m: 0.15}

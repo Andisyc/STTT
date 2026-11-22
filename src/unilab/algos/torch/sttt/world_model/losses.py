@@ -9,6 +9,7 @@ import torch
 from torch.nn import functional as F
 
 from .model import LatentWorldModel
+from .motion import window_motion
 from .reference import categorical_probs
 from .types import LatentState
 
@@ -45,15 +46,8 @@ def world_model_loss(
     initial_previous_action: torch.Tensor | None = None,
     observation_mask: torch.Tensor | None = None,
     transition_mask: torch.Tensor | None = None,
-    heading_valid: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """No actor/critic; every recurrent transition consumes the logged ENV action.
-
-    Balanced one-step KL detaches each target distribution. Multi-step KL uses
-    detached posterior targets. The open prior never receives future proprio or
-    heading labels; its heading is advanced only by its own predicted increments.
-    Missing dense SLAM labels do not disable valid window supervision.
-    """
+    """Fit logged ENV actions, with step-local motion and composed window targets."""
     weights = (free_nats, kl_scale, reconstruction_scale, motion_scale, risk_scale, overshoot_scale, prior_reconstruction_scale, window_scale)
     if any(not math.isfinite(value) or value < 0 for value in weights) or not 0 <= kl_balance <= 1:
         raise ValueError("loss weights must be finite nonnegative and kl_balance in [0,1]")
@@ -68,11 +62,9 @@ def world_model_loss(
         raise ValueError("invalid reset/terminal masks")
     observation_mask = torch.ones_like(first) if observation_mask is None else observation_mask
     transition_mask = torch.ones_like(terminal) if transition_mask is None else transition_mask
-    heading_valid = torch.ones(size, dtype=torch.bool, device=actions.device) if heading_valid is None else heading_valid
     for name, value, shape in (
         ("observation_mask", observation_mask, (size, steps + 1)),
         ("transition_mask", transition_mask, (size, steps)),
-        ("heading_valid", heading_valid, (size,)),
     ):
         if value.shape != shape or value.dtype != torch.bool or value.device != actions.device:
             raise ValueError(f"{name} must be boolean {shape} on the sequence device")
@@ -108,7 +100,6 @@ def world_model_loss(
     kl = _masked_mean(kl_balance * dynamics_kl.clamp_min(free_nats) + (1 - kl_balance) * representation_kl.clamp_min(free_nats), observation_valid)
 
     latent = posterior_states[0]
-    heading = batch["errors"][:, 0, 1:2].detach()
     predicted_motion, predicted_risk, predicted_observations, open_logits = [], [], [], []
     for index in range(steps):
         # A reset starts a new independent segment, never a bridge through it.
@@ -116,18 +107,16 @@ def world_model_loss(
             reset = first[:, index] | terminal[:, index - 1]
             origin = posterior_states[index]
             latent = LatentState(torch.where(reset[:, None, None], origin.state, latent.state), torch.where(reset[:, None], origin.belief, latent.belief))
-            heading = torch.where(reset[:, None], batch["errors"][:, index, 1:2].detach(), heading)
-        motion = model.motion(latent, heading, actions[:, index])
+        motion = model.motion(latent, actions[:, index])
         predicted_motion.append(motion)
         predicted_risk.append(model.risk(latent, actions[:, index]))
-        heading = torch.atan2((heading + motion[:, 2:]).sin(), (heading + motion[:, 2:]).cos())
         latent, logits = model.prior(latent, actions[:, index])
         open_logits.append(logits)
         predicted_observations.append(model.decode(latent))
     motion_prediction = torch.stack(predicted_motion, 1)
     prior_reconstruction = _masked_mean((torch.stack(predicted_observations, 1) - observations[:, 1:].detach()).square().mean(-1), transition_valid)
     overshoot = _masked_mean(_categorical_kl(posterior_logits[:, 1:].detach(), torch.stack(open_logits, 1), model.config.unimix).clamp_min(free_nats), transition_valid)
-    motion_mask = batch["motion_valid"].bool() & transition_valid & heading_valid[:, None]
+    motion_mask = batch["motion_valid"].bool() & transition_valid
     motion_target = torch.where(motion_mask[..., None], batch["path_delta"], 0.)
     motion_loss = _masked_mean(_motion_error(motion_prediction, motion_target), motion_mask)
 
@@ -139,11 +128,10 @@ def world_model_loss(
     if bool((label_valid & ~bounds).any()):
         raise ValueError("valid window endpoints must lie inside the observation sequence")
     safe_start, safe_end = start.clamp(0, steps), end.clamp(0, steps)
-    cumulative = torch.cat((motion_prediction.new_zeros(size, 1, 3), motion_prediction.cumsum(1)), 1)
-    window_prediction = cumulative.gather(1, safe_end[..., None].expand(-1, -1, 3)) - cumulative.gather(1, safe_start[..., None].expand(-1, -1, 3))
+    window_prediction = window_motion(motion_prediction, safe_start, safe_end)
     invalid_prefix = torch.cat((torch.zeros(size, 1, device=actions.device, dtype=torch.long), (~transition_valid).long().cumsum(1)), 1)
     crosses_reset = invalid_prefix.gather(1, safe_end) != invalid_prefix.gather(1, safe_start)
-    window_mask = label_valid & bounds & ~crosses_reset & heading_valid[:, None]
+    window_mask = label_valid & bounds & ~crosses_reset
     window_target = torch.where(window_mask[..., None], batch["window_delta"], 0.)
     window_loss = _masked_mean(_motion_error(window_prediction, window_target), window_mask)
     window_xy_error = (window_prediction[..., :2] - window_target[..., :2]).square().sum(-1)
@@ -177,5 +165,5 @@ def pretraining_loss(model: LatentWorldModel, batch: PretrainingBatch, **loss_co
     return world_model_loss(
         model, batch.sequence, initial_state=state.detach(), initial_previous_action=batch.previous_action,
         observation_mask=batch.observation_mask, transition_mask=batch.transition_mask,
-        heading_valid=batch.heading_valid, **loss_config,
+        **loss_config,
     )

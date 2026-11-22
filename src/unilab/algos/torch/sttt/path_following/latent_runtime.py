@@ -13,10 +13,14 @@ import torch
 from omegaconf import OmegaConf
 
 from unilab.algos.torch.sttt.odometry_runtime import create_pose_runtime
+from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint
+from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
 from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.runtime import PathFollowingController, PathFollowingRuntimeConfig
+from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory
 from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel, load_world_model
+from unilab.algos.torch.sttt.world_model.motion import MOTION_FRAME
 from unilab.algos.torch.sttt.world_model.online import LatentOnlineConfig, LatentPathFollowingUpdater
 from unilab.algos.torch.sttt.world_model.sequence_collection import CausalEgoHistory, proprio_tilt_rad
 from unilab.algos.torch.sttt.world_model.types import LatentState
@@ -41,6 +45,7 @@ class LatentRuntimeSetup:
     runtime: PathFollowingRuntimeConfig
     resume_checkpoint_path: Path | None
     save_checkpoint_path: Path | None
+    pretrained_actor: LatentResidualActor | None = None
 
     def bind(self, playback: Any, env: Any) -> LatentPathFollowingUpdater:
         source = self.loaded.contract["source"]
@@ -68,7 +73,10 @@ class LatentRuntimeSetup:
             if updater.config != self.learning or updater.costs != self.costs:
                 raise ValueError("resume configuration differs from the saved online learning contract")
             return updater
-        return LatentPathFollowingUpdater(self.loaded, rollout_factory(self.loaded.model), self.learning, self.costs)
+        updater = LatentPathFollowingUpdater(self.loaded, rollout_factory(self.loaded.model), self.learning, self.costs)
+        if self.pretrained_actor is not None:
+            updater.actor.load_state_dict(self.pretrained_actor.state_dict(), strict=True)
+        return updater
 
 
 def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, root_dir: str | Path,
@@ -76,7 +84,7 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
                                    spec: Any, device: str) -> LatentRuntimeSetup:
     values = OmegaConf.to_container(node, resolve=True) if OmegaConf.is_config(node) else dict(node)
     required = {"enabled", "mode", "checkpoint_path", "learning_config_path", "learning", "update_interval_steps",
-                "max_cached_queries", "max_pending_windows", "max_trace_records", "pose", "resume_checkpoint_path", "save_checkpoint_path"}
+                "max_cached_queries", "max_pending_windows", "max_trace_records", "pose", "resume_checkpoint_path", "save_checkpoint_path", "pretrained_actor_checkpoint"}
     if not isinstance(values, dict) or set(values) != required or values["enabled"] is not True or values["mode"] != "latent_wm":
         raise ValueError("use path_following=latent_wm for the explicit latent runtime")
     if playback_cfg.action_mode != "policy" or int(playback_cfg.num_envs) != 1 or playback_cfg.keyboard:
@@ -87,7 +95,7 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
         if OmegaConf.select(cfg, path, default=False):
             raise ValueError(f"disable {path}; latent adaptation owns WM/A and keeps Tracker frozen")
     if OmegaConf.select(cfg, "env.commands.resampling_time", default=None) != 0:
-        raise ValueError("latent path following requires an explicit fixed velocity command")
+        raise ValueError("latent path following requires resampling_time=0; the reference supplies nominal commands")
     root = Path(root_dir)
 
     def resolve(value: Any, *, optional: bool = False) -> Path | None:
@@ -106,7 +114,7 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
         digest = _digest(handle)
     source, data = loaded.contract["source"], loaded.contract["data"]
     expected_source = {"checkpoint_sha256": digest, "source_profile": _canonical(asdict(profile)),
-                       "preprocessing": _canonical(dict(spec.preprocessing)), "delta_frame": "fixed_straight_path",
+                       "preprocessing": _canonical(dict(spec.preprocessing)), "delta_frame": MOTION_FRAME,
                        "delta_units": ["m", "m", "rad"], "ego_frame": "previous_measurement_horizontal_heading"}
     for name, expected in expected_source.items():
         if _canonical(source.get(name)) != expected:
@@ -133,10 +141,20 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
         raise ValueError("latent learning configuration requires online and costs sections")
     save_path = resolve(values["save_checkpoint_path"], optional=True)
     resume_path = resolve(values["resume_checkpoint_path"], optional=True)
+    pretrained_path = resolve(values["pretrained_actor_checkpoint"], optional=True)
+    if resume_path is not None and pretrained_path is not None:
+        raise ValueError("select an online resume or pretrained A initialization, not both")
+    learning_config = LatentOnlineConfig.from_mapping(raw["online"])
+    actor = None
+    if pretrained_path is not None:
+        actor, _ = load_actor_checkpoint(pretrained_path, loaded.model, loaded.contract, learning_config.trajectory,
+                                          residual_limits=learning_config.residual_limit_rad)
+        if actor.hidden_dims != learning_config.actor_hidden_dims or actor.command_dim != spec.command_dim:
+            raise ValueError("pretrained A architecture differs from the deployment configuration")
     if save_path is not None and save_path.exists() and save_path != resume_path:
         raise FileExistsError("online output already exists; select a new checkpoint path")
-    return LatentRuntimeSetup(loaded, LatentOnlineConfig.from_mapping(raw["online"]), LatentCostConfig(**raw["costs"]),
-                              PathFollowingRuntimeConfig(pose=pose, **counts), resume_path, save_path)
+    return LatentRuntimeSetup(loaded, learning_config, LatentCostConfig(**raw["costs"]),
+                              PathFollowingRuntimeConfig(pose=pose, **counts), resume_path, save_path, actor)
 
 
 def _digest(handle: Any) -> str:
@@ -183,10 +201,24 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
         if not math.isfinite(self._risk_tilt_limit) or not 0 < self._risk_tilt_limit <= math.pi:
             raise ValueError("WM risk tilt limit must be in (0, pi]")
         source = pose_runtime if pose_runtime is not None else create_pose_runtime(env, config.pose)
-        super().__init__(inner, playback, env, updater, config, pose_runtime=_ReceivingPoses(source, self._receive_poses))
+        parameter = next(updater.model.parameters())
+        super().__init__(inner, playback, env, updater, config,
+                         pose_runtime=_ReceivingPoses(source, self._receive_poses),
+                         reference_factory=lambda initial: MeasuredTrajectory(
+                             initial, updater.config.trajectory, device=parameter.device, dtype=parameter.dtype),
+                         allow_command_changes=True)
         self._residual_limits = self._zero.new_tensor(updater.config.residual_limit_rad)
         updater.ego_history = self.ego_history
         self._reset_diagnostics()
+
+    def _command_for_step(self, command: Any) -> Any:
+        reference = self.collector.reference
+        if reference is None:
+            return command
+        if not isinstance(reference, MeasuredTrajectory):
+            raise TypeError("latent path control requires the shared reference trajectory")
+        with torch.no_grad():
+            return reference.current_state.command(command)
 
     def _reset_diagnostics(self) -> None:
         self._real_latent: LatentState | None = None
@@ -418,6 +450,7 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
                     "next_observation": compact[0].cpu().numpy().copy(),
                     "action": action[0].cpu().numpy().copy(),
                     "source_action": source_action[0].cpu().numpy().copy(),
+                    "residual": self._locked[0].detach().cpu().numpy().copy(),
                     "command": query.command[0].detach().cpu().numpy().copy(),
                     "ego_motion": ego, "ego_valid": valid, "ego_age_s": age,
                     "next_ego_motion": ego.copy(), "next_ego_valid": valid,

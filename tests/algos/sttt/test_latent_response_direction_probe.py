@@ -30,7 +30,7 @@ def probe_case(directory, failure):
         "source": {"checkpoint_sha256": hashlib.sha256(Path(policy_path).read_bytes()).hexdigest(),
                    "source_profile": asdict(profile), "preprocessing": profile.preprocessing,
                    "target_joint_names": list(profile.joint_names), "target_default_joint_angles": [0.] * 29,
-                   "target_action_scale": [.5] * 29, "delta_frame": "fixed_straight_path",
+                   "target_action_scale": [.5] * 29, "delta_frame": "previous_control_horizontal_heading",
                    "delta_units": ["m", "m", "rad"], "ego_frame": "previous_measurement_horizontal_heading",
                    "risk_tilt_limit_rad": .8},
     }

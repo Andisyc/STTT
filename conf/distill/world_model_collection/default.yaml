@@ -5,6 +5,9 @@ residual_amplitude_rad: null
 risk_tilt_limit_rad: null
 seed: 0
 device: cpu
+trajectory: null
+actor_checkpoint: null
+world_model_checkpoint: null
 pose:
   odometry_source: simulation
 observation_augmentation:

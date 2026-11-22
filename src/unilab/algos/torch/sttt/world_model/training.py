@@ -22,7 +22,7 @@ _TRAINING_DEFAULTS = {
     "max_updates": 200000, "batch_size": 16, "rollout_windows": 2, "cache_size": 2,
     "validation_every": 1000, "validation_batches": 16, "checkpoint_every": 1000,
     "learning_rate": 3e-4, "weight_decay": 1e-6, "gradient_clip_norm": 100.,
-    "resume_checkpoint": None, "loss": {},
+    "resume_checkpoint": None, "initial_checkpoint": None, "loss": {},
 }
 _LOSS_KEYS = {"free_nats", "kl_scale", "reconstruction_scale", "motion_scale", "risk_scale", "overshoot_scale", "kl_balance", "prior_reconstruction_scale", "window_scale"}
 
@@ -133,7 +133,7 @@ def _validate(model: LatentWorldModel, sampler: PretrainingSequenceSampler, indi
         _restore_rng(random_state, device)
         model.train(was_training)
     if not windows:
-        raise ValueError("validation crops require valid physical window motion labels and known headings")
+        raise ValueError("validation crops require valid physical window motion labels")
     return {**{key: value / rows for key, value in totals.items()},
             "window_xy_rmse_m": math.sqrt(xy_sum / windows), "window_count": windows}
 
@@ -206,8 +206,16 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     }}
     torch.manual_seed(seed)
     resumed_state: dict[str, Any] = {}
+    if training["resume_checkpoint"] is not None and training["initial_checkpoint"] is not None:
+        raise ValueError("select exact resume or WM warm start, not both")
     if training["resume_checkpoint"] is None:
-        model = LatentWorldModel(config).to(device)
+        if training["initial_checkpoint"] is None:
+            model = LatentWorldModel(config).to(device)
+        else:
+            loaded = load_world_model(_resolve(training["initial_checkpoint"], root), device=device, expected_contract=contract)
+            if loaded.model.config != config:
+                raise ValueError("WM warm-start architecture/scaling differs")
+            model = loaded.model
     else:
         loaded = load_world_model(_resolve(training["resume_checkpoint"], root), device=device, expected_contract=contract)
         if loaded.model.config != config:

@@ -122,12 +122,15 @@ class PathFollowingController(Generic[LearnerT]):
         self, inner: Any, playback: OfficialFADAPlaybackController, env: Any,
         updater: LearnerT, config: PathFollowingRuntimeConfig, *,
         pose_runtime: OnlinePoseRuntime | None = None,
+        reference_factory: Any = None, allow_command_changes: bool = False,
     ) -> None:
         if playback.future_transform is not None:
             raise ValueError("path following must be the sole future transform")
         self.inner, self.playback, self.env = inner, playback, env
         self.policy = playback.policy
         self.updater, self.config = updater, config
+        self._reference_factory = reference_factory
+        self._allow_command_changes = allow_command_changes
         self.poses = pose_runtime if pose_runtime is not None else create_pose_runtime(env, config.pose)
         self.trace: deque[dict[str, Any]] = deque(maxlen=config.max_trace_records)
         self._closed = False
@@ -168,6 +171,7 @@ class PathFollowingController(Generic[LearnerT]):
         self._collector = WindowCollector(
             self.updater.contract["data"]["window_steps"],
             max_alignment_age_ns=round(self.config.pose.max_alignment_age_s * 1e9),
+            reference_factory=self._reference_factory, allow_command_changes=self._allow_command_changes,
         )
         self._queries.clear()
         self._pending.clear()
@@ -205,6 +209,9 @@ class PathFollowingController(Generic[LearnerT]):
             raise ValueError("non-finite A candidate; no fallback or clipping is applied")
         return candidate
 
+    def _command_for_step(self, command: Any) -> Any:
+        return command
+
     def act(self, observation: Any, command: Any) -> torch.Tensor:
         if self._closed or self._failed or self._terminal:
             raise RuntimeError("path following stopped; an explicit reset is required")
@@ -216,16 +223,19 @@ class PathFollowingController(Generic[LearnerT]):
                 self._start = before
             if before.sequence_id != self._start.sequence_id:
                 raise RuntimeError("physical reset crossed path-following episode")
+            command = self._command_for_step(command)
             velocity = np.asarray(torch.as_tensor(command).detach().cpu(), dtype=np.float64)
             if velocity.shape != (1, self.playback.spec.command_dim):
                 raise ValueError("path following command differs from the bound policy contract")
             velocity = velocity[0, :3].copy()
-            if not np.isfinite(velocity).all() or velocity[0] <= 0 or not np.allclose(velocity[1:], 0., atol=1e-8, rtol=0):
-                raise ValueError("path following requires fixed [vx > 0, 0, 0] velocity")
-            if self._command is None:
-                self._command = velocity
-            elif not np.array_equal(velocity, self._command):
-                raise ValueError("velocity command changed; runtime never rewrites the command")
+            if not np.isfinite(velocity).all():
+                raise ValueError("path following requires finite velocity commands")
+            if not self._allow_command_changes:
+                if velocity[0] <= 0 or not np.allclose(velocity[1:], 0., atol=1e-8, rtol=0):
+                    raise ValueError("path following requires fixed [vx > 0, 0, 0] velocity")
+                if self._command is not None and not np.array_equal(velocity, self._command):
+                    raise ValueError("velocity command changed during fixed-path control")
+            self._command = velocity
             if self._decision is not None and self._fresh_decision(before.timestamp_ns) is None:
                 raise RuntimeError("paired localization observation expired")
             if self._decision is None and before.timestamp_ns - self._start.timestamp_ns > round(self.config.pose.max_alignment_age_s * 1e9):

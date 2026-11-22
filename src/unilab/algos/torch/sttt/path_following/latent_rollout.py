@@ -1,4 +1,4 @@
-"""Differentiable receding-horizon execution in a learned fixed-path frame."""
+"""Differentiable Planner–Tracker rollout with external reference geometry."""
 from __future__ import annotations
 
 import math
@@ -17,6 +17,7 @@ from unilab.algos.torch.distill.fada.runtime_policy import (
 )
 from unilab.algos.torch.sttt.geometry import wrap_to_pi
 from unilab.algos.torch.sttt.path_following.intervention import compose_joint_position_residual
+from unilab.algos.torch.sttt.path_following.trajectory import PathState, ReferenceTrajectory, TrajectoryConfig
 from unilab.algos.torch.sttt.world_model.types import LatentState, RolloutStart
 
 
@@ -26,7 +27,7 @@ class RolloutResult:
 
     ``risk`` contains event probabilities (sigmoid of model logits), not logits.
     ``residuals`` has one source-order physical-radian value per held window.
-    ``path_delta`` is already in the fixed path frame, never a body frame.
+    ``path_delta`` contains tangent displacement, lateral/heading-error increments.
     """
 
     errors: torch.Tensor
@@ -37,6 +38,8 @@ class RolloutResult:
     risk: torch.Tensor
     commands: torch.Tensor
     final_latent: LatentState
+    target_speed: torch.Tensor
+    body_delta: torch.Tensor
 
 
 @contextmanager
@@ -163,6 +166,7 @@ class PlannerTrackerRollout:
         ego_motion: torch.Tensor | None = None,
         ego_valid: torch.Tensor | None = None,
         ego_age_s: torch.Tensor | None = None,
+        path_state: PathState | None = None,
     ) -> RolloutStart:
         """Own a current query; optional ego fields describe its entire history.
 
@@ -190,11 +194,22 @@ class PlannerTrackerRollout:
                 observations, env_actions, valid,
                 ego_motion=ego_motion, ego_valid=ego_valid, ego_age_s=ego_age_s,
             )
+        if path_state is None:
+            config = TrajectoryConfig(speed_m_s=max(float(query.command[:, :2].norm(dim=-1).mean()), .01))
+            reference = ReferenceTrajectory.generate(config, batch_size=batch, device=self.device, dtype=self.dtype)
+            heading = -errors[:, 1:2]
+            c, s = heading.cos(), heading.sin()
+            x, y = reference.xy[..., 0], reference.xy[..., 1]
+            xy = torch.stack((c * x - s * y + errors[:, :1] * s,
+                              s * x + c * y - errors[:, :1] * c), -1)
+            reference = ReferenceTrajectory(xy, reference.speed, config)
+            path_state = PathState(reference, errors.new_zeros(batch, 3), errors.new_zeros(batch))
         return RolloutStart(
             latent=latent.detach().clone(), observation_history=observations,
             action_history=source_actions, history_valid_mask=valid,
             errors=errors.detach().clone(), command=query.command.detach().clone(),
             previous_residual=previous_residual.detach().clone(),
+            path_state=path_state.detach(),
         )
 
     def _validate_context(
@@ -224,6 +239,7 @@ class PlannerTrackerRollout:
         *,
         window_steps: int,
         horizon_windows: int,
+        update_reference_commands: bool = True,
     ) -> RolloutResult:
         """Replan every tick; hold each actor residual for ``window_steps`` ticks."""
         for name, value in (("window_steps", window_steps), ("horizon_windows", horizon_windows)):
@@ -233,8 +249,13 @@ class PlannerTrackerRollout:
         self._validate_history(observations, history_actions, valid)
         self._validate_context(observations.shape[0], start.errors, start.command, start.previous_residual)
         latent, errors, command = start.latent, start.errors, start.command
+        path = start.path_state
+        if path is None:
+            raise ValueError("imagined control requires an explicit reference path state")
+        errors = path.errors()
         all_errors, deltas, actions, source_actions = [errors], [], [], []
-        residuals, risks, commands = [], [], []
+        residuals, risks, commands, target_speeds = [], [], [], []
+        body_deltas = []
         held_residual: torch.Tensor | None = None
         with _frozen_model(self.model):
             for step in range(int(window_steps * horizon_windows)):
@@ -255,8 +276,10 @@ class PlannerTrackerRollout:
                         observations = observations.masked_fill(~valid.unsqueeze(-1), 0.)
                         history_actions = history_actions.masked_fill(~valid.unsqueeze(-1), 0.)
                     command = self._advance_command(command)
+                    if update_reference_commands:
+                        command = path.command(command)
                 if step % window_steps == 0:
-                    held_residual = actor(latent.feature(), errors, command)
+                    held_residual = actor(latent.feature(), errors, command, path.preview())
                     residuals.append(held_residual)
                 assert held_residual is not None
                 nominal = invoke_fada_planner(self.policy, self.spec,
@@ -274,10 +297,18 @@ class PlannerTrackerRollout:
                 if self.profile.clip_actions is not None:
                     source_action = source_action.clamp(-self.profile.clip_actions, self.profile.clip_actions)
                 action = self.source_to_env(source_action)
-                delta = self.model.motion(latent, errors[:, 1:2], action)
+                motion = self.model.motion(latent, action)
+                body_deltas.append(motion)
                 risk = self.model.risk(latent, action).sigmoid()
-                # Motion is already path-frame: do not rotate it a second time.
-                errors = torch.stack((errors[:, 0] + delta[:, 1], wrap_to_pi(errors[:, 1] + delta[:, 2])), dim=-1)
+                _, _, target = path.reference.sample(path.progress[:, None])
+                target_speeds.append(target[:, 0])
+                following = path.advance(motion)
+                next_errors = following.errors()
+                forward = errors[:, 1].cos() * motion[:, 0] - errors[:, 1].sin() * motion[:, 1]
+                delta = torch.stack((forward,
+                                     next_errors[:, 0] - errors[:, 0],
+                                     wrap_to_pi(next_errors[:, 1] - errors[:, 1])), -1)
+                path, errors = following, next_errors
                 latent, _ = self.model.prior(latent, action)
                 all_errors.append(errors)
                 deltas.append(delta)
@@ -290,4 +321,6 @@ class PlannerTrackerRollout:
             actions=torch.stack(actions, dim=1), source_actions=torch.stack(source_actions, dim=1),
             residuals=torch.stack(residuals, dim=1), risk=torch.stack(risks, dim=1),
             commands=torch.stack(commands, dim=1), final_latent=latent,
+            target_speed=torch.stack(target_speeds, dim=1),
+            body_delta=torch.stack(body_deltas, dim=1),
         )

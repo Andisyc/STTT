@@ -1,0 +1,36 @@
+world_model_checkpoint: null
+policy_checkpoint: null
+data_dirs: []
+output_dir: null
+device: cpu
+resume_checkpoint: null
+initial_actor_checkpoint: null
+training:
+  residual_limit_rad: null  # 29 source-order physical-radian bounds; set from the controller.
+  hidden_dims: [256, 128]
+  max_updates: 10000
+  batch_size: 16
+  horizon_windows: 2
+  learning_rate: 0.0001
+  max_grad_norm: 10.0
+  checkpoint_every: 1000
+  seed: 0
+trajectories:
+  base:
+    length_m: 30.0
+    samples: 1024
+    preview_points: 8
+    preview_spacing_m: 0.15
+    projection_window_m: 0.5
+  kinds: [straight, circle, figure_eight, random]
+  speed_range: [0.2, 0.8]
+  radius_range: [1.0, 4.0]
+  lateral_range: [-0.3, 0.3]
+  heading_range: [-0.3, 0.3]
+costs:
+  lateral_weight: 1.0
+  lateral_velocity_weight: 1.0
+  forward_weight: 1.0
+  smoothness_weight: 1.0
+  risk_weight: 1.0
+  huber_delta: null

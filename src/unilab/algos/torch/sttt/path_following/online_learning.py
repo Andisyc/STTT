@@ -19,6 +19,7 @@ from unilab.algos.torch.sttt.path_following.model import ResponseModel, response
 from unilab.algos.torch.sttt.path_following.objectives import actor_loss
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath
 from unilab.algos.torch.sttt.path_following.residual_model import ResidualModel
+from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory, PathState
 from unilab.algos.torch.sttt.pose_data import TimedPelvisPose
 from unilab.base.backend.sensors import SensorClock
 
@@ -42,11 +43,12 @@ class ActorUpdateContext:
     the latest sufficiently fresh pair belongs to the runtime, not this learner.
     """
 
-    reference: FixedStraightPath
+    reference: FixedStraightPath | MeasuredTrajectory
     timestamp_ns: int
     context: torch.Tensor
     errors: torch.Tensor
     query_signature: QuerySignature
+    path_state: PathState | None = None
 
     def __post_init__(self) -> None:
         _integer(self.timestamp_ns, "actor timestamp_ns")
@@ -65,19 +67,21 @@ class ActorUpdateContext:
 
     @classmethod
     def from_aligned_query(
-        cls, query: FADAFutureQuery, clock: SensorClock, pose: TimedPelvisPose, reference: FixedStraightPath,
+        cls, query: FADAFutureQuery, clock: SensorClock, pose: TimedPelvisPose, reference: FixedStraightPath | MeasuredTrajectory,
     ) -> ActorUpdateContext:
         if clock.sequence_id != pose.sequence_id or clock.timestamp_ns != pose.timestamp_ns:
             raise ValueError("actor pose and query must represent the same sequence and physical time")
         errors = torch.as_tensor(reference.errors(pose), dtype=query.command.dtype, device=query.command.device).unsqueeze(0)
-        return cls(reference, clock.timestamp_ns, pack_response_context(query), errors, _query_signature(query))
+        state = reference.state_at(pose).detach() if isinstance(reference, MeasuredTrajectory) else None
+        return cls(reference, clock.timestamp_ns, pack_response_context(query), errors, _query_signature(query), state)
 
     @classmethod
     def from_window_start(cls, sample: PathFollowingWindowSample) -> ActorUpdateContext:
         """Explicit historical point; never relabel it as the current decision."""
         query = sample.start_query
         errors = torch.as_tensor(sample.path_errors[:1], dtype=query.command.dtype, device=query.command.device)
-        return cls(sample.reference, sample.start_pose.timestamp_ns, pack_response_context(query), errors, _query_signature(query))
+        state = sample.reference.state_at(sample.start_pose).detach() if isinstance(sample.reference, MeasuredTrajectory) else None
+        return cls(sample.reference, sample.start_pose.timestamp_ns, pack_response_context(query), errors, _query_signature(query), state)
 
 
 @dataclass(frozen=True)

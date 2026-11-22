@@ -1,0 +1,10 @@
+defaults:
+  - latent_reference_evaluation@evaluation
+  - _self_
+output_dir: null
+policy_checkpoint: null
+profile_path: null
+world_model_checkpoint: null
+actor_checkpoint: null
+device: cpu
+source_overrides: []

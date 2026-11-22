@@ -26,6 +26,7 @@ from unilab.algos.torch.sttt.pose_data import ControlInterval, ReceivedPose, Tim
 from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel, load_world_model, save_world_model
 from unilab.algos.torch.sttt.world_model.losses import pretraining_loss, world_model_loss
 from unilab.algos.torch.sttt.world_model.model import LatentWorldModel, WorldModelConfig
+from unilab.algos.torch.sttt.world_model.motion import motion_prefix
 from unilab.algos.torch.sttt.world_model.online import LatentOnlineConfig, LatentPathFollowingUpdater
 from unilab.algos.torch.sttt.world_model.observation_augmentation import ObservationAugmentationConfig, PoseInputAugmenter
 from unilab.algos.torch.sttt.world_model.pretraining_data import PretrainingSequenceSampler
@@ -48,9 +49,9 @@ def sequence(seed=0, steps=3):
         "observations": obs, "actions": rng.normal(0., .2, (steps, 29)).astype(np.float32),
         "source_actions": rng.normal(0., .1, (steps, 29)).astype(np.float32),
         "commands": np.tile(np.array([.4, 0., 0., 0., 0., 1., -1.], np.float32), (steps, 1)),
+        "residuals": np.zeros((steps, 29), np.float32),
         "is_first": np.array([True] + [False] * steps), "ego_motion": np.zeros((steps + 1, 3), np.float32),
         "ego_valid": np.zeros((steps + 1, 1), bool), "ego_age_s": np.zeros((steps + 1, 1), np.float32),
-        "errors": np.tile(np.array([.2, .1], np.float32), (steps + 1, 1)),
         "path_delta": delta, "motion_valid": np.ones(steps, bool), "risk": np.zeros((steps, 1), np.float32),
         "risk_valid": np.ones(steps, bool), "terminal": np.zeros(steps, bool),
         "timestamps_ns": np.arange(steps + 1, dtype=np.int64) * 20_000_000,
@@ -62,11 +63,9 @@ def sequence(seed=0, steps=3):
 def windowed_sequence(seed=0, steps=7):
     raw = sequence(seed, steps)
     raw["path_delta"][:, 2] = .001
-    raw["errors"][1:, 0] += raw["path_delta"][:, 1].cumsum()
-    raw["errors"][1:, 1] += raw["path_delta"][:, 2].cumsum()
     ends = np.arange(2, steps + 1, 2, dtype=np.int64)
     raw["window_start"], raw["window_end"] = ends - 2, ends
-    raw["window_delta"] = np.asarray([raw["path_delta"][end - 2:end].sum(0) for end in ends], np.float32).reshape(-1, 3)
+    raw["window_delta"] = np.asarray([motion_prefix(torch.from_numpy(raw["path_delta"][end - 2:end]))[-1].numpy() for end in ends], np.float32).reshape(-1, 3)
     raw["window_valid"] = np.ones(len(ends), bool)
     return raw
 
@@ -86,7 +85,7 @@ def parts(directory, case=None):
         "source": {"checkpoint_sha256": hashlib.sha256((Path(directory) / "policy.pt").read_bytes()).hexdigest(),
                    "source_profile": asdict(profile), "preprocessing": dict(spec.preprocessing),
                    "target_joint_names": list(reversed(profile.joint_names)), "target_default_joint_angles": [0.] * 29,
-                   "target_action_scale": [.5] * 29, "delta_frame": "fixed_straight_path",
+                   "target_action_scale": [.5] * 29, "delta_frame": "previous_control_horizontal_heading",
                    "delta_units": ["m", "m", "rad"], "ego_frame": "previous_measurement_horizontal_heading",
                    "risk_tilt_limit_rad": .8},
     }
@@ -224,6 +223,7 @@ def test_online_lora_actor_ownership_and_resume(tmp_path):
     for i in range(2):
         updater.record_transition(i, {"observation": observations[i], "next_observation": observations[i+1],
             "action": actions.copy(), "source_action": source[0].numpy().copy(), "command": query.command[0].numpy().copy(),
+            "residual": np.zeros(29, np.float32),
             "ego_motion": np.zeros(3, np.float32), "ego_valid": False, "ego_age_s": 0., "risk": 0., "risk_valid": False}, capacity=16)
     result = updater.update([sample], ActorUpdateContext.from_window_start(sample))
     assert result.b_loss is not None and result.a_loss is not None

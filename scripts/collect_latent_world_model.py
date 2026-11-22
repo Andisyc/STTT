@@ -25,6 +25,8 @@ def main(cfg: DictConfig) -> None:
         residual_amplitude_rad=node.residual_amplitude_rad, risk_tilt_limit_rad=node.risk_tilt_limit_rad,
         seed=node.seed, device=node.device,
         observation_augmentation=OmegaConf.to_container(node.observation_augmentation, resolve=True),
+        trajectory=OmegaConf.to_container(node.trajectory, resolve=True) if node.trajectory is not None else None,
+        actor_checkpoint=node.actor_checkpoint, world_model_checkpoint=node.world_model_checkpoint,
     )
     print(json.dumps(result, allow_nan=False, indent=2))
 
