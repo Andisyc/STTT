@@ -13,7 +13,7 @@ from hydra._internal.utils import create_config_search_path
 from hydra.types import RunMode
 
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from unilab.algos.torch.distill.fada.adaptation_checkpoint import load_fada_deployable_policy_checkpoint
 from unilab.algos.torch.distill.fada.legacy_deployment import LegacyFADAPlaybackProfile
@@ -251,6 +251,8 @@ def capture_configuration(root: Path, policy_checkpoint: Path, *, source_overrid
         "task=g1_walk_flat/mujoco", "recording_profile=straight_payload", "+world_model_collection=default",
         "online_adaptation.enabled=false", "env.runtime_payload.enabled=false", *source_overrides,
     ], run_mode=RunMode.RUN)
+    with open_dict(cfg):
+        del cfg["hydra"]
     for name, value in {
         "training.play_checkpoint_path": str(policy_checkpoint),
         "training.play_use_checkpoint_profile": profile_path is None,

@@ -626,13 +626,16 @@ def test_legacy_native_zero_residual_history_and_multistep_credit(tmp_path):
 def test_legacy_capture_pretraining_resume_and_runtime_without_yaml(tmp_path):
     from test_path_following_evaluation import evaluation_case
     from unilab.algos.torch.sttt.path_following.evaluation import run_path_following_evaluation
+    from unilab.algos.torch.sttt.path_following.pretraining import capture_configuration
     from unilab.algos.torch.sttt.world_model.sequence_collection import collect_world_model_sequences
     from unilab.algos.torch.sttt.world_model.sequence_data import read_sequence_metadata
 
     base, original, _ = evaluation_case(tmp_path / "case", modes=("nominal", "latent_wm_frozen"))
     case, profile = legacy_case(tmp_path / "case" / "inputs", case=base)
     for name, seed in (("train", 1), ("validation", 2)):
-        collect_world_model_sequences(case.cfg, root_dir=ROOT, output_dir=tmp_path / name,
+        capture_cfg = capture_configuration(ROOT, Path(case.cfg.training.play_checkpoint_path),
+                                            source_overrides=["video_recording.enabled=false"], seed=seed)
+        collect_world_model_sequences(capture_cfg, root_dir=ROOT, output_dir=tmp_path / name,
             num_steps=6, window_steps=2, residual_amplitude_rad=.01, risk_tilt_limit_rad=.8,
             seed=seed, device="cpu", playback_deps=case.deps)
     contract = read_sequence_metadata(tmp_path / "train")
