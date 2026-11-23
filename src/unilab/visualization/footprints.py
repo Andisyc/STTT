@@ -67,6 +67,13 @@ class FootprintRecorder:
         self._reset_rows(contacts, np.ones(self.num_envs, dtype=bool))
         self._initialized = True
 
+    def reset_rows(self, contacts: np.ndarray, rows: np.ndarray) -> None:
+        """Reset selected episodes without discarding other rows' contact edges."""
+        contacts = self._contact_rows(contacts)
+        if not self._initialized or rows.shape != (self.num_envs,) or rows.dtype != np.bool_:
+            raise ValueError("partial footprint reset requires initialized boolean row mask")
+        self._reset_rows(contacts, rows)
+
     def observe(
         self, *, foot_positions: np.ndarray, contacts: np.ndarray,
         done: np.ndarray, autoreset: bool,

@@ -6,7 +6,7 @@ import json
 from bisect import bisect_right
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -187,88 +187,13 @@ class PretrainingSequenceSampler:
         if any(isinstance(i, bool) or not isinstance(i, Integral) or not 0 <= i < self.num_starts
                for i in selected):
             raise ValueError("pretraining start indices must be integers in [0, num_starts)")
-        batch_size = len(selected)
-        horizon = self.prediction_steps
-        history = self.history_steps
-        sequence: dict[str, np.ndarray] = {}
-        state_spec, transition_spec = _sequence_specs(self.contract)
-        for spec, length in ((state_spec, horizon + 1), (transition_spec, horizon),
-                             (_WINDOW, self.rollout_windows)):
-            for key, tail in spec.items():
-                dtype = np.bool_ if key in _BOOL else np.int64 if key in _INT else np.float32
-                sequence[key] = np.zeros((batch_size, length, *tail), dtype=dtype)
-        history_observations = np.zeros((batch_size, history, self.contract["data"]["observation_dim"]), dtype=np.float32)
-        history_previous_actions = np.zeros((batch_size, history, 29), dtype=np.float32)
-        history_valid_mask = np.zeros((batch_size, history), dtype=np.bool_)
-        history_ego_motion = np.zeros((batch_size, history, 3), dtype=np.float32)
-        history_ego_valid = np.zeros((batch_size, history, 1), dtype=np.bool_)
-        history_ego_age_s = np.zeros((batch_size, history, 1), dtype=np.float32)
-        previous_action = np.zeros((batch_size, 29), dtype=np.float32)
-        previous_residual = np.zeros((batch_size, 29), dtype=np.float32)
-        observation_mask = np.zeros((batch_size, horizon + 1), dtype=np.bool_)
-        transition_mask = np.zeros((batch_size, horizon), dtype=np.bool_)
-        origins: list[tuple[str, int]] = []
-        for row, selected_index in enumerate(selected):
+        samples = []
+        for selected_index in selected:
             shard_index = bisect_right(self._ends, int(selected_index))
             first_index = self._ends[shard_index - 1] if shard_index else 0
             origin = (int(selected_index) - first_index) * self.window_steps
-            shard = self._shards[shard_index]
-            raw = self._load_shard(shard_index)
-            stop = min(origin + horizon, shard.steps)
-            transitions = stop - origin
-            for key in state_spec:
-                sequence[key][row, :transitions + 1] = raw[key][origin:stop + 1]
-            for key in transition_spec:
-                sequence[key][row, :transitions] = raw[key][origin:stop]
-            observation_mask[row, :transitions + 1] = True
-            transition_mask[row, :transitions] = True
-            if origin:
-                previous_action[row] = raw["actions"][origin - 1]
-                previous_residual[row] = raw["residuals"][origin - 1]
-            history_start = max(0, origin - history)
-            history_count = origin - history_start
-            if history_count:
-                destination = slice(history - history_count, history)
-                source = slice(history_start, origin)
-                history_observations[row, destination] = raw["observations"][source]
-                history_valid_mask[row, destination] = True
-                history_ego_motion[row, destination] = raw["ego_motion"][source]
-                history_ego_valid[row, destination] = raw["ego_valid"][source]
-                history_ego_age_s[row, destination] = raw["ego_age_s"][source]
-                # Actions condition their own observation, including the oldest
-                # retained row, not the next observation in the history crop.
-                action_start = max(1, history_start)
-                if action_start < origin:
-                    offset = history - history_count + action_start - history_start
-                    history_previous_actions[row, offset:] = raw["actions"][action_start - 1:origin - 1]
-            complete = (raw["window_start"] >= origin) & (raw["window_end"] <= stop)
-            occupied: set[int] = set()
-            for window in np.flatnonzero(complete):
-                relative_start = int(raw["window_start"][window]) - origin
-                slot = relative_start // self.window_steps
-                if slot in occupied:
-                    raise ValueError(f"multiple complete window labels occupy one forecast slot: {shard.path}")
-                occupied.add(slot)
-                sequence["window_start"][row, slot] = relative_start
-                sequence["window_end"][row, slot] = int(raw["window_end"][window]) - origin
-                sequence["window_delta"][row, slot] = raw["window_delta"][window]
-                sequence["window_valid"][row, slot] = raw["window_valid"][window]
-            origins.append((str(shard.path), origin))
-        as_tensor = lambda array: torch.as_tensor(array, device=device)
-        return PretrainingBatch(
-            history_observations=as_tensor(history_observations),
-            history_previous_actions=as_tensor(history_previous_actions),
-            history_valid_mask=as_tensor(history_valid_mask),
-            history_ego_motion=as_tensor(history_ego_motion),
-            history_ego_valid=as_tensor(history_ego_valid),
-            history_ego_age_s=as_tensor(history_ego_age_s),
-            sequence={key: as_tensor(value) for key, value in sequence.items()},
-            previous_action=as_tensor(previous_action),
-            previous_residual=as_tensor(previous_residual),
-            observation_mask=as_tensor(observation_mask),
-            transition_mask=as_tensor(transition_mask),
-            origins=tuple(origins),
-        )
+            samples.append((str(self._shards[shard_index].path), self._load_shard(shard_index), origin))
+        return collate_pretraining_sequences(samples, self.contract, rollout_windows=self.rollout_windows, device=device)
 
     def _sampling_identity(self) -> dict[str, Any]:
         return {"contract": self.contract, "rollout_windows": self.rollout_windows,
@@ -297,3 +222,94 @@ class PretrainingSequenceSampler:
         except (TypeError, ValueError, KeyError, OverflowError) as error:
             raise ValueError("invalid pretraining sampler RNG state") from error
         self._rng = generator
+
+
+def collate_pretraining_sequences(samples, contract: Mapping[str, Any], *, rollout_windows: int,
+                                  device: str | torch.device = "cpu") -> PretrainingBatch:
+    """Crop real episode prefixes identically for immutable archives and live replay."""
+    if not samples:
+        raise ValueError("cannot sample an empty pretraining batch")
+    windows = _positive_integer(rollout_windows, "rollout_windows")
+    window_steps = _positive_integer(contract["data"]["window_steps"], "window_steps")
+    history = _positive_integer(contract["data"]["history_length"], "history_length") - 1
+    horizon, batch_size = windows * window_steps, len(samples)
+    sequence: dict[str, np.ndarray] = {}
+    state_spec, transition_spec = _sequence_specs(contract)
+    for spec, length in ((state_spec, horizon + 1), (transition_spec, horizon), (_WINDOW, windows)):
+        for key, tail in spec.items():
+            dtype = np.bool_ if key in _BOOL else np.int64 if key in _INT else np.float32
+            sequence[key] = np.zeros((batch_size, length, *tail), dtype=dtype)
+    history_observations = np.zeros((batch_size, history, contract["data"]["observation_dim"]), dtype=np.float32)
+    history_previous_actions = np.zeros((batch_size, history, 29), dtype=np.float32)
+    history_valid_mask = np.zeros((batch_size, history), dtype=np.bool_)
+    history_ego_motion = np.zeros((batch_size, history, 3), dtype=np.float32)
+    history_ego_valid = np.zeros((batch_size, history, 1), dtype=np.bool_)
+    history_ego_age_s = np.zeros((batch_size, history, 1), dtype=np.float32)
+    previous_action = np.zeros((batch_size, 29), dtype=np.float32)
+    previous_residual = np.zeros((batch_size, 29), dtype=np.float32)
+    observation_mask = np.zeros((batch_size, horizon + 1), dtype=np.bool_)
+    transition_mask = np.zeros((batch_size, horizon), dtype=np.bool_)
+    origins: list[tuple[str, int]] = []
+    for row, (identity, raw, origin) in enumerate(samples):
+        steps = len(raw["actions"])
+        if type(origin) is not int or not 0 <= origin < steps or origin % window_steps:
+            raise ValueError("forecast origin must be an existing episode-local window-grid start")
+        stop = min(origin + horizon, steps)
+        transitions = stop - origin
+        for key in state_spec:
+            sequence[key][row, :transitions + 1] = raw[key][origin:stop + 1]
+        for key in transition_spec:
+            sequence[key][row, :transitions] = raw[key][origin:stop]
+        observation_mask[row, :transitions + 1] = True
+        transition_mask[row, :transitions] = True
+        if origin:
+            previous_action[row] = raw["actions"][origin - 1]
+            previous_residual[row] = raw["residuals"][origin - 1]
+        history_start = max(0, origin - history)
+        history_count = origin - history_start
+        if history_count:
+            destination = slice(history - history_count, history)
+            source = slice(history_start, origin)
+            history_observations[row, destination] = raw["observations"][source]
+            history_valid_mask[row, destination] = True
+            history_ego_motion[row, destination] = raw["ego_motion"][source]
+            history_ego_valid[row, destination] = raw["ego_valid"][source]
+            history_ego_age_s[row, destination] = raw["ego_age_s"][source]
+            action_start = max(1, history_start)
+            if action_start < origin:
+                offset = history - history_count + action_start - history_start
+                history_previous_actions[row, offset:] = raw["actions"][action_start - 1:origin - 1]
+        complete = (raw["window_start"] >= origin) & (raw["window_end"] <= stop)
+        occupied: set[int] = set()
+        for window in np.flatnonzero(complete):
+            relative_start = int(raw["window_start"][window]) - origin
+            slot = relative_start // window_steps
+            if slot in occupied or not 0 <= slot < windows:
+                raise ValueError(f"multiple or invalid window labels occupy one forecast slot: {identity}")
+            occupied.add(slot)
+            sequence["window_start"][row, slot] = relative_start
+            sequence["window_end"][row, slot] = int(raw["window_end"][window]) - origin
+            sequence["window_delta"][row, slot] = raw["window_delta"][window]
+            sequence["window_valid"][row, slot] = raw["window_valid"][window]
+        origins.append((str(identity), origin))
+    as_tensor = lambda array: torch.as_tensor(array, device=device)
+    return PretrainingBatch(
+        history_observations=as_tensor(history_observations),
+        history_previous_actions=as_tensor(history_previous_actions),
+        history_valid_mask=as_tensor(history_valid_mask),
+        history_ego_motion=as_tensor(history_ego_motion),
+        history_ego_valid=as_tensor(history_ego_valid),
+        history_ego_age_s=as_tensor(history_ego_age_s),
+        sequence={key: as_tensor(value) for key, value in sequence.items()},
+        previous_action=as_tensor(previous_action), previous_residual=as_tensor(previous_residual),
+        observation_mask=as_tensor(observation_mask), transition_mask=as_tensor(transition_mask), origins=tuple(origins),
+    )
+def select_pretraining_batch(batch: PretrainingBatch, index: slice) -> PretrainingBatch:
+    values = {}
+    for item in fields(batch):
+        value = getattr(batch, item.name)
+        if item.name == "sequence":
+            values[item.name] = {key: tensor[index] for key, tensor in value.items()}
+        else:
+            values[item.name] = value[index]
+    return PretrainingBatch(**values)

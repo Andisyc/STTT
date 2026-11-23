@@ -10,6 +10,7 @@ training:
   hidden_dims: [256, 128]
   max_updates: 10000
   batch_size: 16
+  microbatch_size: null
   horizon_windows: 2
   learning_rate: 0.0001
   max_grad_norm: 10.0

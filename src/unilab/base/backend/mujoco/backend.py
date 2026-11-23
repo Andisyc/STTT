@@ -1061,6 +1061,12 @@ class MuJoCoBackend(SimBackend):
             raise ValueError("A scalar physical clock requires exactly one environment")
         return _sim_time_to_ns(float(self._physics_state[0, 0]))
 
+    def get_sim_times_ns(self) -> np.ndarray:
+        values = np.rint(self._physics_state[:, 0] * 1e9)
+        if not np.isfinite(values).all() or np.any(values < 0) or np.any(values >= 2.0**63):
+            raise ValueError("MuJoCo physical clocks must fit nonnegative int64 nanoseconds")
+        return values.astype(np.int64)
+
     def open_sensor_stream(self, config: StereoSensorConfig) -> BackendSensorStream:
         """Open the opt-in chest stereo/IMU stream and sample it while stepping."""
         from .sensors import create_mujoco_sensor_stream

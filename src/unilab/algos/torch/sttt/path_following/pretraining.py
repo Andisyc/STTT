@@ -21,8 +21,9 @@ from unilab.algos.torch.distill.fada.runtime_policy import (
     FADAFutureQuery, OfficialFADAPlaybackProfile, invoke_fada_planner,
 )
 from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint, save_actor_checkpoint
+from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
 from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
-from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig, latent_actor_loss
+from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.trajectory import PathState, ReferenceTrajectory, TrajectoryConfig
 from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel, load_world_model
@@ -77,6 +78,7 @@ class ActorTrainingConfig:
     max_grad_norm: float = 10.
     checkpoint_every: int = 1000
     seed: int = 0
+    microbatch_size: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.residual_limit_rad) != 29 or any(not math.isfinite(x) or x <= 0 for x in self.residual_limit_rad):
@@ -90,6 +92,8 @@ class ActorTrainingConfig:
             raise ValueError("actor seed must be a nonnegative integer")
         if any(not math.isfinite(x) or x <= 0 for x in (self.learning_rate, self.max_grad_norm)):
             raise ValueError("actor learning rate/gradient norm must be positive")
+        if self.microbatch_size is not None and (type(self.microbatch_size) is not int or self.microbatch_size < 1):
+            raise ValueError("actor microbatch size must be a positive integer or None")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ActorTrainingConfig:
@@ -194,8 +198,10 @@ def train_latent_actor(cfg: Mapping[str, Any] | DictConfig, *, root_dir: str | P
     else:
         actor = LatentResidualActor(loaded.model.feature_dim, options.hidden_dims, options.residual_limit_rad,
                                     command_dim=rollout.spec.command_dim, preview_points=distribution.base.preview_points).to(next(loaded.model.parameters()))
-    optimizer = torch.optim.AdamW(actor.parameters(), lr=options.learning_rate, weight_decay=0.)
-    signature = {"training": {key: value for key, value in asdict(options).items() if key != "max_updates"},
+    learner = ActorLearner(actor, rollout, {**asdict(options), "window_steps": loaded.contract["data"]["window_steps"]}, costs)
+    optimizer = learner.optimizer
+    signature = {"training": {key: value for key, value in asdict(options).items()
+                              if key != "max_updates" and not (key == "microbatch_size" and value is None)},
                  "trajectories": asdict(distribution), "costs": asdict(costs), "device": device}
     updates = 0
     if raw.get("resume_checkpoint"):
@@ -206,6 +212,7 @@ def train_latent_actor(cfg: Mapping[str, Any] | DictConfig, *, root_dir: str | P
         rng.setstate(state["task_rng_state"])
         _restore_rng(state, torch.device(device))
         updates = state["optimizer_steps"]
+    learner.updates = updates
     if updates >= options.max_updates:
         raise ValueError("max_updates must exceed completed actor updates")
     output = resolve(raw["output_dir"])
@@ -219,19 +226,10 @@ def train_latent_actor(cfg: Mapping[str, Any] | DictConfig, *, root_dir: str | P
             batch = sampler.sample(options.batch_size, device=device)
             task = distribution.sample(rng)
             start = actor_training_start(batch, rollout, task, seed=rng.randrange(2**31))
-            actor.train()
-            optimizer.zero_grad(set_to_none=True)
-            result = rollout.run(start, actor, window_steps=loaded.contract["data"]["window_steps"], horizon_windows=options.horizon_windows)
-            losses = latent_actor_loss(result, start, ctrl_dt=rollout.profile.ctrl_dt,
-                                       window_steps=loaded.contract["data"]["window_steps"], config=costs)
-            if any(not bool(torch.isfinite(value)) for value in losses.values()):
-                raise ValueError("non-finite offline actor cost")
-            losses["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(actor.parameters(), options.max_grad_norm, error_if_nonfinite=True)
-            optimizer.step()
-            updates += 1
+            losses = learner.update(start)
+            updates = learner.updates
             if updates % options.checkpoint_every == 0 or updates == options.max_updates:
-                metrics = {name: float(value.detach()) for name, value in losses.items()}
+                metrics = losses
                 log.write(json.dumps({"optimizer_steps": updates, "task": asdict(task), **metrics}) + "\n")
                 log.flush()
                 print(json.dumps({"actor_updates": updates, **metrics}), flush=True)
@@ -269,118 +267,8 @@ def capture_configuration(root: Path, policy_checkpoint: Path, *, source_overrid
 
 
 def run_pretraining_pipeline(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Path = ".") -> dict[str, Any]:
-    """Initial WM/A training followed by explicit collect → WM → A cycles."""
-    from unilab.algos.torch.sttt.world_model.sequence_collection import collect_world_model_sequences
-    from unilab.algos.torch.sttt.world_model.training import train_world_model
-    from unilab.training import ensure_registries
+    """Run continuous collection, WM warmup and persistent alternating updates."""
+    from unilab.algos.torch.sttt.path_following.joint_training import run_joint_pretraining
 
-    raw = OmegaConf.to_container(cfg, resolve=True) if OmegaConf.is_config(cfg) else dict(cfg)
-    required = {"output_dir", "policy_checkpoint", "profile_path", "device", "seed", "wm", "actor",
-                "capture", "source_overrides", "refinement_cycles", "refine_wm_updates", "refine_actor_updates", "evaluation"}
-    if not isinstance(raw, dict) or set(raw) != required:
-        raise ValueError("use conf/sttt/latent_pretraining.yaml")
-    root = Path(root_dir).resolve()
-    def resolve(value):
-        if not value:
-            raise ValueError("provide explicit pretraining output and policy checkpoint")
-        path = Path(value).expanduser()
-        return (path if path.is_absolute() else root / path).resolve()
-    output, policy = resolve(raw["output_dir"]), resolve(raw["policy_checkpoint"])
-    if not policy.is_file():
-        raise FileNotFoundError(policy)
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError("pretraining requires a new output directory")
-    if type(raw["seed"]) is not int or raw["seed"] < 0 or type(raw["refinement_cycles"]) is not int or raw["refinement_cycles"] < 0:
-        raise ValueError("pretraining seed/cycle count must be nonnegative integers")
-    capture = raw["capture"]
-    for name in ("num_steps", "window_steps", "initial_train_episodes", "initial_validation_episodes", "episodes_per_cycle"):
-        if type(capture[name]) is not int or capture[name] < 1:
-            raise ValueError(f"capture.{name} must be a positive integer")
-    for name in ("refine_wm_updates", "refine_actor_updates"):
-        if type(raw[name]) is not int or raw[name] < 1:
-            raise ValueError(f"{name} must be a positive integer")
-    if capture["risk_tilt_limit_rad"] is None or capture["residual_amplitude_rad"] is None:
-        raise ValueError("set explicit capture residual and physical risk bounds")
-    ActorTrainingConfig.from_mapping(raw["actor"]["training"])
-    distribution = TrajectoryDistribution.from_mapping(raw["actor"].get("trajectories", {}))
-    rng = random.Random(raw["seed"])
-    ensure_registries()
-    output.mkdir(parents=True, exist_ok=True)
-    train_dirs = [str(resolve(path)) for path in raw["wm"]["data"]["train_dirs"]]
-    validation_dirs = [str(resolve(path)) for path in raw["wm"]["data"]["validation_dirs"]]
-    profile = str(resolve(raw["profile_path"])) if raw["profile_path"] else None
-    episode_index = 0
-    def collect_group(name, count, *, actor_checkpoint=None, world_model_checkpoint=None):
-        nonlocal episode_index
-        directories = []
-        for index in range(count):
-            seed = raw["seed"] + episode_index
-            episode_index += 1
-            source = capture_configuration(root, policy, source_overrides=list(raw["source_overrides"]), seed=seed, profile_path=profile)
-            directory = output / name / f"episode_{index:04d}"
-            task = distribution.sample(rng)
-            torch.manual_seed(seed)
-            result = collect_world_model_sequences(
-                source, root_dir=root, output_dir=directory, num_steps=capture["num_steps"],
-                window_steps=capture["window_steps"], residual_amplitude_rad=capture["residual_amplitude_rad"],
-                risk_tilt_limit_rad=capture["risk_tilt_limit_rad"], seed=seed, device=raw["device"],
-                trajectory=task, actor_checkpoint=actor_checkpoint, world_model_checkpoint=world_model_checkpoint,
-            )
-            if not result["transitions"] or result["localization_invalidated"] or result["reset_crossed"]:
-                raise RuntimeError(f"capture did not produce a usable physical sequence: {result}")
-            directories.append(str(directory))
-        return directories
-    if capture["initial"]:
-        if train_dirs or validation_dirs:
-            raise ValueError("initial capture and supplied datasets are mutually exclusive")
-        train_dirs = collect_group("initial_train", capture["initial_train_episodes"])
-        validation_dirs = collect_group("initial_validation", capture["initial_validation_episodes"])
-    elif not train_dirs or not validation_dirs:
-        raise ValueError("capture.initial=false requires explicit train/validation datasets")
-    summary = {"format": "sttt_latent_pretraining", "schema_version": 1, "complete": False, "cycles": [],
-               "config": raw, "train_dirs": train_dirs, "validation_dirs": validation_dirs}
-    def publish():
-        temporary = output / "summary.json.tmp"
-        temporary.write_text(json.dumps(summary, allow_nan=False, indent=2) + "\n")
-        temporary.replace(output / "summary.json")
-    publish()
-    previous_wm = previous_actor = None
-    for cycle in range(raw["refinement_cycles"] + 1):
-        if cycle:
-            train_dirs.extend(collect_group(f"cycle_{cycle:03d}/capture", capture["episodes_per_cycle"],
-                                            actor_checkpoint=previous_actor, world_model_checkpoint=previous_wm))
-        wm_config = dict(raw["wm"])
-        wm_config["data"] = {"train_dirs": train_dirs, "validation_dirs": validation_dirs}
-        wm_config["output_dir"] = str(output / f"cycle_{cycle:03d}/wm")
-        wm_config["device"], wm_config["seed"] = raw["device"], raw["seed"] + cycle
-        wm_config["training"] = {**wm_config["training"], "resume_checkpoint": None, "initial_checkpoint": previous_wm}
-        if cycle:
-            wm_config["training"]["max_updates"] = raw["refine_wm_updates"]
-        wm_result = train_world_model(wm_config, root_dir=root)
-        previous_wm = wm_result["best_checkpoint_path"]
-        actor_config = {**raw["actor"], "world_model_checkpoint": previous_wm, "policy_checkpoint": str(policy),
-                        "data_dirs": train_dirs, "device": raw["device"],
-                        "output_dir": str(output / f"cycle_{cycle:03d}/actor"),
-                        "initial_actor_checkpoint": previous_actor, "resume_checkpoint": None}
-        actor_config["training"] = {**actor_config["training"], "seed": raw["seed"] + cycle}
-        if cycle:
-            actor_config["training"]["max_updates"] = raw["refine_actor_updates"]
-        actor_result = train_latent_actor(actor_config, root_dir=root)
-        previous_actor = actor_result["actor_checkpoint"]
-        summary["cycles"].append({"cycle": cycle, "world_model": wm_result, "actor": actor_result})
-        publish()
-    summary["world_model_checkpoint"], summary["actor_checkpoint"] = previous_wm, previous_actor
-    if previous_wm is None or previous_actor is None:
-        raise RuntimeError("pretraining did not produce a paired WM and actor")
-    if raw["evaluation"]["enabled"]:
-        from unilab.algos.torch.sttt.path_following.pretrained_evaluation import evaluate_pretrained_actor
-        summary["evaluation"] = evaluate_pretrained_actor(
-            raw["evaluation"], root_dir=root, output_dir=output / "evaluation",
-            policy_checkpoint=policy, profile_path=profile, world_model_checkpoint=previous_wm,
-            actor_checkpoint=previous_actor, source_overrides=list(raw["source_overrides"]), device=raw["device"],
-        )
-    summary["training_complete"] = True
-    summary["complete"] = not raw["evaluation"]["enabled"] or summary["evaluation"]["complete"]
-    publish()
-    return summary
+    return run_joint_pretraining(cfg, root_dir=root_dir)
 

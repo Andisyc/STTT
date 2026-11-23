@@ -1,6 +1,11 @@
 enabled: true
 num_steps: 1500
 seeds: [10000]
+horizon_windows: 2
+risk_threshold: 0.5
+conditions:
+  - name: nominal
+    source_overrides: []
 trajectories:
   - {kind: straight, speed_m_s: 0.35, initial_lateral_m: 0.15}
   - {kind: circle, radius_m: 2.3, speed_m_s: 0.35, initial_lateral_m: 0.15}

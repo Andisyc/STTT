@@ -1,6 +1,5 @@
 defaults:
   - latent_world_model@wm
-  - latent_actor_pretraining@actor
   - latent_reference_evaluation@evaluation
   - _self_
 
@@ -9,17 +8,71 @@ policy_checkpoint: null
 profile_path: null  # Omit only for a legacy checkpoint with an embedded source profile.
 device: cpu
 seed: 0
-source_overrides: []  # Physical load/friction settings; measurements remain noiseless.
-refinement_cycles: 2
-refine_wm_updates: 10000
-refine_actor_updates: 5000
+source_overrides: []  # Physical settings; measurement noise remains disabled.
+resume_checkpoint: null  # Paired joint state; collectors resume in new physical episodes.
+schedule:
+  pretrain_wm_updates: 50000  # PWM generic warmup default, not a G1 convergence claim.
+  online_iterations: 15000
+  actor_updates_per_iteration: 1
+  wm_updates_per_iteration: 8
+  checkpoint_every: 2500
+replay:
+  capacity_transitions: 1000000
 capture:
-  initial: true  # Set false to use wm.data.train_dirs / validation_dirs.
-  initial_train_episodes: 4
-  initial_validation_episodes: 1
-  episodes_per_cycle: 2
-  num_steps: 3000
+  initial: true  # Set false only with wm.data.train_dirs / validation_dirs.
+  num_envs: 64
+  initial_min_transitions: 1000000
+  validation_episodes: 10
+  steps_per_iteration: 20  # PWM H=16 rounded up to two project residual windows.
+  max_episode_steps: 1000
   window_steps: 10
-  residual_amplitude_rad: null
+  residual_amplitude_rad: null  # Explicit physical-radian exploration bound.
   risk_tilt_limit_rad: null
+  command_resampling_s: 10.0
+  command_ranges: null  # [vx, vy, yaw_rate] lower/upper pairs; otherwise use source-profile ranges.
+  conditions:
+    - name: nominal
+      source_overrides: []
+calibration:
+  response_probe_result: null
+  require_response_probe: true
+  cost_scales: null  # Null derives and freezes physical RMS scales from initial capture statistics.
+wm:
+  device: ${device}
+  seed: ${seed}
+  training:
+    max_updates: ${schedule.pretrain_wm_updates}
+    batch_size: 256
+    microbatch_size: 32
+    rollout_windows: 2
+    learning_rate: 0.0003
+actor:
+  initial_actor_checkpoint: null
+  training:
+    residual_limit_rad: null  # 29 explicit source-order physical-radian limits.
+    hidden_dims: [256, 128]
+    max_updates: ${schedule.online_iterations}
+    batch_size: 64
+    microbatch_size: 8
+    horizon_windows: 2
+    learning_rate: 0.0005
+    max_grad_norm: 10.0
+    checkpoint_every: ${schedule.checkpoint_every}
+    seed: ${seed}
+  trajectories:
+    base:
+      preview_points: 8
+      preview_spacing_m: 0.15
+      projection_window_m: 0.5
+    lateral_range: [-0.3, 0.3]
+    heading_range: [-0.3, 0.3]
+  costs:
+    lateral_weight: 1.0
+    lateral_velocity_weight: 1.0
+    forward_weight: 1.0
+    smoothness_weight: 1.0
+    risk_weight: 1.0
+    huber_delta: null
+evaluation:
+  horizon_windows: ${actor.training.horizon_windows}
 

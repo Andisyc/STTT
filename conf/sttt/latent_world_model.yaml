@@ -23,6 +23,7 @@ model:
 training:
   max_updates: 200000
   batch_size: 16
+  microbatch_size: null  # None means one full effective batch.
   rollout_windows: 2
   cache_size: 2
   validation_every: 1000

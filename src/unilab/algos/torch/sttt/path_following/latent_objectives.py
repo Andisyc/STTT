@@ -102,4 +102,6 @@ def latent_actor_loss(
         + config.smoothness_weight * losses["smoothness_loss"]
         + config.risk_weight * losses["risk_loss"]
     )
-    return {"loss": total, **losses}
+    weights = {"lateral_loss": config.lateral_weight, "lateral_velocity_loss": config.lateral_velocity_weight,
+               "forward_loss": config.forward_weight, "smoothness_loss": config.smoothness_weight, "risk_loss": config.risk_weight}
+    return {"loss": total, **losses, **{f"weighted_{name}": value * weights[name] for name, value in losses.items()}}

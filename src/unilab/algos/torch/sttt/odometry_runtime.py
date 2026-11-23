@@ -48,7 +48,7 @@ from unilab.algos.torch.sttt.pose_timeline import PoseTimeline
 from unilab.base.backend.sensors import BackendSensorStream, RigKinematicsSample, SensorClock, StereoFrame
 from unilab.envs.common.rotation import np_matrix_from_quat
 
-__all__ = ["create_pose_runtime"]
+__all__ = ["create_pose_runtime", "BatchSimulationPoseRuntime"]
 
 _NS_PER_SECOND = 1e9
 _QUATERNION_NORM_TOLERANCE = 1e-3
@@ -291,6 +291,65 @@ class _SimulationPoseRuntime(_TimelineEvidence):
             source_timestamps_ns=(timestamp_ns, timestamp_ns),
             frame_id=self._FRAME_ID,
         )
+
+
+class BatchSimulationPoseRuntime:
+    """Independent simulation truth streams, sampled together on physical clocks."""
+
+    def __init__(self, env: Any, num_envs: int, *, sequence_offset: int = 0,
+                 sequence_stride: int | None = None) -> None:
+        if type(num_envs) is not int or num_envs < 1 or type(sequence_offset) is not int or sequence_offset < 0:
+            raise ValueError("batch pose runtime requires positive row count and nonnegative offset")
+        stride = num_envs if sequence_stride is None else sequence_stride
+        if type(stride) is not int or stride < num_envs + sequence_offset:
+            raise ValueError("sequence stride must cover every globally indexed stream")
+        self.env, self.num_envs, self.stride = env, num_envs, stride
+        self.sequence_ids = np.arange(sequence_offset, sequence_offset + num_envs, dtype=np.int64)
+        self.epochs = np.zeros(num_envs, dtype=np.int64)
+        self._last: list[TimedPelvisPose | None] = [None] * num_envs
+        self._closed = False
+
+    def sample(self) -> tuple[TimedPelvisPose, ...]:
+        if self._closed:
+            raise RuntimeError("batch pose runtime is closed")
+        clocks = np.asarray(self.env.get_sim_times_ns())
+        position = np.asarray(self.env.get_base_pos(), dtype=np.float64)
+        quaternion = np.asarray(self.env.get_base_quat(), dtype=np.float64)
+        if clocks.shape != (self.num_envs,) or clocks.dtype != np.int64 or np.any(clocks < 0):
+            raise ValueError("batch physical clocks require nonnegative int64 [num_envs]")
+        if position.shape != (self.num_envs, 3) or quaternion.shape != (self.num_envs, 4):
+            raise ValueError("batch simulation poses require [num_envs,3] positions and [num_envs,4] quaternions")
+        norms = np.linalg.norm(quaternion, axis=1)
+        if not np.isfinite(position).all() or not np.isfinite(norms).all() or np.any(np.abs(norms - 1.) > _QUATERNION_NORM_TOLERANCE):
+            raise ValueError("batch simulation poses require finite positions and unit wxyz quaternions")
+        rotation = np_matrix_from_quat(quaternion / norms[:, None])
+        result = []
+        for row, timestamp in enumerate(clocks):
+            previous = self._last[row]
+            if previous is not None and int(timestamp) < previous.timestamp_ns:
+                raise ValueError("batch physical time moved backwards without a row reset")
+            if previous is None or previous.timestamp_ns != int(timestamp):
+                matrix = np.eye(4, dtype=np.float64)
+                matrix[:3, :3], matrix[:3, 3] = rotation[row], position[row]
+                previous = TimedPelvisPose(sequence_id=int(self.sequence_ids[row]),
+                    tracking_epoch=int(self.epochs[row]), timestamp_ns=int(timestamp),
+                    navigation_from_pelvis=matrix, valid=True,
+                    source_timestamps_ns=(int(timestamp), int(timestamp)), frame_id="world")
+                self._last[row] = previous
+            result.append(previous)
+        return tuple(result)
+
+    def reset(self, env_indices: np.ndarray) -> None:
+        indices = np.asarray(env_indices)
+        if self._closed or indices.ndim != 1 or indices.dtype.kind not in "iu" or np.any(indices < 0) or np.any(indices >= self.num_envs) or len(np.unique(indices)) != len(indices):
+            raise ValueError("batch pose reset requires unique in-range integer row indices")
+        self.sequence_ids[indices] += self.stride
+        self.epochs[indices] += 1
+        for row in indices:
+            self._last[int(row)] = None
+
+    def close(self) -> None:
+        self._closed = True
 
 
 class _CuvslamPoseRuntime(_TimelineEvidence):

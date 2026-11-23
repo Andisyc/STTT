@@ -391,6 +391,26 @@ class FADAPlaybackSession(RslRlPlaybackSession):
             self.footprint_recorder.reset(self.env.get_foot_contact())
         return result
 
+    def reset_rows(self, env_indices: np.ndarray) -> Any:
+        """Reset physical rows and their controller histories at one boundary."""
+        indices = np.asarray(env_indices)
+        if indices.ndim != 1 or indices.dtype.kind not in "iu" or not len(indices):
+            raise ValueError("partial session reset requires nonempty integer row indices")
+        if np.any(indices >= self.num_envs) or np.any(indices < 0) or len(np.unique(indices)) != len(indices):
+            raise ValueError("partial session reset indices must be unique and in range")
+        mask = np.zeros(self.num_envs, dtype=bool)
+        mask[indices] = True
+        if self.controller is not None:
+            self.controller.reset(mask)
+        self.env.reset(indices)
+        if self.official_adapter is not None:
+            self.official_adapter.reset(mask)
+        self.command_control_steps[indices] = 0
+        if self.footprint_recorder is not None:
+            self.footprint_recorder.reset_rows(self.env.get_foot_contact(), mask)
+        self.last_update_stats = None
+        return self.refresh_observation()
+
     def close(self) -> None:
         """Close controller-owned perception before the environment/backend."""
         if self._closed:

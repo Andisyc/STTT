@@ -178,7 +178,8 @@ def proprio_tilt_rad(observation: np.ndarray, *, observation_contract: str = "of
 def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, window_steps,
                                   residual_amplitude_rad, seed, risk_tilt_limit_rad,
                                   device=None, playback_deps=None, observation_augmentation=None,
-                                  trajectory=None, actor_checkpoint=None, world_model_checkpoint=None) -> dict[str, Any]:
+                                  trajectory=None, actor_checkpoint=None, world_model_checkpoint=None,
+                                  forecast_windows=None) -> dict[str, Any]:
     """Capture one real episode without changing existing B collection or training."""
     from unilab.visualization.playback_distill_sessions import create_fada_playback_session
     from unilab.visualization.playback_sessions import RslRlPlaybackConfig
@@ -193,6 +194,8 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
     amplitude = np.asarray(residual_amplitude_rad, dtype=np.float64)
     if isinstance(residual_amplitude_rad, (bool, np.bool_)) or amplitude.shape not in ((), (29,)) or not np.isfinite(amplitude).all() or np.any(amplitude < 0):
         raise ValueError("residual_amplitude_rad must be an explicit finite nonnegative scalar or per-joint 29-vector")
+    if forecast_windows is not None and (type(forecast_windows) is not int or forecast_windows < 1 or actor_checkpoint is None or np.any(amplitude != 0)):
+        raise ValueError("forecast diagnostics require a frozen actor and zero exploration")
     if not isinstance(cfg, DictConfig):
         raise TypeError("collection requires a composed Hydra DictConfig")
     if str(cfg.training.task_name) != "G1WalkFlat" or str(cfg.training.sim_backend) != "mujoco":
@@ -232,14 +235,18 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
     if task_config is not None and pose_config.odometry_source != "simulation":
         raise ValueError("offline reference capture requires simulation truth")
     actor = rollout = task_reference = None
+    initial_path = None
+    forecasts = []
     history = CausalEgoHistory()
     before = None
     step = 0
     label_poses = {}
 
     def command_transform(command):
-        if task_reference is None or before is None:
+        if before is None:
             return command
+        if task_reference is None:
+            return command if initial_path is None else initial_path.command(command)
         measured = label_poses.get(before.timestamp_ns)
         if measured is None:
             raise ValueError("reference control requires a current measured pose")
@@ -252,10 +259,10 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             "observation": query.observation_history[0, -1].detach().cpu().numpy().copy(),
             "command": query.command[0].detach().cpu().numpy().copy(),
         }
-        if actor is not None and task_reference is not None and step % window_steps == 0:
+        if actor is not None and (task_reference is not None or initial_path is not None) and step % window_steps == 0:
             if before is None or rollout is None:
                 raise RuntimeError("actor capture lacks its physical decision point")
-            state = task_reference.state_at(label_poses[before.timestamp_ns])
+            state = initial_path if task_reference is None else task_reference.state_at(label_poses[before.timestamp_ns])
             count = query.observation_history.shape[1]
             samples = [history.at(max(0, before.timestamp_ns - (count - 1 - index) * round(query.profile.ctrl_dt * 1e9))) for index in range(count)]
             parameter = query.command
@@ -269,6 +276,10 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                 proposed = actor(start.latent.feature(), start.errors, start.command, state.preview()) + capture["residual"]
                 limits = actor.residual_limit_rad29
                 capture["residual"] = proposed.clamp(-limits, limits)
+                if forecast_windows is not None:
+                    prediction = rollout.run(start, actor, window_steps=window_steps, horizon_windows=forecast_windows)
+                    forecasts.append({"origin_step": step, "risk": prediction.risk[0, :, 0].cpu().tolist(),
+                        "body_delta": prediction.body_delta[0].cpu().tolist(), "actions": prediction.actions[0].cpu().tolist()})
         return compose_joint_position_residual(
             query.planner_future, capture["residual"], ctrl_dt=query.profile.ctrl_dt,
             position_scale=query.preprocessing["term_scale"]["dof_pos"],
@@ -348,6 +359,12 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
         ref_parameter = next(controller.policy.parameters())
         executed = 0
         capture["previous_residual"] = torch.zeros(1, 29, device=ref_parameter.device, dtype=ref_parameter.dtype)
+        if task_config is not None:
+            from unilab.algos.torch.sttt.path_following.trajectory import PathState, ReferenceTrajectory
+            initial_reference = ReferenceTrajectory.generate(task_config, device=ref_parameter.device, dtype=ref_parameter.dtype)
+            initial_pose = torch.zeros(1, 3, device=ref_parameter.device, dtype=ref_parameter.dtype)
+            initial_progress, _ = initial_reference.project(initial_pose, initial_pose[:, 0])
+            initial_path = PathState(initial_reference, initial_pose, initial_progress)
         for step in range(int(num_steps)):
             before = poses.begin_step()
             if controls and (before.sequence_id != controls[-1].sequence_id or before.timestamp_ns != controls[-1].end_ns):
@@ -476,6 +493,8 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             {"timestamp_ns": p.timestamp_ns, "source_timestamps_ns": p.source_timestamps_ns,
              "sequence_id": p.sequence_id, "tracking_epoch": p.tracking_epoch, "frame_id": p.frame_id}
             for p in label_poses.values()]
+        provenance["rollout_forecasts"] = forecasts
+        provenance["end_reason"] = ("terminated" if bool(np.any(session.env.state.terminated)) else "time_limit") if terminated else "requested_horizon"
         (output / "capture.json").write_text(json.dumps(provenance, allow_nan=False, indent=2) + "\n", encoding="utf-8")
         writer.close()
         return {"sequences": writer.sequence_count, "transitions": writer.transition_count,

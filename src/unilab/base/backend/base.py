@@ -482,6 +482,10 @@ class SimBackend(abc.ABC):
         """Return the single environment's physical time, not elapsed wall time."""
         raise NotImplementedError(f"{self.__class__.__name__} does not expose a physical clock")
 
+    def get_sim_times_ns(self) -> np.ndarray:
+        """Return one physical int64 nanosecond clock per environment row."""
+        raise NotImplementedError(f"{self.__class__.__name__} does not expose batched physical clocks")
+
     def get_physics_state(self) -> np.ndarray:
         """Return a physics snapshot suitable for offline playback/video export."""
         raise NotImplementedError(

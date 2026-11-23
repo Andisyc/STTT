@@ -185,13 +185,16 @@ class PathState:
 class MeasuredTrajectory:
     """One localization identity and task anchor; measured poses reset imagination."""
 
-    def __init__(self, initial: TimedPelvisPose, config: TrajectoryConfig, *, device: Any = "cpu", dtype: torch.dtype = torch.float32):
+    def __init__(self, initial: TimedPelvisPose, config: TrajectoryConfig, *, device: Any = "cpu",
+                 dtype: torch.dtype = torch.float32, reference: ReferenceTrajectory | None = None):
         matrix = pose_matrix(initial)
         self.sequence_id, self.tracking_epoch, self.frame_id = pose_identity(initial)
         self.timestamp_ns = initial.timestamp_ns
         self.origin_xy = tuple(matrix[:2, 3])
         self.heading_rad = float(np.arctan2(matrix[1, 0], matrix[0, 0]))
-        self.reference = ReferenceTrajectory.generate(config, device=device, dtype=dtype)
+        self.reference = ReferenceTrajectory.generate(config, device=device, dtype=dtype) if reference is None else reference
+        if self.reference.xy.shape[0] != 1 or self.reference.config != config:
+            raise ValueError("measured trajectory requires one matching reference")
         self._states: OrderedDict[int, PathState] = OrderedDict()
         self.state_at(initial)
 

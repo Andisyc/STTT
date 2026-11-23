@@ -564,6 +564,10 @@ class NpEnv(ABEnv):
         """Read the backend's physical clock through the public environment seam."""
         return self._backend.get_sim_time_ns()
 
+    def get_sim_times_ns(self) -> np.ndarray:
+        """Read per-row physical clocks through the public backend contract."""
+        return self._backend.get_sim_times_ns()
+
     def get_physics_state_snapshot(self) -> np.ndarray:
         """Return a detached physics snapshot for offline playback/video export."""
         if not self.play_capabilities.supports_physics_state_playback:

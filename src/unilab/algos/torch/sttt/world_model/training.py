@@ -13,6 +13,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from .checkpoint import canonical_contract, load_world_model, save_training_checkpoint
+from .learner import WorldModelLearner
 from .losses import pretraining_loss
 from .model import LatentWorldModel, WorldModelConfig
 from .pretraining_data import PretrainingSequenceSampler
@@ -23,6 +24,7 @@ _TRAINING_DEFAULTS = {
     "validation_every": 1000, "validation_batches": 16, "checkpoint_every": 1000,
     "learning_rate": 3e-4, "weight_decay": 1e-6, "gradient_clip_norm": 100.,
     "resume_checkpoint": None, "initial_checkpoint": None, "loss": {},
+    "microbatch_size": None,
 }
 _LOSS_KEYS = {"free_nats", "kl_scale", "reconstruction_scale", "motion_scale", "risk_scale", "overshoot_scale", "kl_balance", "prior_reconstruction_scale", "window_scale"}
 
@@ -202,7 +204,8 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     if device.type not in {"cpu", "cuda", "mps"}:
         raise ValueError("exact pretraining resume supports CPU, CUDA or MPS")
     signature = {"seed": seed, "device": str(device), **{
-        key: value for key, value in training.items() if key not in {"max_updates", "resume_checkpoint"}
+        key: value for key, value in training.items()
+        if key not in {"max_updates", "resume_checkpoint"} and not (key == "microbatch_size" and value is None)
     }}
     torch.manual_seed(seed)
     resumed_state: dict[str, Any] = {}
@@ -253,7 +256,9 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     history = list(resumed_state.get("history", []))
     best_metric, best_step = resumed_state.get("best_metric"), resumed_state.get("best_step")
     best_state = resumed_state.get("best_state_dict")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    learner = WorldModelLearner(model, {**training, "learning_rate": learning_rate, "weight_decay": weight_decay,
+                                       "gradient_clip_norm": gradient_clip}, loss_config, updates=optimizer_steps)
+    optimizer = learner.optimizer
     if resumed_state:
         optimizer.load_state_dict(resumed_state["optimizer_state"])
         _restore_rng(resumed_state, device)
@@ -275,22 +280,15 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
         del saved_best
 
     while optimizer_steps < max_updates:
-        model.train()
         batch = sampler.sample(batch_size, device=device)
-        optimizer.zero_grad(set_to_none=True)
-        losses = pretraining_loss(model, batch, **loss_config)
-        if any(not bool(torch.isfinite(value)) for value in losses.values()):
-            raise ValueError("non-finite world-model training loss")
-        losses["loss"].backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip, error_if_nonfinite=True)
-        optimizer.step()
-        optimizer_steps += 1
+        losses = learner.update(batch)
+        optimizer_steps = learner.updates
         final = optimizer_steps == max_updates
         improved = False
         if optimizer_steps % integers["validation_every"] == 0 or final:
             validation = _validate(model, validation_sampler, validation_indices, batch_size=batch_size,
                                    device=device, seed=validation_seed, loss_config=loss_config)
-            train_metrics = {key: float(value.detach()) for key, value in losses.items()
+            train_metrics = {key: value for key, value in losses.items()
                              if key not in {"window_xy_squared_error_sum", "window_xy_count"}}
             history.append({"optimizer_steps": optimizer_steps, "train": train_metrics, "validation": validation})
             metric = validation["window_xy_rmse_m"]
