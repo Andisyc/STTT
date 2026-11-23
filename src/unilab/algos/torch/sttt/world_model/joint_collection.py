@@ -222,7 +222,10 @@ class BatchedSequenceCollector:
             target_joint_names=source["target_joint_names"], target_default_joint_angles=source["target_default_joint_angles"],
             target_action_scale=source["target_action_scale"])
 
-    def _physical_observation(self):
+    def _decision_observation(self):
+        """Publish the next command before freezing the next Tracker observation."""
+        command = self._path.command(self._command_template)
+        self.session.set_external_command(command[:, :3].cpu().numpy())
         observation = self.session.official_adapter.observation() if self.session.official_adapter is not None else self.session.obs
         return self.controller.project_observation(observation).detach().cpu().numpy().copy()
 
@@ -243,7 +246,7 @@ class BatchedSequenceCollector:
             pose[indices], progress[indices] = 0., 0.
         projected, _ = reference.project(pose, progress)
         self._path = PathState(reference, pose, projected)
-        observations = self._physical_observation()
+        observations = self._decision_observation()
         initial_errors = self._path.errors().detach().cpu().numpy()
         for position, row in enumerate(indices):
             row = int(row)
@@ -345,10 +348,6 @@ class BatchedSequenceCollector:
         self.versions, self._roots = versions, [None] * self.num_envs
         completed = []
         for _ in range(steps):
-            before = self.poses.sample()
-            self._update_path(before)
-            command = self._path.command(self._command_template)
-            self.session.set_external_command(command[:, :3].cpu().numpy())
             self._query_observation = self._query_command = None
             self.session.step_once()
             after = self.poses.sample()
@@ -359,7 +358,7 @@ class BatchedSequenceCollector:
             source_actions = self.controller.last_source_action.detach().cpu().numpy()
             if actions.shape != (self.num_envs, 29) or source_actions.shape != actions.shape:
                 raise ValueError("actual target and source actions must retain their [num_envs,29] contract")
-            following = self._physical_observation()
+            following = self._decision_observation()
             terminated = np.asarray(self.session.env.state.terminated, dtype=bool).reshape(self.num_envs)
             done = terminated | np.asarray(self.session.env.state.truncated, dtype=bool).reshape(self.num_envs)
             done |= self._steps + 1 >= self.capture.max_episode_steps

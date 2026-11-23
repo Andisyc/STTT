@@ -244,6 +244,95 @@ def test_session_partial_reset_preserves_other_tracker_history(tmp_path):
     assert session.step_count == 12
 
 
+def test_collector_records_command_refreshed_tracker_observations(tmp_path):
+    from types import SimpleNamespace
+
+    from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
+    from unilab.algos.torch.sttt.path_following.joint_config import TrainingVersions
+    from unilab.algos.torch.sttt.pose_data import TimedPelvisPose
+    from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel
+    from unilab.algos.torch.sttt.world_model.joint_collection import BatchedSequenceCollector, _Episode
+    from unilab.envs.locomotion.g1.walk_config import G1WalkFlatCfg
+    from unilab.envs.locomotion.g1.walk_control_bindings import G1WalkControlBindings
+    from unilab.envs.locomotion.g1.walk_observation import assemble_walk_observation
+    from unilab.visualization.playback_sessions import FADAPlaybackSession
+
+    policy, contract, model = physical_inputs(tmp_path)
+    rollout = load_rollout(LoadedWorldModel(model, contract, {}), policy)
+    queries = []
+
+    def capture(query):
+        queries.append(query.observation_history[:, -1].detach().cpu().numpy().copy())
+        return query.planner_future
+
+    controller = FADAPlaybackController(rollout.policy, device="cpu", profile=rollout.profile,
+                                      future_transform=capture)
+
+    class RecordedSensors(G1WalkControlBindings):
+        """Fixed sensor samples; exercise command publication without advancing physics."""
+
+        def __init__(self):
+            self._cfg = G1WalkFlatCfg()
+            self._cfg.gait_clock_mode = "command_fixed"
+            self._cfg.command_gated_phase_contact.enabled = False
+            self._cfg.command_gated_phase_contact.stand_phase = (0., 0.)
+            self._cfg.command_gated_phase_contact.startup_phase = (0., math.pi)
+            self.state = SimpleNamespace(info={
+                "commands": np.zeros((2, 3), np.float32),
+                "gait_phase": np.zeros((2, 2), np.float32),
+                "command_is_null": np.ones(2, bool),
+            })
+            self.refresh_state()
+
+        def refresh_state(self):
+            self._synchronize_external_command_for_observation(self.state.info)
+            vector = np.zeros((2, 3), np.float32)
+            gravity = np.tile(np.array([0., 0., 1.], np.float32), (2, 1))
+            joints = np.zeros((2, 29), np.float32)
+            self.state.obs = assemble_walk_observation(
+                noisy_gyro=vector, noisy_gravity=gravity, noisy_diff=joints, noisy_dof_vel=joints,
+                gyro=vector, gravity=gravity, diff=joints, dof_vel=joints, last_actions=joints,
+                command_obs=self.state.info["commands"], gait_phase=self.state.info["gait_phase"],
+                mode_obs=np.zeros((2, 1), np.float32), linvel=vector, mode_observation=False,
+                walk_profile=True, fada_privileged=False, privileged_strength=None,
+                fada_privileged_obs=None, dtype=np.dtype(np.float32))
+
+        def get_observations(self):
+            return {"actor": torch.from_numpy(self.state.obs["obs"])}
+
+    sensors = RecordedSensors()
+    session = FADAPlaybackSession(controller=controller, env=sensors, wrapped_env=sensors,
+                                  device="cpu", action_mode="policy", num_envs=2)
+    session.refresh_observation()
+    collector = object.__new__(BatchedSequenceCollector)
+    collector.controller, collector.session = controller, session
+    collector._command_template = torch.zeros(2, 3)
+    reference = ReferenceTrajectory.generate(TrajectoryConfig(speed_m_s=.4), batch_size=2)
+    collector._path = PathState(reference, torch.zeros(2, 3), torch.zeros(2))
+    initial = collector._decision_observation()
+    np.testing.assert_array_equal(initial[:, 64:66], np.tile(np.array([0., math.pi], np.float32), (2, 1)))
+    poses = lambda step: [TimedPelvisPose(row, 0, step * 20_000_000, np.eye(4)) for row in range(2)]
+    records = [_Episode(contract, 4, initial[row], poses(0)[row], str(row), 2, np.zeros(2))
+               for row in range(2)]
+
+    for step in range(2):
+        actions = controller.act(session.obs, sensors.state.info["commands"]).detach().cpu().numpy()
+        command = sensors.state.info["commands"].copy()
+        # A task's post-step command resampling can reset phase before the collector
+        # restores its external command for the next decision at the same timestamp.
+        session.set_external_command(np.zeros((2, 3), np.float32))
+        following = collector._decision_observation()
+        for row, record in enumerate(records):
+            record.append(observation=queries[-1][row], command=command[row], action=actions[row],
+                          source_action=actions[row], residual=np.zeros(29), next_observation=following[row],
+                          next_pose=poses(step + 1)[row], terminal=False, risk=0.,
+                          versions=TrainingVersions(), next_errors=np.zeros(2))
+    for row, record in enumerate(records):
+        np.testing.assert_array_equal(record.sequence()["observations"][:-1],
+                                      np.stack([query[row] for query in queries]))
+        assert record.steps == 2
+
+
 def test_live_replay_growing_prefixes_terminal_tails_and_resume(tmp_path):
     from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay
 
