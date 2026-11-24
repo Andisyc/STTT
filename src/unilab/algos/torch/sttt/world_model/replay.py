@@ -13,6 +13,16 @@ from .pretraining_data import PretrainingBatch, _json_copy, _positive_integer, c
 from .sequence_data import _arrays, _contract
 
 
+class ReplayVersionError(ValueError):
+    """Retain the exact normalized metadata rejected by the replay boundary."""
+
+    def __init__(self, identity: str, action_count: int, metadata: dict[str, Any], detail: str):
+        super().__init__(f"replay versions invalid: episode={identity!r}, actions={action_count}, {detail}")
+        self.metadata = metadata
+        self.action_count = action_count
+        self.snapshot_path: str | None = None
+
+
 class EpisodeReplay:
     def __init__(self, contract: Mapping[str, Any], *, capacity_transitions: int,
                  rollout_windows: int, seed: int = 0, device: Any = "cpu"):
@@ -62,8 +72,19 @@ class EpisodeReplay:
         provenance = _json_copy(dict(metadata)) if metadata is not None else self._metadata.get(identity, {})
         if "versions_actor_wm" in provenance:
             versions = provenance["versions_actor_wm"]
-            if len(versions) != count or any(len(pair) != 2 or any(type(x) is not int or x < 0 for x in pair) for pair in versions):
-                raise ValueError("replay versions must identify both learners for every executed action")
+            if not isinstance(versions, list):
+                raise ReplayVersionError(identity, count, provenance,
+                                         f"expected version rows, got {type(versions).__name__}")
+            if len(versions) != count:
+                raise ReplayVersionError(identity, count, provenance, f"version_rows={len(versions)}")
+            for step, pair in enumerate(versions):
+                if not isinstance(pair, list) or len(pair) != 2:
+                    raise ReplayVersionError(identity, count, provenance,
+                                             f"step={step}, expected actor/WM pair, got {pair!r}")
+                for learner, version in zip(("actor", "world_model"), pair):
+                    if type(version) is not int or version < 0:
+                        raise ReplayVersionError(identity, count, provenance,
+                            f"step={step}, learner={learner}, value={version!r}, type={type(version).__name__}")
         if previous is not None and identity in self._metadata:
             old_metadata = self._metadata[identity]
             if {key: value for key, value in old_metadata.items() if key != "versions_actor_wm"} != {key: value for key, value in provenance.items() if key != "versions_actor_wm"}:

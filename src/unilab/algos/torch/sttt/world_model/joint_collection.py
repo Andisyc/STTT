@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from unilab.visualization.playback_sessions import RslRlPlaybackConfig
 
 from .checkpoint import canonical_contract
 from .motion import MOTION_FRAME
+from .replay import ReplayVersionError
 from .sequence_collection import _path_delta, proprio_tilt_rad
 from .sequence_data import SequenceDatasetWriter, _BOOL, _INT, _WINDOW, _sequence_specs
 from .types import RolloutStart
@@ -339,8 +341,28 @@ class BatchedSequenceCollector:
 
     def _store(self, replay, row):
         record = self._records[row]
-        replay.update_episode(record.identity, record.sequence(), metadata={"stream_id": self.stream_offset + row,
-            "condition": self.condition, "versions_actor_wm": record.versions})
+        sequence = record.sequence()
+        metadata = {"stream_id": self.stream_offset + row,
+                    "condition": self.condition, "versions_actor_wm": record.versions}
+        try:
+            replay.update_episode(record.identity, sequence, metadata=metadata)
+        except ReplayVersionError as error:
+            directory = self.output / "replay_failures"
+            directory.mkdir(parents=True, exist_ok=True)
+            snapshot = directory / f"replay_failure_{uuid4().hex}.pkl"
+            temporary = snapshot.with_suffix(".tmp")
+            try:
+                with temporary.open("xb") as handle:
+                    pickle.dump({"identity": record.identity, "contract": self.contract,
+                                 "sequence": sequence, "metadata": error.metadata,
+                                 "input_metadata": metadata, "error": str(error)},
+                                handle, protocol=pickle.HIGHEST_PROTOCOL)
+                temporary.replace(snapshot)
+            except Exception as snapshot_error:
+                raise error from snapshot_error
+            error.snapshot_path = str(snapshot)
+            error.args = (f"{error}; failed input saved to {snapshot}",)
+            raise
 
     def advance(self, steps: int, replay, *, versions: TrainingVersions) -> CollectionBlock:
         if type(steps) is not int or steps < self.capture.window_steps or steps % self.capture.window_steps:

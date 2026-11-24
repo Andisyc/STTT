@@ -332,6 +332,58 @@ def test_collector_records_command_refreshed_tracker_observations(tmp_path):
         assert record.steps == 2
 
 
+@pytest.mark.parametrize("invalid", ["count", "pair", "value"])
+def test_replay_failure_snapshot_preserves_exact_rejected_input(tmp_path, invalid):
+    import pickle
+    from types import SimpleNamespace
+
+    from unilab.algos.torch.sttt.world_model.joint_collection import BatchedSequenceCollector
+    from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay, ReplayVersionError
+
+    _, contract, _ = physical_inputs(tmp_path)
+    raw = _raw_capture(tmp_path / "train")
+    versions = [[0, 0] for _ in range(len(raw["actions"]))]
+    replay = EpisodeReplay(contract, capacity_transitions=100, rollout_windows=2)
+    metadata = {"stream_id": 0, "condition": "nominal", "versions_actor_wm": deepcopy(versions[:3])}
+    replay.update_episode("failed", _physical_prefix(raw, 3, contract), metadata=metadata)
+    if invalid == "count":
+        versions.pop()
+    elif invalid == "pair":
+        versions[3] = [0]
+    else:
+        versions[3] = [0.0, 0]
+    collector = object.__new__(BatchedSequenceCollector)
+    collector.output, collector.contract = tmp_path / "capture", contract
+    collector.stream_offset, collector.condition = 0, "nominal"
+    collector._records = [SimpleNamespace(identity="failed", versions=versions, sequence=lambda: raw)]
+
+    with pytest.raises(ReplayVersionError) as failure:
+        collector._store(replay, 0)
+
+    assert failure.value.snapshot_path is not None
+    with Path(failure.value.snapshot_path).open("rb") as handle:
+        snapshot = pickle.load(handle)
+    assert snapshot["identity"] == "failed"
+    assert snapshot["metadata"]["versions_actor_wm"] == versions
+    assert snapshot["input_metadata"]["versions_actor_wm"] == versions
+    if invalid == "value":
+        assert type(snapshot["metadata"]["versions_actor_wm"][3][0]) is float
+    for key, values in raw.items():
+        np.testing.assert_array_equal(snapshot["sequence"][key], values)
+    assert replay.transitions == replay.total_collected == 3
+    assert replay.episode_metadata("failed") == metadata
+
+    restored = EpisodeReplay(snapshot["contract"], capacity_transitions=100, rollout_windows=2)
+    with pytest.raises(ReplayVersionError) as reproduced:
+        restored.update_episode(snapshot["identity"], snapshot["sequence"], metadata=snapshot["metadata"])
+    assert reproduced.value.action_count == len(raw["actions"])
+    assert str(reproduced.value) == snapshot["error"]
+    assert reproduced.value.metadata == failure.value.metadata
+    repaired = {**metadata, "versions_actor_wm": [[0, 0] for _ in range(len(raw["actions"]))]}
+    replay.update_episode("failed", raw, metadata=repaired)
+    assert replay.transitions == len(raw["actions"])
+
+
 def test_live_replay_growing_prefixes_terminal_tails_and_resume(tmp_path):
     from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay
 
