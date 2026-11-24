@@ -223,11 +223,14 @@ class NpEnv(ABEnv):
         """Reset every row through the same state-carrier lifecycle used by autoreset."""
 
         if self._state is None:
-            return self.init_state()
-        # B1: 标记全部 row 后复用 _reset_done_envs, 同步 backend, obs 与 info carrier.
-        self._state.terminated.fill(True)
-        self._state.truncated.fill(False)
-        self._reset_done_envs()
+            self.init_state()
+        else:
+            # Reuse autoreset's state publication without retaining its done flags.
+            self._state.terminated.fill(True)
+            self._state.truncated.fill(False)
+            self._reset_done_envs()
+        assert self._state is not None
+        self._state.reward.fill(0)
         self._state.terminated.fill(False)
         self._state.truncated.fill(False)
         self._clear_step_final_observation()

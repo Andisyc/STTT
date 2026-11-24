@@ -247,6 +247,66 @@ class TestNpEnvInitState:
         np.testing.assert_array_equal(observed.obs["obs"], 0.0)
         np.testing.assert_array_equal(observed.terminated, False)
 
+    def test_session_full_reset_publishes_fresh_observations_and_control_state(self):
+        from unilab.training.rsl_rl import RslRlVecEnvWrapper
+        from unilab.visualization.playback_sessions import FADAPlaybackSession
+
+        class _ResetInfoEnv(_StubNpEnv):
+            def reset(self, env_indices: np.ndarray):
+                obs, info = super().reset(env_indices)
+                for observation in obs.values():
+                    observation.fill(self._reset_count)
+                info["commands"] = np.full((len(env_indices), 3), 0.4)
+                info["current_actions"] = np.zeros((len(env_indices), 3))
+                info["gait_phase"] = np.full((len(env_indices), 2), float(self._reset_count))
+                return obs, info
+
+        env = _ResetInfoEnv(num_envs=2)
+        env.set_autoreset(False)
+        wrapped = RslRlVecEnvWrapper(env, device="cpu", policy_obs_mode="actor")
+        state = _require_state(env)
+        np.testing.assert_array_equal(wrapped.get_observations()["actor"].numpy(), env._reset_count)
+        np.testing.assert_array_equal(state.terminated, False)
+        np.testing.assert_array_equal(state.truncated, False)
+        session = FADAPlaybackSession(controller=None, env=env, wrapped_env=wrapped,
+                                     device="cpu", action_mode="policy", num_envs=2)
+        for observation in state.obs.values():
+            observation.fill(7.)
+        state.info["steps"][:] = [env.cfg.max_episode_steps, 2]
+        state.info["commands"].fill(9.)
+        state.info["current_actions"].fill(0.8)
+        state.info["gait_phase"].fill(9.)
+        state.reward.fill(7.)
+        state.terminated.fill(True)
+        state.truncated.fill(True)
+        wrapped.episode_returns.fill_(5.)
+        wrapped.episode_lengths.fill_(3.)
+        env.step_counter = 123
+
+        observed = session.reset()
+
+        np.testing.assert_array_equal(observed["actor"].numpy(), env._reset_count)
+        np.testing.assert_array_equal(observed["critic"].numpy(), env._reset_count)
+        np.testing.assert_array_equal(wrapped.get_observations()["actor"].numpy(), observed["actor"].numpy())
+        np.testing.assert_array_equal(wrapped.get_privileged_observations().numpy(), observed["critic"].numpy())
+        for observation in state.obs.values():
+            np.testing.assert_array_equal(observation, env._reset_count)
+        np.testing.assert_array_equal(state.info["steps"], 0)
+        np.testing.assert_allclose(state.info["commands"], .4)
+        np.testing.assert_array_equal(state.info["current_actions"], 0.)
+        np.testing.assert_array_equal(state.info["gait_phase"], env._reset_count)
+        np.testing.assert_array_equal(state.reward, 0.)
+        np.testing.assert_array_equal(state.terminated, False)
+        np.testing.assert_array_equal(state.truncated, False)
+        np.testing.assert_array_equal(wrapped.episode_returns.numpy(), 0.)
+        np.testing.assert_array_equal(wrapped.episode_lengths.numpy(), 0.)
+        assert state.final_observation is None
+        assert env.step_counter == 123
+
+        following = env.step(np.zeros((2, 3), dtype=np.float32))
+        np.testing.assert_array_equal(following.info["steps"], 1)
+        np.testing.assert_array_equal(following.truncated, False)
+
     def test_session_partial_reset_publishes_fresh_rows_without_repeated_timeout(self):
         from unilab.training.rsl_rl import RslRlVecEnvWrapper
         from unilab.visualization.playback_sessions import FADAPlaybackSession
