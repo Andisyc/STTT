@@ -402,7 +402,7 @@ class FADAPlaybackSession(RslRlPlaybackSession):
         mask[indices] = True
         if self.controller is not None:
             self.controller.reset(mask)
-        self.env.reset(indices)
+        self.env.reset_rows(indices)
         if self.official_adapter is not None:
             self.official_adapter.reset(mask)
         self.command_control_steps[indices] = 0

@@ -233,6 +233,21 @@ class NpEnv(ABEnv):
         self._clear_step_final_observation()
         return self._state
 
+    def reset_rows(self, env_indices: np.ndarray) -> NpEnvState:
+        """Reset selected rows and publish fresh state for their next control step."""
+        if self._state is None:
+            raise RuntimeError("partial reset requires an initialized environment")
+        self._reset_state_rows(env_indices)
+        self._state.reward[env_indices] = 0
+        self._state.terminated[env_indices] = False
+        self._state.truncated[env_indices] = False
+        terminal_mask = self._state.info.get("_final_observation")
+        if isinstance(terminal_mask, np.ndarray):
+            terminal_mask[env_indices] = False
+            if not terminal_mask.any():
+                self._state.final_observation = None
+        return self._state
+
     def step(self, actions: np.ndarray) -> NpEnvState:
         import time
 
@@ -328,7 +343,6 @@ class NpEnv(ABEnv):
             return
 
         env_indices = np.flatnonzero(done).astype(np.int32)
-        self._state.info["steps"][env_indices] = 0
 
         final_observation = self._ensure_final_observation_scratch()
         compat_final_observation, compat_terminal_mask = (
@@ -342,6 +356,11 @@ class NpEnv(ABEnv):
 
         self._state.final_observation = final_observation
 
+        self._reset_state_rows(env_indices)
+
+    def _reset_state_rows(self, env_indices: np.ndarray) -> None:
+        assert self._state is not None
+        self._state.info["steps"][env_indices] = 0
         new_obs, info1 = self.reset(env_indices)
         for key in self._state.obs:
             self._state.obs[key][env_indices] = new_obs[key]

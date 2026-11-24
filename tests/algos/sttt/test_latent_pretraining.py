@@ -222,9 +222,8 @@ def test_session_partial_reset_preserves_other_tracker_history(tmp_path):
     reference.act_projected(observations, command)
 
     class Rows:
-        def reset(self, indices):
+        def reset_rows(self, indices):
             observations[indices, 6] = .2
-            return {"actor": observations}, {}
 
         def get_observations(self):
             return {"actor": observations}

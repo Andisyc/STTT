@@ -247,6 +247,62 @@ class TestNpEnvInitState:
         np.testing.assert_array_equal(observed.obs["obs"], 0.0)
         np.testing.assert_array_equal(observed.terminated, False)
 
+    def test_session_partial_reset_publishes_fresh_rows_without_repeated_timeout(self):
+        from unilab.training.rsl_rl import RslRlVecEnvWrapper
+        from unilab.visualization.playback_sessions import FADAPlaybackSession
+
+        class _ResetInfoEnv(_StubNpEnv):
+            def reset(self, env_indices: np.ndarray):
+                obs, info = super().reset(env_indices)
+                info["commands"] = np.full((len(env_indices), 3), 0.4)
+                info["current_actions"] = np.zeros((len(env_indices), 3))
+                info["gait_phase"] = np.zeros((len(env_indices), 2))
+                return obs, info
+
+        env = _ResetInfoEnv(num_envs=2)
+        env.set_autoreset(False)
+        wrapped = RslRlVecEnvWrapper(env, device="cpu", policy_obs_mode="actor")
+        session = FADAPlaybackSession(controller=None, env=env, wrapped_env=wrapped,
+                                     device="cpu", action_mode="policy", num_envs=2)
+        state = _require_state(env)
+        for observation in state.obs.values():
+            observation.fill(7.0)
+        state.info["steps"][:] = [env.cfg.max_episode_steps, 2]
+        state.info["commands"][:] = [[1., 2., 3.], [4., 5., 6.]]
+        state.info["current_actions"].fill(0.8)
+        state.info["gait_phase"].fill(0.5)
+        state.reward[:] = [3., 4.]
+        state.terminated[:] = [False, True]
+        state.truncated[:] = [True, False]
+        state.final_observation = {key: np.full_like(value, -3.) for key, value in state.obs.items()}
+        state.info["final_observation"] = {key: value.copy() for key, value in state.final_observation.items()}
+        state.info["_final_observation"] = np.ones(2, dtype=bool)
+        env.step_counter = 123
+
+        observed = session.reset_rows(np.array([0], dtype=np.int64))
+
+        np.testing.assert_array_equal(state.info["steps"], [0, 2])
+        np.testing.assert_allclose(state.info["commands"], [[.4, .4, .4], [4., 5., 6.]])
+        np.testing.assert_allclose(state.info["current_actions"], [[0., 0., 0.], [.8, .8, .8]])
+        np.testing.assert_allclose(state.info["gait_phase"], [[0., 0.], [.5, .5]])
+        for observation in state.obs.values():
+            np.testing.assert_array_equal(observation[0], 0.)
+            np.testing.assert_array_equal(observation[1], 7.)
+        np.testing.assert_array_equal(observed["actor"][0].numpy(), 0.)
+        np.testing.assert_array_equal(observed["actor"][1].numpy(), 7.)
+        np.testing.assert_array_equal(state.reward, [0., 4.])
+        np.testing.assert_array_equal(state.terminated, [False, True])
+        np.testing.assert_array_equal(state.truncated, [False, False])
+        np.testing.assert_array_equal(state.info["_final_observation"], [False, True])
+        assert state.final_observation is not None
+        np.testing.assert_array_equal(state.final_observation["obs"][1], -3.)
+        assert env.step_counter == 123
+
+        for expected_steps in (1, 2):
+            following = env.step(np.zeros((2, 3), dtype=np.float32))
+            assert following.info["steps"][0] == expected_steps
+            assert not following.truncated[0]
+
     def test_preserve_rollout_state_restores_env_rng_and_backend_on_exception(self):
         env = _StubNpEnv(num_envs=1)
         env.init_state()
