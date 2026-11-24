@@ -57,6 +57,35 @@ def physical_inputs(tmp_path):
     return checkpoint, contract, model
 
 
+def test_legacy_archive_import_validates_json_without_deepcopy(tmp_path, monkeypatch):
+    import copy
+    import json
+    from unilab.algos.torch.sttt.path_following.joint_training import _import_datasets
+    from unilab.algos.torch.sttt.world_model.checkpoint import canonical_contract
+    from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay
+
+    _, contract, _ = physical_inputs(tmp_path)
+    expected = json.loads(json.dumps(contract))
+    wrong_profile = json.loads(json.dumps(contract))
+    wrong_profile["source"]["source_profile"]["ctrl_dt"] *= 2
+    wrong_preprocessing = json.loads(json.dumps(contract))
+    wrong_preprocessing["source"]["preprocessing"]["term_scale"]["dof_vel"] *= 2
+    replay = EpisodeReplay(contract, capacity_transitions=20, rollout_windows=2)
+
+    def unavailable_deepcopy(*args, **kwargs):
+        raise TypeError("issubclass() arg 1 must be a class")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(copy, "deepcopy", unavailable_deepcopy)
+        _import_datasets([tmp_path / "train"], replay)
+        assert canonical_contract(contract) == expected
+        for invalid in (wrong_profile, wrong_preprocessing):
+            with pytest.raises(ValueError, match="source profile/preprocessing metadata disagree"):
+                canonical_contract(invalid)
+    assert replay.total_collected == 6
+    assert replay.sample(1).sequence["actions"].shape == (1, 4, 29)
+
+
 def test_rotating_frame_windows_are_composed_not_summed():
     motion = torch.tensor([[[1., 0., math.pi / 2], [1., 0., 0.], [0., 1., -.2]]], dtype=torch.float64, requires_grad=True)
     poses = motion_prefix(motion)

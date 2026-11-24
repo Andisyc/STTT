@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -41,10 +41,14 @@ def canonical_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     if data.get("observation_dim") not in (64, 66) or data.get("action_dim") != 29:
         raise ValueError("world-model artifact requires an admitted observation contract and 29D ENV actions")
     if data["observation_dim"] == 66:
-        from dataclasses import asdict
         from unilab.algos.torch.distill.fada.legacy_deployment import LegacyFADAPlaybackProfile
         profile = LegacyFADAPlaybackProfile.from_source(source["source_profile"].get("source_profile"))
-        if json.loads(json.dumps(asdict(profile), allow_nan=False)) != source["source_profile"] or profile.preprocessing != source["preprocessing"]:
+        # Source metadata is already finite JSON; normalize tuples without deepcopy.
+        profile_json = json.loads(json.dumps(
+            {field.name: getattr(profile, field.name) for field in fields(profile)},
+            allow_nan=False,
+        ))
+        if profile_json != source["source_profile"] or profile.preprocessing != source["preprocessing"]:
             raise ValueError("legacy WM source profile/preprocessing metadata disagree")
     if source["delta_frame"] != MOTION_FRAME or source["delta_units"] != ["m", "m", "rad"]:
         raise ValueError("world-model motion labels must use control-start heading meters/radians")
