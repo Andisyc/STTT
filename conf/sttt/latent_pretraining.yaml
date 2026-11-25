@@ -11,8 +11,8 @@ seed: 0
 source_overrides: []  # Physical settings; measurement noise remains disabled.
 resume_checkpoint: null  # Paired joint state; collectors resume in new physical episodes.
 schedule:
-  pretrain_wm_updates: 50000  # PWM generic warmup default, not a G1 convergence claim.
-  online_iterations: 15000
+  pretrain_wm_updates: 10000  # Shortened training budget; convergence is measured separately.
+  online_iterations: 3000
   actor_updates_per_iteration: 1
   wm_updates_per_iteration: 8
   checkpoint_every: 2500
