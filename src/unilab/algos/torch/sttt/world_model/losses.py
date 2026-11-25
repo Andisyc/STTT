@@ -33,8 +33,8 @@ def _categorical_kl(target: torch.Tensor, prediction: torch.Tensor, unimix: floa
 
 
 def _motion_error(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    difference = prediction - target.detach()
-    return torch.cat((difference[..., :2], torch.atan2(difference[..., 2:].sin(), difference[..., 2:].cos())), -1).square().mean(-1)
+    # These are motion increments, not interchangeable absolute orientations.
+    return (prediction - target.detach()).square().mean(-1)
 
 
 def world_model_loss(
@@ -133,7 +133,19 @@ def world_model_loss(
     crosses_reset = invalid_prefix.gather(1, safe_end) != invalid_prefix.gather(1, safe_start)
     window_mask = label_valid & bounds & ~crosses_reset
     window_target = torch.where(window_mask[..., None], batch["window_delta"], 0.)
-    window_loss = _masked_mean(_motion_error(window_prediction, window_target), window_mask)
+    # Do not let a full predicted revolution disappear at the window boundary.
+    predicted_yaw = F.pad(motion_prediction[..., 2].cumsum(1), (1, 0))
+    predicted_turn = predicted_yaw.gather(1, safe_end) - predicted_yaw.gather(1, safe_start)
+    target_yaw = F.pad(motion_target[..., 2].cumsum(1), (1, 0))
+    target_turn = target_yaw.gather(1, safe_end) - target_yaw.gather(1, safe_start)
+    missing_motion = F.pad((~motion_mask).long().cumsum(1), (1, 0))
+    dense_window = missing_motion.gather(1, safe_end) == missing_motion.gather(1, safe_start)
+    # Dense labels identify genuine turns beyond pi. Sparse short-window labels
+    # retain their measured principal-angle target, never the prediction's winding.
+    target_turn = torch.where(dense_window, target_turn, window_target[..., 2])
+    continuous_prediction = torch.cat((window_prediction[..., :2], predicted_turn[..., None]), -1)
+    continuous_target = torch.cat((window_target[..., :2], target_turn[..., None]), -1)
+    window_loss = _masked_mean(_motion_error(continuous_prediction, continuous_target), window_mask)
     window_xy_error = (window_prediction[..., :2] - window_target[..., :2]).square().sum(-1)
     window_xy_sum = torch.where(window_mask, window_xy_error, 0.).sum()
     risk_target = batch["risk"].detach().to(observations)

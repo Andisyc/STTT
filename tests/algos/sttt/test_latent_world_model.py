@@ -182,6 +182,49 @@ def test_sequence_loss_terminal_mask_and_artifact_identity(tmp_path):
         load_world_model(artifact, expected_contract=wrong)
 
 
+def _angular_motion_loss(monkeypatch, predicted_turn, target_turn=0., *, dense=True):
+    steps = 10
+    raw = sequence(steps=steps)
+    raw["path_delta"][:] = (0., 0., target_turn)
+    raw["window_delta"][:] = (0., 0., math.atan2(math.sin(steps * target_turn), math.cos(steps * target_turn)))
+    raw["motion_valid"][:] = dense
+    batch = {key: value.double() if value.is_floating_point() else value
+             for key, value in batch_sequences([raw]).items()}
+    model = LatentWorldModel(model_config()).double().eval().requires_grad_(False)
+    theta = torch.tensor(predicted_turn, dtype=torch.float64, requires_grad=True)
+    monkeypatch.setattr(model, "motion", lambda latent, action: torch.cat(
+        (action[:, :2] * 0., theta.expand(action.shape[0], 1)), -1))
+    losses = world_model_loss(model, batch, kl_scale=0., reconstruction_scale=0.,
+        prior_reconstruction_scale=0., overshoot_scale=0., risk_scale=0.)
+    return losses, theta
+
+
+@pytest.mark.parametrize("dense", [True, False])
+@pytest.mark.parametrize("sign", [-1., 1.])
+def test_angular_motion_rejects_full_turn_alias_and_corrects_gradient(monkeypatch, dense, sign):
+    old_minimum = sign * 2 * math.pi * 10 / 101
+    losses, theta = _angular_motion_loss(monkeypatch, old_minimum, dense=dense)
+    gradient = torch.autograd.grad(losses["loss"], theta)[0]
+    expected_weight = (100 + int(dense)) / 3
+    assert float(losses["loss"].detach()) == pytest.approx(expected_weight * old_minimum**2)
+    assert float(gradient) == pytest.approx(2 * expected_weight * old_minimum)
+    closer, _ = _angular_motion_loss(monkeypatch, old_minimum * .99, dense=dense)
+    correct, _ = _angular_motion_loss(monkeypatch, 0., dense=dense)
+    assert float(closer["loss"].detach()) < float(losses["loss"].detach())
+    assert float(correct["loss"].detach()) == pytest.approx(0., abs=1e-12)
+
+
+@pytest.mark.parametrize("sign", [-1., 1.])
+def test_angular_motion_preserves_genuine_dense_turns_beyond_pi(monkeypatch, sign):
+    target = sign * .7  # Ten valid increments record a genuine turn beyond 2*pi.
+    matching, _ = _angular_motion_loss(monkeypatch, target, target)
+    aliased, theta = _angular_motion_loss(monkeypatch, target - sign * 2 * math.pi / 10, target)
+    assert float(matching["motion_loss"].detach()) == pytest.approx(0., abs=1e-12)
+    assert float(matching["window_loss"].detach()) == pytest.approx(0., abs=1e-12)
+    assert float(aliased["window_loss"].detach()) == pytest.approx((2 * math.pi)**2 / 3)
+    assert float(torch.autograd.grad(aliased["loss"], theta)[0]) * sign < 0
+
+
 def test_actual_tracker_rollout_and_actor_credit_are_preserved(tmp_path):
     case, profile, _, model, factory = parts(tmp_path / "case")
     query, source = captured_query(case, profile)
