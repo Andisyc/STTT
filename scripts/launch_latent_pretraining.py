@@ -179,9 +179,12 @@ def choose_backend(cgroup: Cgroup, resources: Resources, environment: dict[str, 
     raise RuntimeError("没有可用的独立用户服务或已委派的 memory 控制器；无法保证内存预留，未启动训练。")
 
 
-def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str) -> list[str]:
+def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str,
+                     *, actor_microbatch_size: int | None = None) -> list[str]:
     def relative(path: Path) -> str:
         return str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+    if actor_microbatch_size is not None and (type(actor_microbatch_size) is not int or actor_microbatch_size < 1):
+        raise ValueError("actor microbatch size must be a positive integer")
 
     train = sorted(relative(p.parent) for p in (data_dir / "capture" / "nominal").glob("*/metadata.json"))
     validation = sorted(relative(p.parent) for p in (data_dir / "validation").rglob("metadata.json"))
@@ -199,7 +202,8 @@ def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str) ->
             "capture.risk_tilt_limit_rad=0.8",
             "capture.command_ranges=[[-0.6,1.0],[-0.4,0.4],[-0.8,0.8]]",
             "actor.training.residual_limit_rad=" + json.dumps([0.005] * 29),
-            "calibration.require_response_probe=false"]
+            "calibration.require_response_probe=false",
+            *([] if actor_microbatch_size is None else [f"actor.training.microbatch_size={actor_microbatch_size}"])]
 
 
 def worker(payload: str, command: list[str]) -> None:
@@ -277,13 +281,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--data-dir", type=Path, required=True, help="包含 capture/nominal 和 validation 的旧运行目录")
     parser.add_argument("--policy-checkpoint", type=Path, default=Path("model/mixup_0kg/student_iter_0031.pt"))
     parser.add_argument("--output-dir", type=Path, help="新运行目录；默认自动生成时间戳")
+    parser.add_argument("--actor-microbatch-size", type=int, help="A 推演的单组样本数；不改变有效 batch 或训练次数")
     parser.add_argument("--dry-run", action="store_true", help="仅显示资源分配，不创建输出文件或启动进程")
     options = parser.parse_args(argv)
     output = (options.output_dir or Path(f"outputs/latent_joint_reuse_{datetime.now():%Y%m%d_%H%M%S_%f}")).resolve()
     uv, ionice = shutil.which("uv"), shutil.which("ionice")
     if uv is None or ionice is None:
         raise RuntimeError("需要已安装的 uv 和 ionice；本脚本不安装工具。")
-    command = training_command(options.data_dir.resolve(), options.policy_checkpoint.resolve(), output, uv)
+    command = training_command(options.data_dir.resolve(), options.policy_checkpoint.resolve(), output, uv,
+                               actor_microbatch_size=options.actor_microbatch_size)
     cgroup, resources = inspect_resources()
     environment = dict(os.environ)
     environment.update(OMP_NUM_THREADS=str(resources.threads), MKL_NUM_THREADS=str(resources.threads),
