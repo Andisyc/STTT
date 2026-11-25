@@ -36,7 +36,6 @@ capture:
 calibration:
   response_probe_result: null
   require_response_probe: true
-  cost_scales: null  # Null derives and freezes physical RMS scales from initial capture statistics.
 wm:
   device: ${device}
   seed: ${seed}
@@ -59,6 +58,14 @@ actor:
     max_grad_norm: 10.0
     checkpoint_every: ${schedule.checkpoint_every}
     seed: ${seed}
+    critic:
+      hidden_dims: [256, 128]
+      learning_rate: 0.0005
+      epochs: 8
+      minibatches: 4
+      lambda_return: 0.95
+      target_tau: 0.01
+      max_grad_norm: 10.0
   trajectories:
     base:
       preview_points: 8
@@ -67,12 +74,16 @@ actor:
     lateral_range: [-0.3, 0.3]
     heading_range: [-0.3, 0.3]
   costs:
-    lateral_weight: 1.0
+    lateral_weight: 0.5
     lateral_velocity_weight: 1.0
     forward_weight: 1.0
-    smoothness_weight: 1.0
+    smoothness_weight: 0.01
     risk_weight: 1.0
-    huber_delta: null
+    lateral_tolerance_m: 0.3
+    lateral_velocity_tolerance_m_s: 1.0
+    forward_speed_floor_m_s: 0.1
+    discount: 0.99
+    failure_cost_rate: 4.0
 evaluation:
   horizon_windows: ${actor.training.horizon_windows}
 

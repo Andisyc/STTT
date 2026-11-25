@@ -4,6 +4,7 @@ policy_checkpoint: null
 profile_path: null  # Official policies require a file; g1_fada_state_v2 uses its embedded profile.
 response_checkpoint: null  # Required only when also selecting oat_path.
 world_model_checkpoint: null  # Required for latent_wm and latent_wm_frozen; independent of response_checkpoint.
+pretrained_actor_checkpoint: null  # Required when adapting A; includes its cost Critic.
 latent_learning:
   online:
     residual_limit_rad: null  # Required: 29 positive source-order physical joint limits in radians.

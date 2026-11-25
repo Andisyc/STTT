@@ -273,7 +273,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                     ego_valid=torch.tensor([[row[1]] for row in samples], device=parameter.device, dtype=torch.bool)[None],
                     ego_age_s=parameter.new_tensor([[row[2]] for row in samples])[None], path_state=state,
                 )
-                proposed = actor(start.latent.feature(), start.errors, start.command, state.preview()) + capture["residual"]
+                proposed = actor(start.latent.feature(), start.errors, start.command, state.preview(), start.previous_residual) + capture["residual"]
                 limits = actor.residual_limit_rad29
                 capture["residual"] = proposed.clamp(-limits, limits)
                 if forecast_windows is not None:

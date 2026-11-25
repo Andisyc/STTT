@@ -24,6 +24,7 @@ from unilab.algos.torch.sttt.path_following.intervention import compose_joint_po
 from unilab.algos.torch.sttt.path_following.joint_config import CaptureSchedule, TrainingVersions
 from unilab.algos.torch.sttt.path_following.joint_data import join_rollout_starts, select_path, select_rollout_start
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
+from unilab.algos.torch.sttt.path_following.latent_objectives import ObservedCostWindow
 from unilab.algos.torch.sttt.path_following.trajectory import PathState, ReferenceTrajectory
 from unilab.visualization.playback_sessions import RslRlPlaybackConfig
 
@@ -40,6 +41,7 @@ class CollectionBlock:
     physical_control_steps: int
     starts: RolloutStart | None
     completed_directories: tuple[str, ...]
+    failures: tuple[tuple[RolloutStart, ObservedCostWindow], ...] = ()
 
 
 class _Episode:
@@ -147,6 +149,7 @@ class BatchedSequenceCollector:
         self.model = self.actor = self.rollout = None
         self.versions = TrainingVersions()
         self._roots: list[RolloutStart | None] = [None] * num_envs
+        self._latest_starts: list[RolloutStart | None] = [None] * num_envs
         self._query_observation = self._query_command = None
         policy_path = Path(str(cfg.training.play_checkpoint_path)).expanduser()
         policy_path = policy_path if policy_path.is_absolute() else Path(root_dir) / policy_path
@@ -306,9 +309,10 @@ class BatchedSequenceCollector:
                     ego_motion=torch.as_tensor(ego, device=self.device), ego_valid=torch.as_tensor(valid, device=self.device),
                     ego_age_s=torch.as_tensor(age, device=self.device), path_state=path)
                 for output, row in enumerate(indices):
+                    self._latest_starts[int(row)] = select_rollout_start(start, slice(output, output + 1))
                     if self._roots[int(row)] is None:
                         self._roots[int(row)] = select_rollout_start(start, slice(output, output + 1))
-                proposed = self.actor(start.latent.feature(), start.errors, start.command, path.preview()) + noise
+                proposed = self.actor(start.latent.feature(), start.errors, start.command, path.preview(), start.previous_residual) + noise
                 self._residual[index] = proposed.clamp(-self.actor.residual_limit_rad29, self.actor.residual_limit_rad29)
             else:
                 self._residual[index] = noise
@@ -369,6 +373,7 @@ class BatchedSequenceCollector:
             raise ValueError("persistent collection advances complete residual windows")
         self.versions, self._roots = versions, [None] * self.num_envs
         completed = []
+        failures = []
         for _ in range(steps):
             self._query_observation = self._query_command = None
             self.session.step_once()
@@ -399,6 +404,25 @@ class BatchedSequenceCollector:
                 indices = np.flatnonzero(done)
                 for row in indices:
                     record = self._records[int(row)]
+                    last = self._latest_starts[int(row)]
+                    if terminated[row] and last is not None:
+                        end = record.steps
+                        begin = ((end - 1) // self.capture.window_steps) * self.capture.window_steps
+                        arrays = record.arrays
+                        heading = record.errors[begin:end, 1]
+                        motion = arrays["path_delta"][begin:end]
+                        forward = np.cos(heading) * motion[:, 0] - np.sin(heading) * motion[:, 1]
+                        change = np.diff(record.errors[begin:end + 1], axis=0)
+                        path_delta = np.column_stack((forward, change))
+                        def tensor(value):
+                            return torch.as_tensor(value.copy(), device=self.device, dtype=self.dtype).unsqueeze(0)
+                        measured = ObservedCostWindow(
+                            tensor(record.errors[begin:end + 1]), tensor(path_delta),
+                            tensor(arrays["actions"][begin:end]), tensor(arrays["source_actions"][begin:end]),
+                            tensor(arrays["residuals"][begin:begin + 1]), tensor(arrays["risk"][begin:end]),
+                            tensor(arrays["commands"][begin:end]),
+                            tensor(np.linalg.norm(arrays["commands"][begin:end, :2], axis=-1)))
+                        failures.append((last, measured))
                     self._store(replay, int(row))
                     completed.append(self._persist(int(row), prefix=False))
                 self.poses.reset(indices)
@@ -410,7 +434,7 @@ class BatchedSequenceCollector:
         if self.actor is not None and any(start is None for start in self._roots):
             raise RuntimeError("collection block did not visit an actor decision in every stream")
         starts = join_rollout_starts([start for start in self._roots if start is not None]) if self.actor is not None else None
-        return CollectionBlock(steps * self.num_envs, starts, tuple(completed))
+        return CollectionBlock(steps * self.num_envs, starts, tuple(completed), tuple(failures))
 
     def flush(self, replay) -> tuple[str, ...]:
         directories = []

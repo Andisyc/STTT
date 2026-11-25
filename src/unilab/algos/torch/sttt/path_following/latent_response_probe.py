@@ -46,7 +46,10 @@ class _HeldResidual(nn.Module):
         super().__init__()
         self.register_buffer("residual", residual.detach().clone())
 
-    def forward(self, feature, _errors, _command, _preview):
+
+    def context(self, feature, errors, command, preview, previous_residual):
+        return torch.cat((feature, errors, command, preview.flatten(1), previous_residual), -1)
+    def forward(self, feature, _errors, _command, _preview, _previous_residual):
         return self.residual.expand(feature.shape[0], -1)
 
 

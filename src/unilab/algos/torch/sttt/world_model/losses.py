@@ -32,9 +32,10 @@ def _categorical_kl(target: torch.Tensor, prediction: torch.Tensor, unimix: floa
     return (target_prob * (target_prob.clamp_min(tiny).log() - prediction_prob.clamp_min(tiny).log())).sum((-1, -2))
 
 
-def _motion_error(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    # These are motion increments, not interchangeable absolute orientations.
-    return (prediction - target.detach()).square().mean(-1)
+def _motion_error(prediction: torch.Tensor, target: torch.Tensor,
+                  tolerance: torch.Tensor) -> torch.Tensor:
+    # Continuous increments retain their winding; units are normalized, not wrapped.
+    return ((prediction - target.detach()) / tolerance).square().mean(-1)
 
 
 def world_model_loss(
@@ -42,6 +43,8 @@ def world_model_loss(
     kl_scale: float = 1., reconstruction_scale: float = 1., motion_scale: float = 1.,
     risk_scale: float = 1., overshoot_scale: float = 1., kl_balance: float = .8,
     prior_reconstruction_scale: float = 1., window_scale: float = 1.,
+    motion_velocity_tolerance: float = .05, motion_yaw_rate_tolerance: float = .1,
+    window_xy_tolerance: float = .01, window_yaw_tolerance: float = .02,
     initial_state: LatentState | None = None,
     initial_previous_action: torch.Tensor | None = None,
     observation_mask: torch.Tensor | None = None,
@@ -51,6 +54,10 @@ def world_model_loss(
     weights = (free_nats, kl_scale, reconstruction_scale, motion_scale, risk_scale, overshoot_scale, prior_reconstruction_scale, window_scale)
     if any(not math.isfinite(value) or value < 0 for value in weights) or not 0 <= kl_balance <= 1:
         raise ValueError("loss weights must be finite nonnegative and kl_balance in [0,1]")
+    tolerances = (motion_velocity_tolerance, motion_yaw_rate_tolerance,
+                  window_xy_tolerance, window_yaw_tolerance)
+    if any(not math.isfinite(value) or value <= 0 for value in tolerances):
+        raise ValueError("physical prediction tolerances must be positive and finite")
     observations, actions = batch["observations"], batch["actions"]
     if observations.ndim != 3 or actions.ndim != 3:
         raise ValueError("world-model loss requires batched sequences")
@@ -94,7 +101,7 @@ def world_model_loss(
         reconstructions.append(model.decode(latent))
     prior_logits = torch.stack(priors, 1)
     posterior_logits = torch.stack(posteriors, 1)
-    reconstruction = _masked_mean((torch.stack(reconstructions, 1) - observations.detach()).square().mean(-1), observation_valid)
+    reconstruction = _masked_mean(((torch.stack(reconstructions, 1) - observations.detach()) * model.proprio_loss_weight).square().mean(-1), observation_valid)
     dynamics_kl = _categorical_kl(posterior_logits.detach(), prior_logits, model.config.unimix)
     representation_kl = _categorical_kl(posterior_logits, prior_logits.detach(), model.config.unimix)
     kl = _masked_mean(kl_balance * dynamics_kl.clamp_min(free_nats) + (1 - kl_balance) * representation_kl.clamp_min(free_nats), observation_valid)
@@ -114,11 +121,17 @@ def world_model_loss(
         open_logits.append(logits)
         predicted_observations.append(model.decode(latent))
     motion_prediction = torch.stack(predicted_motion, 1)
-    prior_reconstruction = _masked_mean((torch.stack(predicted_observations, 1) - observations[:, 1:].detach()).square().mean(-1), transition_valid)
+    prior_reconstruction = _masked_mean(((torch.stack(predicted_observations, 1) - observations[:, 1:].detach()) * model.proprio_loss_weight).square().mean(-1), transition_valid)
     overshoot = _masked_mean(_categorical_kl(posterior_logits[:, 1:].detach(), torch.stack(open_logits, 1), model.config.unimix).clamp_min(free_nats), transition_valid)
     motion_mask = batch["motion_valid"].bool() & transition_valid
     motion_target = torch.where(motion_mask[..., None], batch["path_delta"], 0.)
-    motion_loss = _masked_mean(_motion_error(motion_prediction, motion_target), motion_mask)
+    duration = (batch["timestamps_ns"][:, 1:] - batch["timestamps_ns"][:, :-1]).to(actions.dtype) * 1e-9
+    if bool((motion_mask & (duration <= 0)).any()):
+        raise ValueError("valid motion transitions require advancing physical timestamps")
+    duration = torch.where(motion_mask, duration, 1.)
+    step_tolerance = duration[..., None] * actions.new_tensor(
+        (motion_velocity_tolerance, motion_velocity_tolerance, motion_yaw_rate_tolerance))
+    motion_loss = _masked_mean(_motion_error(motion_prediction, motion_target, step_tolerance), motion_mask)
 
     start, end = batch["window_start"].long(), batch["window_end"].long()
     if start.shape != end.shape or start.ndim != 2 or start.shape[0] != size:
@@ -145,7 +158,8 @@ def world_model_loss(
     target_turn = torch.where(dense_window, target_turn, window_target[..., 2])
     continuous_prediction = torch.cat((window_prediction[..., :2], predicted_turn[..., None]), -1)
     continuous_target = torch.cat((window_target[..., :2], target_turn[..., None]), -1)
-    window_loss = _masked_mean(_motion_error(continuous_prediction, continuous_target), window_mask)
+    window_tolerance = actions.new_tensor((window_xy_tolerance, window_xy_tolerance, window_yaw_tolerance))
+    window_loss = _masked_mean(_motion_error(continuous_prediction, continuous_target, window_tolerance), window_mask)
     window_xy_error = (window_prediction[..., :2] - window_target[..., :2]).square().sum(-1)
     window_xy_sum = torch.where(window_mask, window_xy_error, 0.).sum()
     risk_target = batch["risk"].detach().to(observations)

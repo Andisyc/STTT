@@ -270,6 +270,12 @@ class PathFollowingController(Generic[LearnerT]):
         self._queries[self._steps] = self._before, owned
         return self.collector.transform(query)
 
+    def _learning_ready(self) -> bool:
+        return True
+
+    def _run_learning(self, samples, decision):
+        return self.updater.update(samples, decision)
+
     def on_env_step(self, *, executed_action: Any, next_observation: Any, done: Any | None = None) -> dict[str, float | int]:
         if self._closed or self._failed or self._terminal or self._before is None:
             raise RuntimeError("no live path-following query to complete")
@@ -323,13 +329,14 @@ class PathFollowingController(Generic[LearnerT]):
                 decision = self._fresh_decision(after.timestamp_ns)
                 if decision is not None and decision.timestamp_ns <= self._last_decision_update:
                     decision = None
-                if self._pending or (decision is not None and self.updater.calibration_complete):
-                    # Any learner exception halts this controller: never replay a B
-                    # batch after its commit followed by an A-stage failure.
-                    self.last_update = self.updater.update(tuple(self._pending), decision)
+                if self._learning_ready() and (self._pending or (decision is not None and self.updater.calibration_complete)):
+                    # Accepted batches are never replayed after a learning failure.
+                    result = self._run_learning(tuple(self._pending), decision)
                     self._pending.clear()
-                    if decision is not None and self.last_update.a_loss is not None:
-                        self._last_decision_update = decision.timestamp_ns
+                    if result is not None:
+                        self.last_update = result
+                        if decision is not None and result.a_loss is not None:
+                            self._last_decision_update = decision.timestamp_ns
             self._record(after)
             stats = dict(inner_stats or {})
             stats.update({"path_steps": self._steps, "path_windows": self.collector.completed_windows,

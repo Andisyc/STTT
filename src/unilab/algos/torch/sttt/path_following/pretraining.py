@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 import random
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 from hydra._internal.config_loader_impl import ConfigLoaderImpl
@@ -22,6 +22,7 @@ from unilab.algos.torch.distill.fada.runtime_policy import (
 )
 from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint, save_actor_checkpoint
 from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
+from unilab.algos.torch.sttt.path_following.critic import CriticConfig
 from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
 from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
@@ -79,6 +80,7 @@ class ActorTrainingConfig:
     checkpoint_every: int = 1000
     seed: int = 0
     microbatch_size: int | None = None
+    critic: CriticConfig = field(default_factory=CriticConfig)
 
     def __post_init__(self) -> None:
         if len(self.residual_limit_rad) != 29 or any(not math.isfinite(x) or x <= 0 for x in self.residual_limit_rad):
@@ -94,6 +96,8 @@ class ActorTrainingConfig:
             raise ValueError("actor learning rate/gradient norm must be positive")
         if self.microbatch_size is not None and (type(self.microbatch_size) is not int or self.microbatch_size < 1):
             raise ValueError("actor microbatch size must be a positive integer or None")
+        if not isinstance(self.critic, CriticConfig):
+            raise ValueError("actor training requires a validated critic configuration")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ActorTrainingConfig:
@@ -103,6 +107,8 @@ class ActorTrainingConfig:
                 raw[name] = tuple(raw[name])
         if raw.get("residual_limit_rad") is None:
             raise ValueError("set explicit source-order residual_limit_rad before pretraining A")
+        if "critic" in raw:
+            raw["critic"] = CriticConfig.from_mapping(raw["critic"])
         return cls(**raw)
 
 
@@ -199,7 +205,6 @@ def train_latent_actor(cfg: Mapping[str, Any] | DictConfig, *, root_dir: str | P
         actor = LatentResidualActor(loaded.model.feature_dim, options.hidden_dims, options.residual_limit_rad,
                                     command_dim=rollout.spec.command_dim, preview_points=distribution.base.preview_points).to(next(loaded.model.parameters()))
     learner = ActorLearner(actor, rollout, {**asdict(options), "window_steps": loaded.contract["data"]["window_steps"]}, costs)
-    optimizer = learner.optimizer
     signature = {"training": {key: value for key, value in asdict(options).items()
                               if key != "max_updates" and not (key == "microbatch_size" and value is None)},
                  "trajectories": asdict(distribution), "costs": asdict(costs), "device": device}
@@ -208,7 +213,7 @@ def train_latent_actor(cfg: Mapping[str, Any] | DictConfig, *, root_dir: str | P
         if state["signature"] != signature:
             raise ValueError("actor resume configuration changed")
         sampler.load_state_dict(state["sampler_state"])
-        optimizer.load_state_dict(state["optimizer_state"])
+        learner.load_state_dict(state["learner_state"])
         rng.setstate(state["task_rng_state"])
         _restore_rng(state, torch.device(device))
         updates = state["optimizer_steps"]
@@ -235,9 +240,9 @@ def train_latent_actor(cfg: Mapping[str, Any] | DictConfig, *, root_dir: str | P
                 print(json.dumps({"actor_updates": updates, **metrics}), flush=True)
                 checkpoint = save_actor_checkpoint(output / f"actor_{updates:08d}.pt", actor, loaded.model, loaded.contract,
                                                     distribution.base, training_state={"optimizer_steps": updates,
-                                                        "optimizer_state": optimizer.state_dict(), "sampler_state": sampler.state_dict(),
+                                                        "sampler_state": sampler.state_dict(),
                                                         "task_rng_state": rng.getstate(), "signature": signature,
-                                                        **_rng_state(torch.device(device))})
+                                                        **_rng_state(torch.device(device))}, learner_state=learner.state_dict())
     return {"actor_checkpoint": str(checkpoint), "optimizer_steps": updates, "metrics": metrics}
 
 

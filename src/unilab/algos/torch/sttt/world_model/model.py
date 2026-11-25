@@ -72,6 +72,23 @@ class LatentWorldModel(nn.Module):
         self.proprio_decoder = VectorDecoder(self.feature_dim, groups, cfg.hidden_dim, cfg.decoder_layers, cfg.norm_eps)
         self.motion_head = MLP(self.feature_dim + cfg.action_dim, 3, cfg.hidden_dim, cfg.head_layers, cfg.norm_eps)
         self.risk_head = MLP(self.feature_dim + cfg.action_dim, 1, cfg.hidden_dim, cfg.head_layers, cfg.norm_eps)
+        # Loss-only physical units; reconstructed from the execution contract.
+        self.register_buffer("proprio_loss_weight", torch.ones(cfg.obs_dim), persistent=False)
+        self.configure_observation_loss({"term_scale": {
+            "base_ang_vel": 1., "projected_gravity": 1., "dof_pos": 1., "dof_vel": 1.,
+        }})
+
+    def configure_observation_loss(self, preprocessing: Mapping[str, Any]) -> None:
+        """Cold-path conversion of physical tolerances into recorded observation units."""
+        scale = preprocessing["term_scale"]
+        angular = [1. / (.1 * scale["base_ang_vel"])] * 3
+        gravity = [1. / (.05 * scale["projected_gravity"])] * 3
+        position = [1. / (.01 * scale["dof_pos"])] * 29
+        velocity = [1. / scale["dof_vel"]] * 29
+        # Gait phase is advanced analytically in imagination, not decoded.
+        weights = (angular + position + velocity + gravity if self.config.obs_dim == 64
+                   else angular + gravity + position + velocity + [0., 0.])
+        self.proprio_loss_weight.copy_(self.proprio_loss_weight.new_tensor(weights))
 
     @property
     def model_config(self) -> dict[str, Any]:

@@ -157,6 +157,7 @@ def load_world_model(path: str | Path, *, device: str | torch.device = "cpu", ex
         raise ValueError("world-model checkpoint tensors have inconsistent floating dtypes")
     model = LatentWorldModel(config).to(dtype=scale.dtype)
     model.load_state_dict(state, strict=True)
+    model.configure_observation_loss(contract["source"]["preprocessing"])
     _validate_model(model)
     training_state = payload["training_state"]
     if not isinstance(training_state, dict):

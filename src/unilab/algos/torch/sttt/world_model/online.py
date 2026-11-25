@@ -6,10 +6,9 @@ import math
 import time
 from collections import OrderedDict, deque
 from collections.abc import Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 import torch
@@ -18,8 +17,10 @@ from torch import nn
 from unilab.algos.torch.distill.fada.adaptation import FADALoRALinear
 from unilab.algos.torch.distill.fada.runtime_policy import FADAFutureQuery
 from unilab.algos.torch.sttt.path_following.features import context_dimension
+from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
+from unilab.algos.torch.sttt.path_following.critic import CriticConfig
 from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
-from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig, latent_actor_loss
+from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.online_learning import ActorUpdateContext
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath
@@ -64,6 +65,8 @@ class LatentOnlineConfig:
     risk_threshold: float = 0.5
     trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
     adapt_actor: bool = True
+    critic: CriticConfig = field(default_factory=lambda: CriticConfig(
+        learning_rate=1e-4, epochs=1, minibatches=1))
 
     def __post_init__(self) -> None:
         if len(self.residual_limit_rad) != 29:
@@ -90,6 +93,8 @@ class LatentOnlineConfig:
             raise ValueError("adapt_actor/trajectory have invalid types")
         if isinstance(self.risk_threshold, bool) or not math.isfinite(self.risk_threshold) or not 0 < self.risk_threshold < 1:
             raise ValueError("risk_threshold must be a probability in (0,1)")
+        if not isinstance(self.critic, CriticConfig):
+            raise ValueError("online learning requires a validated cost Critic configuration")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> LatentOnlineConfig:
@@ -101,6 +106,9 @@ class LatentOnlineConfig:
             raw["actor_hidden_dims"] = tuple(raw["actor_hidden_dims"])
         if "trajectory" in raw:
             raw["trajectory"] = TrajectoryConfig.from_mapping(raw["trajectory"])
+        if "critic" in raw:
+            raw["critic"] = CriticConfig.from_mapping({
+                "learning_rate": 1e-4, "epochs": 1, "minibatches": 1, **raw["critic"]})
         return cls(**raw)
 
 
@@ -113,19 +121,16 @@ class LatentUpdateResult:
     calibration_complete: bool
     actor_skip_reason: str | None
     elapsed_s: float
+    critic_loss: float | None = None
 
 
-@contextmanager
-def _frozen(model: nn.Module) -> Iterator[None]:
-    flags = [parameter.requires_grad for parameter in model.parameters()]
-    training = model.training
-    model.eval().requires_grad_(False)
-    try:
-        yield
-    finally:
-        for parameter, flag in zip(model.parameters(), flags):
-            parameter.requires_grad_(flag)
-        model.train(training)
+@dataclass(frozen=True)
+class PreparedLatentUpdate:
+    samples: tuple[Any, ...]
+    sequences: tuple[dict[str, Any], ...]
+    start: RolloutStart | None
+
+
 
 
 def _join_windows(sequences: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -167,6 +172,8 @@ class LatentPathFollowingUpdater:
         self.window_steps = _count(self.contract["data"]["window_steps"], "window_steps")
         self.ctrl_dt = _positive(self.contract["data"]["ctrl_dt"], "ctrl_dt")
         self.model.eval().requires_grad_(False)
+        self.model.configure_observation_loss(self.contract["source"]["preprocessing"])
+        self.loss_config = {**loaded.training_state.get("loss_config", {}), "risk_scale": 0.}
         targets = tuple(name for name, module in self.model.named_modules()
                         if name and isinstance(module, nn.Linear)
                         and name.split(".", 1)[0] in {"prior_net", "motion_head"})
@@ -191,7 +198,20 @@ class LatentPathFollowingUpdater:
                                               command_dim=rollout.spec.command_dim,
                                               preview_points=config.trajectory.preview_points).to(parameter)
         self.model_optimizer = torch.optim.AdamW(self.adapters, lr=config.wm_learning_rate, weight_decay=config.lora_weight_decay)
-        self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), lr=config.actor_learning_rate, weight_decay=0.0)
+        self.actor_learner = ActorLearner(self.actor, rollout, {
+            "window_steps": self.window_steps, "horizon_windows": config.horizon_windows,
+            "batch_size": 1, "microbatch_size": 1, "learning_rate": config.actor_learning_rate,
+            "max_grad_norm": config.max_grad_norm, "critic": asdict(config.critic),
+        }, costs)
+        self.actor_optimizer = self.actor_learner.optimizer
+        self.inference_model = copy.deepcopy(self.model).eval().requires_grad_(False)
+        self.inference_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
+        source = self.contract["source"]
+        self.inference_rollout = PlannerTrackerRollout(self.inference_model, rollout.policy,
+            rollout.profile, rollout.preprocessing, target_joint_names=source["target_joint_names"],
+            target_default_joint_angles=source["target_default_joint_angles"],
+            target_action_scale=source["target_action_scale"])
+        self._publication = None
         self.replay: deque[tuple[Any, dict[str, Any]]] = deque(maxlen=config.replay_capacity_windows)
         self.records: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self.actor_updates = self.response_updates = self.zero_calibration_windows = 0
@@ -199,6 +219,36 @@ class LatentPathFollowingUpdater:
         self._last_window_id = -1
         self.previous_residual = torch.zeros(1, 29, device=parameter.device, dtype=parameter.dtype)
         self.ego_history: Any = None
+
+    def initialize_pretrained(self, state: Mapping[str, Any]) -> None:
+        if state["signature"]["costs"] != asdict(self.costs):
+            raise ValueError("pretrained Actor/Critic and online task costs differ")
+        saved = state["critic_learner"]
+        expected = self.actor_learner.critic_learner.signature
+        if any(saved["signature"][key] != expected[key] for key in
+               ("context_dim", "discount", "failure_value")):
+            raise ValueError("pretrained cost critic temporal or input contract differs")
+        learner = self.actor_learner.critic_learner
+        learner.critic.load_state_dict(saved["critic"], strict=True)
+        learner.target.load_state_dict(saved["target"], strict=True)
+        self.stage_publication()
+        self.publish()
+
+    def stage_publication(self) -> None:
+        self._publication = (
+            {name: value.detach().cpu().clone() for name, value in self.model.state_dict().items()},
+            {name: value.detach().cpu().clone() for name, value in self.actor.state_dict().items()},
+        )
+
+    def publish(self) -> bool:
+        """Only the control thread activates a complete, finished learner snapshot."""
+        if self._publication is None:
+            return False
+        model, actor = self._publication
+        self.inference_model.load_state_dict(model, strict=True)
+        self.inference_actor.load_state_dict(actor, strict=True)
+        self._publication = None
+        return True
 
     @property
     def calibration_complete(self) -> bool:
@@ -249,7 +299,7 @@ class LatentPathFollowingUpdater:
                     ego[index], valid[index, 0], age[index, 0] = self.ego_history.at(timestamp)
         parameter = next(self.model.parameters())
         with torch.no_grad():
-            return self.rollout.encode_start(
+            return self.inference_rollout.encode_start(
                 query, errors=decision.errors.to(parameter), previous_residual=self.previous_residual,
                 ego_motion=torch.as_tensor(ego, device=parameter.device, dtype=parameter.dtype).unsqueeze(0),
                 ego_valid=torch.as_tensor(valid, device=parameter.device).unsqueeze(0),
@@ -262,7 +312,7 @@ class LatentPathFollowingUpdater:
         with torch.no_grad():
             if start.path_state is None:
                 raise ValueError("A requires the current reference preview")
-            return self.actor(start.latent.feature(), start.errors, start.command, start.path_state.preview())
+            return self.inference_actor(start.latent.feature(), start.errors, start.command, start.path_state.preview(), start.previous_residual)
 
     def _recent_batch(self) -> dict[str, torch.Tensor] | None:
         count = self.config.replay_sequence_windows
@@ -275,21 +325,35 @@ class LatentPathFollowingUpdater:
         sequence = _join_windows([entry for _, entry in entries])
         return batch_sequences([sequence], device=next(self.model.parameters()).device, contract=self.contract)
 
+    def prepare_update(self, completed_windows: Sequence[Any],
+                       actor_context: ActorUpdateContext | None = None) -> PreparedLatentUpdate:
+        """Detach causal inputs on the control thread before handing them to learning."""
+        samples = tuple(completed_windows)
+        sequences = tuple(window_sequence(sample, self.records) for sample in samples)
+        start = self.start_from_decision(actor_context) if actor_context is not None else None
+        for sample in samples:
+            for control in sample.controls:
+                self.records.pop(control.transition_id)
+        return PreparedLatentUpdate(samples, sequences, start)
+
+    def update(self, completed_windows: Sequence[Any],
+               actor_context: ActorUpdateContext | None = None) -> LatentUpdateResult:
+        result = self.update_prepared(self.prepare_update(completed_windows, actor_context))
+        self.publish()
+        return result
+
     @torch.enable_grad()
-    def update(self, completed_windows: Sequence[Any], actor_context: ActorUpdateContext | None = None) -> LatentUpdateResult:
+    def update_prepared(self, prepared: PreparedLatentUpdate) -> LatentUpdateResult:
         if torch.is_inference_mode_enabled():
             raise ValueError("online learning must run outside inference_mode")
         started = time.perf_counter()
-        wm_value = actor_value = None
-        for sample in completed_windows:
+        wm_value = actor_value = critic_value = None
+        for sample, sequence in zip(prepared.samples, prepared.sequences):
             if self._reference is None:
                 self.begin_episode(sample.reference)
             if sample.reference != self._reference or sample.window_id <= self._last_window_id:
                 raise ValueError("WM windows must be new and from the current localization episode")
-            sequence = window_sequence(sample, self.records)
             self.replay.append((sample, sequence))
-            for control in sample.controls:
-                self.records.pop(control.transition_id)
             self._last_window_id = sample.window_id
             if not bool(torch.count_nonzero(sample.start_query.residual_rad)):
                 self.zero_calibration_windows = min(self.config.calibration_windows, self.zero_calibration_windows + 1)
@@ -299,7 +363,7 @@ class LatentPathFollowingUpdater:
             try:
                 for _ in range(self.config.wm_updates_per_cycle):
                     self.model_optimizer.zero_grad(set_to_none=True)
-                    losses = world_model_loss(self.model, batch, risk_scale=0.0)
+                    losses = world_model_loss(self.model, batch, **self.loss_config)
                     loss = losses["loss"]
                     if not bool(torch.isfinite(loss)):
                         raise ValueError("non-finite WM adaptation cost")
@@ -311,32 +375,17 @@ class LatentPathFollowingUpdater:
             finally:
                 self.model_optimizer.zero_grad(set_to_none=True)
                 self.model.eval()
-        reason = "calibration" if not self.calibration_complete else ("missing_context" if actor_context is None else None)
+        reason = "calibration" if not self.calibration_complete else ("missing_context" if prepared.start is None else None)
         if not self.config.adapt_actor:
             reason = "frozen_actor"
         if reason is None:
-            assert actor_context is not None
-            if actor_context.reference != self._reference:
-                raise ValueError("A decision belongs to another localization episode")
-            start = self.start_from_decision(actor_context)
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            try:
-                with _frozen(self.model):
-                    result = self.rollout.run(start, self.actor, window_steps=self.window_steps,
-                                              horizon_windows=self.config.horizon_windows)
-                    loss = latent_actor_loss(result, start, ctrl_dt=self.ctrl_dt, window_steps=self.window_steps, config=self.costs)["loss"]
-                    if not bool(torch.isfinite(loss)):
-                        raise ValueError("non-finite imagined policy cost")
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm, error_if_nonfinite=True)
-                    self.actor_optimizer.step()
-                    actor_value = float(loss.detach())
-                self.actor_updates += 1
-            finally:
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                self.model_optimizer.zero_grad(set_to_none=True)
-        return LatentUpdateResult(wm_value, actor_value, len(completed_windows), self.zero_calibration_windows,
-                                  self.calibration_complete, reason, time.perf_counter() - started)
+            metrics = self.actor_learner.update(prepared.start)
+            actor_value, critic_value = metrics["loss"], metrics["critic_loss"]
+            self.actor_updates = self.actor_learner.updates
+        if wm_value is not None or actor_value is not None:
+            self.stage_publication()
+        return LatentUpdateResult(wm_value, actor_value, len(prepared.samples), self.zero_calibration_windows,
+                                  self.calibration_complete, reason, time.perf_counter() - started, critic_value)
 
     def save(self, path: str | Path) -> None:
         destination = Path(path)
@@ -352,11 +401,12 @@ class LatentPathFollowingUpdater:
                     name = target + "." + name[len(target + ".base."):]
                     break
             base_state[name] = value.detach().cpu()
-        payload = {"format": "sttt_latent_path_following_online", "schema_version": 2,
+        payload = {"format": "sttt_latent_path_following_online", "schema_version": 3,
                    "model_config": asdict(self.model.config), "contract": self.contract,
                    "base_state": base_state, "adapters": adapters, "adapter_targets": list(self.adapter_targets),
                    "actor": self.actor.state_dict(), "config": asdict(self.config), "costs": asdict(self.costs),
-                   "model_optimizer": self.model_optimizer.state_dict(), "actor_optimizer": self.actor_optimizer.state_dict(),
+                   "model_optimizer": self.model_optimizer.state_dict(),
+                   "actor_learner": self.actor_learner.state_dict(), "loss_config": self.loss_config,
                    "actor_updates": self.actor_updates, "response_updates": self.response_updates,
                    "zero_calibration_windows": self.zero_calibration_windows}
         temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -366,13 +416,13 @@ class LatentPathFollowingUpdater:
     @classmethod
     def restore(cls, path: str | Path, rollout_factory: Any, *, device: str = "cpu", expected_contract: Mapping[str, Any] | None = None) -> LatentPathFollowingUpdater:
         payload = torch.load(path, map_location=device, weights_only=True)
-        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 2:
-            raise ValueError("expected an independent latent online checkpoint")
+        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 3:
+            raise ValueError("expected a version-3 latent WM/Actor/Critic online checkpoint")
         if expected_contract is not None and payload["contract"] != dict(expected_contract):
             raise ValueError("online checkpoint control contract differs from deployment")
         model = LatentWorldModel(WorldModelConfig.from_mapping(payload["model_config"])).to(device)
         model.load_state_dict(payload["base_state"], strict=True)
-        loaded = LoadedWorldModel(model, payload["contract"], {})
+        loaded = LoadedWorldModel(model, payload["contract"], {"loss_config": payload["loss_config"]})
         updater = cls(loaded, rollout_factory(model), LatentOnlineConfig.from_mapping(payload["config"]), LatentCostConfig(**payload["costs"]))
         if tuple(payload["adapter_targets"]) != updater.adapter_targets:
             raise ValueError("online LoRA target manifest differs from this physical model")
@@ -384,7 +434,9 @@ class LatentPathFollowingUpdater:
                 parameters[name].copy_(value)
         updater.actor.load_state_dict(payload["actor"], strict=True)
         updater.model_optimizer.load_state_dict(payload["model_optimizer"])
-        updater.actor_optimizer.load_state_dict(payload["actor_optimizer"])
+        updater.actor_learner.load_state_dict(payload["actor_learner"])
         for name in ("actor_updates", "response_updates", "zero_calibration_windows"):
             setattr(updater, name, int(payload[name]))
+        updater.stage_publication()
+        updater.publish()
         return updater

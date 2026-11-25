@@ -124,7 +124,7 @@ class _RuntimeEvidence:
                         self.age_sum += age
                         self.age_max = max(self.age_max, age)
                         new_measurement = True
-                self.latest = record
+                self.latest.update(record)
                 elapsed = record.get("online_update_elapsed_s")
                 if elapsed is not None:
                     self.update_count += 1
@@ -135,6 +135,8 @@ class _RuntimeEvidence:
                     self.saturation_count += 1
                     self.saturation_sum += saturation
                     self.saturation_max = max(self.saturation_max, saturation)
+            elif record["event"] == "learning_complete":
+                self.latest.update({key: record[key] for key in ("a_updates", "b_updates", "critic_updates")})
             row["new_measurement"] = new_measurement
             self.handle.write(json.dumps(_plain(row), allow_nan=False) + "\n")
             self.records += 1
@@ -147,6 +149,7 @@ class _RuntimeEvidence:
             "unique_mean_age_s": self.age_sum / self.unique / 1e9 if self.unique else None,
             "unique_max_age_s": self.age_max / 1e9 if self.unique else None,
             "a_updates": self.latest.get("a_updates"), "b_updates": self.latest.get("b_updates"),
+            "critic_updates": self.latest.get("critic_updates"),
             "dropped_windows": self.latest.get("dropped_windows", {}),
             "expired_queries": self.latest.get("expired_queries"),
         }
@@ -180,6 +183,8 @@ def _run_episode(
                     if playback_cfg.official_playback.profile_path else {"source": "checkpoint.runtime_config.source_profile"}),
         "response": _file_identity(playback_cfg.path_following.checkpoint_path) if mode == "oat_path" else None,
         "world_model": _file_identity(playback_cfg.path_following.checkpoint_path) if mode in _LATENT_MODES else None,
+        "actor_critic": (_file_identity(playback_cfg.path_following.pretrained_actor_checkpoint)
+                         if mode in _LATENT_MODES and playback_cfg.path_following.pretrained_actor_checkpoint else None),
     }
     _publish(output / "source.json", source)
     metrics = PathFollowingMetrics(thresholds)
@@ -310,6 +315,7 @@ def _run_episode(
             if session is not None:
                 try:
                     session.close()
+                    evidence.drain(session.controller, previous_timestamp)
                 except Exception as error:
                     close_failure = {"type": type(error).__name__, "message": str(error)}
                     reason = "error"
@@ -343,7 +349,7 @@ def run_path_following_evaluation(
     if not isinstance(cfg, DictConfig):
         raise TypeError("evaluation requires the independent Hydra configuration")
     expected = {"output_dir", "policy_checkpoint", "profile_path", "response_checkpoint", "pose_source", "device", "modes", "conditions", "seeds", "duration_s", "source_overrides", "thresholds"}
-    latent_keys = {"world_model_checkpoint", "latent_learning"}
+    latent_keys = {"world_model_checkpoint", "pretrained_actor_checkpoint", "latent_learning"}
     if set(cfg) != expected and set(cfg) != expected | latent_keys:
         raise ValueError("use conf/sttt/path_following_evaluate.yaml or conf/sttt/latent_path_following_evaluate.yaml")
     raw_thresholds = OmegaConf.to_container(cfg.thresholds, resolve=True)
@@ -398,6 +404,9 @@ def run_path_following_evaluation(
     world_model = resolve(cfg.world_model_checkpoint) if set(modes) & _LATENT_MODES else None
     if world_model is not None:
         _file_identity(world_model)
+    pretrained_actor = resolve(cfg.pretrained_actor_checkpoint) if set(modes) & _LATENT_MODES and cfg.pretrained_actor_checkpoint else None
+    if pretrained_actor is not None:
+        _file_identity(pretrained_actor)
     output = resolve(cfg.output_dir)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"evaluation output must be empty: {output}")
@@ -421,6 +430,8 @@ def run_path_following_evaluation(
                     OmegaConf.update(playback_cfg, "path_following.pose.odometry_source", cfg.pose_source)
                 elif mode in _LATENT_MODES:
                     OmegaConf.update(playback_cfg, "path_following.checkpoint_path", str(world_model))
+                    OmegaConf.update(playback_cfg, "path_following.pretrained_actor_checkpoint",
+                                     str(pretrained_actor) if pretrained_actor is not None else None)
                     OmegaConf.update(playback_cfg, "path_following.learning", latent_learning, merge=True, force_add=True)
                     OmegaConf.update(playback_cfg, "path_following.pose.odometry_source", cfg.pose_source)
                     if mode == "latent_wm_frozen":

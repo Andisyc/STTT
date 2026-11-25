@@ -117,6 +117,20 @@ def captured_query(case, profile):
     return captured[0], source
 
 
+def actor_artifact(path, model, contract, rollout):
+    from unilab.algos.torch.sttt.path_following.actor_checkpoint import save_actor_checkpoint
+    from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
+    from unilab.algos.torch.sttt.path_following.trajectory import TrajectoryConfig
+    actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=rollout.spec.command_dim)
+    learner = ActorLearner(actor, rollout, {
+        "window_steps": contract["data"]["window_steps"], "horizon_windows": 1,
+        "batch_size": 1, "microbatch_size": 1, "learning_rate": 1e-4, "max_grad_norm": 10.,
+        "critic": {"hidden_dims": (8,), "learning_rate": 1e-4, "epochs": 1, "minibatches": 1},
+    }, LatentCostConfig())
+    return save_actor_checkpoint(path, actor, model, contract, TrajectoryConfig(),
+                                  training_state={}, learner_state=learner.state_dict())
+
+
 def pose(index, *, y=0., arrival_epoch=1):
     matrix = np.eye(4)
     matrix[:3, 3] = [index * .01, y, .8]
@@ -190,6 +204,8 @@ def _angular_motion_loss(monkeypatch, predicted_turn, target_turn=0., *, dense=T
     raw["motion_valid"][:] = dense
     batch = {key: value.double() if value.is_floating_point() else value
              for key, value in batch_sequences([raw]).items()}
+    batch["path_delta"][..., 2] = target_turn
+    batch["window_delta"][..., 2] = math.atan2(math.sin(steps * target_turn), math.cos(steps * target_turn))
     model = LatentWorldModel(model_config()).double().eval().requires_grad_(False)
     theta = torch.tensor(predicted_turn, dtype=torch.float64, requires_grad=True)
     monkeypatch.setattr(model, "motion", lambda latent, action: torch.cat(
@@ -205,7 +221,7 @@ def test_angular_motion_rejects_full_turn_alias_and_corrects_gradient(monkeypatc
     old_minimum = sign * 2 * math.pi * 10 / 101
     losses, theta = _angular_motion_loss(monkeypatch, old_minimum, dense=dense)
     gradient = torch.autograd.grad(losses["loss"], theta)[0]
-    expected_weight = (100 + int(dense)) / 3
+    expected_weight = (100 / .02**2 + int(dense) / (.1 * .02)**2) / 3
     assert float(losses["loss"].detach()) == pytest.approx(expected_weight * old_minimum**2)
     assert float(gradient) == pytest.approx(2 * expected_weight * old_minimum)
     closer, _ = _angular_motion_loss(monkeypatch, old_minimum * .99, dense=dense)
@@ -221,7 +237,7 @@ def test_angular_motion_preserves_genuine_dense_turns_beyond_pi(monkeypatch, sig
     aliased, theta = _angular_motion_loss(monkeypatch, target - sign * 2 * math.pi / 10, target)
     assert float(matching["motion_loss"].detach()) == pytest.approx(0., abs=1e-12)
     assert float(matching["window_loss"].detach()) == pytest.approx(0., abs=1e-12)
-    assert float(aliased["window_loss"].detach()) == pytest.approx((2 * math.pi)**2 / 3)
+    assert float(aliased["window_loss"].detach()) == pytest.approx((2 * math.pi / .02)**2 / 3)
     assert float(torch.autograd.grad(aliased["loss"], theta)[0]) * sign < 0
 
 
@@ -237,7 +253,8 @@ def test_actual_tracker_rollout_and_actor_credit_are_preserved(tmp_path):
     torch.testing.assert_close(result.source_actions[:, 0], source, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(result.actions[:, 0], rollout.source_to_env(source), atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(query.observation_history, history_before, atol=0, rtol=0)
-    cost = latent_actor_loss(result, start, ctrl_dt=.02, window_steps=1, config=LatentCostConfig())["loss"]
+    cost = latent_actor_loss(result, start, ctrl_dt=.02, window_steps=1, config=LatentCostConfig(),
+                            residual_limits=actor.residual_limit_rad29)["loss"]
     cost.backward()
     assert sum(float(p.grad.square().sum()) for p in actor.parameters() if p.grad is not None) > 0
     assert all(parameter.grad is None for parameter in (*model.parameters(), *case.policy.parameters()))
@@ -268,7 +285,16 @@ def test_online_lora_actor_ownership_and_resume(tmp_path):
             "action": actions.copy(), "source_action": source[0].numpy().copy(), "command": query.command[0].numpy().copy(),
             "residual": np.zeros(29, np.float32),
             "ego_motion": np.zeros(3, np.float32), "ego_valid": False, "ego_age_s": 0., "risk": 0., "risk_valid": False}, capacity=16)
-    result = updater.update([sample], ActorUpdateContext.from_window_start(sample))
+    from concurrent.futures import ThreadPoolExecutor
+    before_publication = {name: value.clone() for name, value in updater.inference_actor.state_dict().items()}
+    prepared = updater.prepare_update([sample], ActorUpdateContext.from_window_start(sample))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(updater.update_prepared, prepared).result(timeout=30)
+    for name, value in before_publication.items():
+        torch.testing.assert_close(updater.inference_actor.state_dict()[name], value, rtol=0, atol=0)
+    assert updater.publish()
+    for name, value in updater.actor.state_dict().items():
+        torch.testing.assert_close(updater.inference_actor.state_dict()[name], value, rtol=0, atol=0)
     assert result.b_loss is not None and result.a_loss is not None
     assert updater.response_updates == updater.actor_updates == 1
     for name, parameter in model.named_parameters():
@@ -284,6 +310,9 @@ def test_online_lora_actor_ownership_and_resume(tmp_path):
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, restored.model.state_dict()[name], atol=0, rtol=0)
     assert restored.response_updates == restored.actor_updates == 1
+    for name, value in updater.actor_learner.critic_learner.target.state_dict().items():
+        torch.testing.assert_close(value, restored.actor_learner.critic_learner.target.state_dict()[name], rtol=0, atol=0)
+    assert updater.actor_learner.critic_learner.updates == restored.actor_learner.critic_learner.updates == 1
     updater.discard_pending()
     assert not updater.replay and not updater.records
     assert updater.calibration_complete
@@ -345,19 +374,23 @@ def test_public_training_resume_and_whole_capture_split(tmp_path):
 
 
 def test_factory_latent_mode_uses_real_history_and_window_activation(tmp_path):
-    case, _, contract, model, _ = parts(tmp_path / "case")
+    case, _, contract, model, factory = parts(tmp_path / "case")
     artifact = save_world_model(tmp_path / "wm.pt", model, contract)
     node = OmegaConf.load(ROOT / "conf/distill/path_following/latent_wm.yaml")
     node.checkpoint_path = str(artifact)
+    node.pretrained_actor_checkpoint = str(actor_artifact(tmp_path / "actor.pt", model, contract, factory(model)))
     node.pose.odometry_source = "simulation"
     node.update_interval_steps = 2
     node.learning = {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8], "calibration_windows": 1,
-                                "horizon_windows": 1, "replay_sequence_windows": 1, "lora_rank": 2}}
+                                "horizon_windows": 1, "replay_sequence_windows": 1, "lora_rank": 2,
+                                "critic": {"hidden_dims": [8]}}}
     case.cfg.path_following = node
     session = create_session(case)
     try:
-        for _ in range(4):
+        for index in range(4):
             session.step_once()
+            if (index + 1) % 2 == 0:
+                session.controller._finish_learning(wait=True)
         runtime = session.controller
         assert runtime.updater.actor_updates == runtime.updater.response_updates == 2
         assert runtime.collector.completed_windows == 2
@@ -380,14 +413,16 @@ def test_latent_evaluation_compares_adaptation_with_frozen_world_model(tmp_path)
     from unilab.algos.torch.sttt.path_following.evaluation import run_path_following_evaluation
 
     case, original, _ = evaluation_case(tmp_path / "evaluation", modes=("latent_wm", "latent_wm_frozen"))
-    _, _, contract, model, _ = parts(tmp_path / "evaluation" / "inputs", case=case)
+    _, _, contract, model, factory = parts(tmp_path / "evaluation" / "inputs", case=case)
     artifact = save_world_model(tmp_path / "evaluation_wm.pt", model, contract)
+    actor_path = actor_artifact(tmp_path / "evaluation_actor.pt", model, contract, factory(model))
     cfg = OmegaConf.merge(
         OmegaConf.load(ROOT / "conf/sttt/latent_path_following_evaluate.yaml"), original,
-        {"world_model_checkpoint": str(artifact),
+        {"world_model_checkpoint": str(artifact), "pretrained_actor_checkpoint": str(actor_path),
          "latent_learning": {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8],
                                          "calibration_windows": 1, "horizon_windows": 1,
-                                         "replay_sequence_windows": 1, "lora_rank": 2}},
+                                         "replay_sequence_windows": 1, "lora_rank": 2,
+                                         "critic": {"hidden_dims": [8]}}},
          "thresholds": {"heading_tolerance_rad": math.pi}},
     )
     result = run_path_following_evaluation(cfg, root_dir=ROOT, playback_deps=case.deps)
@@ -654,7 +689,8 @@ def test_legacy_native_zero_residual_history_and_multistep_credit(tmp_path):
     torch.testing.assert_close(result.source_actions[:, 0], actual, rtol=1e-6, atol=1e-6)
     for index, phase in enumerate(phases):
         torch.testing.assert_close(phase, (start.observation_history[:, -1, 64:66] + index * 2 * math.pi * .02).remainder(2 * math.pi))
-    latent_actor_loss(result, start, ctrl_dt=.02, window_steps=2, config=LatentCostConfig())["loss"].backward()
+    latent_actor_loss(result, start, ctrl_dt=.02, window_steps=2, config=LatentCostConfig(),
+                      residual_limits=actor.residual_limit_rad29)["loss"].backward()
     assert sum(float(p.grad.square().sum()) for p in actor.parameters() if p.grad is not None) > 0
     assert all(p.grad is None for p in (*case.policy.parameters(), *model.parameters()))
     residual = torch.full((1, 29), .02)
@@ -706,17 +742,24 @@ def test_legacy_capture_pretraining_resume_and_runtime_without_yaml(tmp_path):
     assert restored.model.config.obs_dim == 66 and restored.training_state["optimizer_steps"] == 2
     node = OmegaConf.load(ROOT / "conf/distill/path_following/latent_wm.yaml")
     node.checkpoint_path = second["best_checkpoint_path"]
+    from unilab.algos.torch.sttt.path_following.pretraining import load_rollout
+    best = load_world_model(node.checkpoint_path)
+    node.pretrained_actor_checkpoint = str(actor_artifact(tmp_path / "legacy_actor.pt", best.model, best.contract,
+        load_rollout(best, Path(case.cfg.training.play_checkpoint_path))))
     node.pose.odometry_source = "simulation"
     node.update_interval_steps = 2
     node.learning = {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8],
                                "calibration_windows": 1, "horizon_windows": 1,
-                               "replay_sequence_windows": 1, "lora_rank": 2}}
+                               "replay_sequence_windows": 1, "lora_rank": 2,
+                               "critic": {"hidden_dims": [8]}}}
     case.cfg.path_following = node
     session = create_session(case)
     before = {name: value.clone() for name, value in session.controller.playback.policy.state_dict().items()}
     try:
-        for _ in range(6):
+        for index in range(6):
             session.step_once()
+            if (index + 1) % 2 == 0:
+                session.controller._finish_learning(wait=True)
         updater = session.controller.updater
         assert updater.actor.command_dim == 3 and updater.actor_updates > 0 and updater.response_updates > 0
         for name, value in session.controller.playback.policy.state_dict().items():
@@ -733,6 +776,7 @@ def test_legacy_capture_pretraining_resume_and_runtime_without_yaml(tmp_path):
         session.close()
     evaluation = OmegaConf.merge(OmegaConf.load(ROOT / "conf/sttt/latent_path_following_evaluate.yaml"), original,
         {"profile_path": None, "world_model_checkpoint": second["best_checkpoint_path"],
+         "pretrained_actor_checkpoint": node.pretrained_actor_checkpoint,
          "latent_learning": node.learning, "source_overrides": ["path_following.update_interval_steps=2"]})
     # The optional path_following group exists only in the latent mode.
     evaluation.source_overrides = ["++path_following.update_interval_steps=2"]

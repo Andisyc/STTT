@@ -7,6 +7,7 @@ import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -46,6 +47,7 @@ class LatentRuntimeSetup:
     resume_checkpoint_path: Path | None
     save_checkpoint_path: Path | None
     pretrained_actor: LatentResidualActor | None = None
+    pretrained_learning: dict[str, Any] | None = None
 
     def bind(self, playback: Any, env: Any) -> LatentPathFollowingUpdater:
         source = self.loaded.contract["source"]
@@ -76,6 +78,7 @@ class LatentRuntimeSetup:
         updater = LatentPathFollowingUpdater(self.loaded, rollout_factory(self.loaded.model), self.learning, self.costs)
         if self.pretrained_actor is not None:
             updater.actor.load_state_dict(self.pretrained_actor.state_dict(), strict=True)
+            updater.initialize_pretrained(self.pretrained_learning)
         return updater
 
 
@@ -145,16 +148,20 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
     if resume_path is not None and pretrained_path is not None:
         raise ValueError("select an online resume or pretrained A initialization, not both")
     learning_config = LatentOnlineConfig.from_mapping(raw["online"])
-    actor = None
+    if learning_config.adapt_actor and pretrained_path is None and resume_path is None:
+        raise ValueError("online A/Critic adaptation requires pretrained_actor_checkpoint or an online resume")
+    actor, pretrained_learning = None, None
     if pretrained_path is not None:
-        actor, _ = load_actor_checkpoint(pretrained_path, loaded.model, loaded.contract, learning_config.trajectory,
+        actor, metadata = load_actor_checkpoint(pretrained_path, loaded.model, loaded.contract, learning_config.trajectory,
                                           residual_limits=learning_config.residual_limit_rad)
         if actor.hidden_dims != learning_config.actor_hidden_dims or actor.command_dim != spec.command_dim:
             raise ValueError("pretrained A architecture differs from the deployment configuration")
+        pretrained_learning = metadata["learner_state"]
     if save_path is not None and save_path.exists() and save_path != resume_path:
         raise FileExistsError("online output already exists; select a new checkpoint path")
     return LatentRuntimeSetup(loaded, learning_config, LatentCostConfig(**raw["costs"]),
-                              PathFollowingRuntimeConfig(pose=pose, **counts), resume_path, save_path, actor)
+                              PathFollowingRuntimeConfig(pose=pose, **counts), resume_path, save_path,
+                              actor, pretrained_learning)
 
 
 def _digest(handle: Any) -> str:
@@ -210,6 +217,37 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
         self._residual_limits = self._zero.new_tensor(updater.config.residual_limit_rad)
         updater.ego_history = self.ego_history
         self._reset_diagnostics()
+        self._learning_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="latent-learning")
+        self._learning_future: Future | None = None
+        self._submitted_timestamp = -1
+
+    def _finish_learning(self, *, wait: bool = False) -> None:
+        future = self._learning_future
+        if future is None or (not wait and not future.done()):
+            return
+        self.last_update = future.result()
+        self._learning_future = None
+        if self.updater.publish():
+            self._real_latent = None
+        if self.last_update.a_loss is not None:
+            self._last_decision_update = self._submitted_timestamp
+        self.trace.append({"event": "learning_complete", "step": self._steps,
+            "a_updates": self.updater.actor_updates, "b_updates": self.updater.response_updates,
+            "critic_updates": self.updater.actor_learner.critic_learner.updates,
+            "elapsed_s": self.last_update.elapsed_s, "critic_loss": self.last_update.critic_loss})
+        budget = self.updater.window_steps * self.updater.ctrl_dt
+        self._budget_updates += 1
+        self._budget_overruns += int(self.last_update.elapsed_s > budget)
+        self._max_update_elapsed_s = max(self._max_update_elapsed_s, self.last_update.elapsed_s)
+
+    def _learning_ready(self) -> bool:
+        return self._learning_future is None
+
+    def _run_learning(self, samples, decision):
+        prepared = self.updater.prepare_update(samples, decision)
+        self._submitted_timestamp = -1 if decision is None else decision.timestamp_ns
+        self._learning_future = self._learning_executor.submit(self.updater.update_prepared, prepared)
+        return None
 
     def _command_for_step(self, command: Any) -> Any:
         reference = self.collector.reference
@@ -237,6 +275,7 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
     def reset(self, done: Any = None) -> None:
         if done is not None and not bool(torch.as_tensor(done).any()):
             return
+        self._finish_learning(wait=True)
         self.ego_history.clear()
         self.updater.discard_pending()
         super().reset(done)
@@ -252,6 +291,7 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
     def _select_candidate(self, now_ns: int) -> torch.Tensor:
         if not self.collector.window.at_boundary:
             return self._candidate
+        self._finish_learning()
         decision = self._fresh_decision(now_ns)
         if not self.updater.calibration_complete or decision is None:
             return self._zero
@@ -272,7 +312,7 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
             if timestamp >= 0 and bool(query.history_valid_mask[0, index]):
                 ego[index], valid[index, 0], age[index, 0] = self.ego_history.at(timestamp)
         reference = query.command
-        start = self.updater.rollout.encode_start(
+        start = self.updater.inference_rollout.encode_start(
             query, errors=reference.new_zeros((1, 2)), previous_residual=self._locked,
             ego_motion=torch.as_tensor(ego, device=reference.device, dtype=reference.dtype).unsqueeze(0),
             ego_valid=torch.as_tensor(valid, device=reference.device).unsqueeze(0),
@@ -285,7 +325,7 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
         if self._real_latent is None:
             raise RuntimeError("real WM posterior requires its current observed state")
         ego, valid, age = self.ego_history.at(timestamp_ns)
-        self._real_latent = self.updater.model.posterior(
+        self._real_latent = self.updater.inference_model.posterior(
             self._real_latent, action, observation,
             ego_motion=torch.as_tensor(ego, device=action.device, dtype=action.dtype).reshape(1, 3),
             ego_valid=torch.tensor([[valid]], device=action.device, dtype=torch.bool),
@@ -360,9 +400,6 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
         if self.last_update is not None and self.last_update is not self._last_diagnostic_update:
             self._last_diagnostic_update = self.last_update
             elapsed = self.last_update.elapsed_s
-            self._budget_updates += 1
-            self._budget_overruns += int(elapsed > budget)
-            self._max_update_elapsed_s = max(self._max_update_elapsed_s, elapsed)
         fields = {
             "risk_probability": probability, "risk_tilt_rad": tilt,
             "risk_label_valid": label_valid, "risk_event": event if label_valid else None,
@@ -405,7 +442,7 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
             if self._real_latent is None:
                 self._initialize_real_latent(query, before.timestamp_ns)
             with torch.no_grad():
-                probability = float(self.updater.model.risk(self._real_latent, action).sigmoid().item())
+                probability = float(self.updater.inference_model.risk(self._real_latent, action).sigmoid().item())
             if not math.isfinite(probability):
                 raise ValueError("non-finite real-transition risk prediction")
             state = self.env.state
@@ -488,8 +525,10 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
         if self._closed:
             return
         try:
+            self._finish_learning(wait=True)
             if self.save_checkpoint_path is not None and not self._failed:
                 self.updater.save(self.save_checkpoint_path)
         finally:
+            self._learning_executor.shutdown(wait=True, cancel_futures=True)
             self._real_latent = None
             super().close()

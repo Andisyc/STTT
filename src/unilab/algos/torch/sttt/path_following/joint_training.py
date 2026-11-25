@@ -98,14 +98,15 @@ class JointTrainer:
         self.at_boundary = False
         self.physical_control_steps += block.physical_control_steps
         actor_metrics, wm_metrics = {}, {}
-        for _ in range(self.schedule.actor_updates_per_iteration):
-            actor_metrics = self.actor.update(block.starts)
         for _ in range(self.schedule.wm_updates_per_iteration):
             wm_metrics = self.world_model.update(self.replay.sample(self.wm_batch_size))
+        for _ in range(self.schedule.actor_updates_per_iteration):
+            actor_metrics = self.actor.update(block.starts, block.failures)
         self.iteration += 1
         self.at_boundary = True
         return {"phase": "joint", "iteration": self.iteration, "actor_updates": self.actor.updates,
                 "wm_updates": self.world_model.updates, "physical_control_steps": self.physical_control_steps,
+                "critic_updates": self.actor.critic_learner.updates,
                 "replay_transitions": self.replay.transitions, "total_real_records": self.replay.total_collected,
                 "actor": actor_metrics, "world_model": wm_metrics}
 
@@ -118,7 +119,8 @@ class JointTrainer:
             valid = warmup == self.schedule.pretrain_wm_updates + iteration * self.schedule.wm_updates_per_iteration
         else:
             valid = warmup <= self.schedule.pretrain_wm_updates
-        if not valid or self.actor.updates != iteration * self.schedule.actor_updates_per_iteration:
+        if (not valid or self.actor.updates != iteration * self.schedule.actor_updates_per_iteration
+                or state["critic_updates"] != self.actor.critic_learner.updates):
             raise ValueError("paired checkpoint optimizer counters do not describe a complete joint boundary")
         self.iteration, self.physical_control_steps = iteration, physical
 
@@ -159,7 +161,8 @@ class _Collectors:
         starts = [block.starts for block in blocks if block.starts is not None]
         return CollectionBlock(sum(block.physical_control_steps for block in blocks),
             join_rollout_starts(starts) if starts else None,
-            tuple(directory for block in blocks for directory in block.completed_directories))
+            tuple(directory for block in blocks for directory in block.completed_directories),
+            tuple(failure for block in blocks for failure in block.failures))
 
     def bind(self, model, actor):
         for collector in self.items:
@@ -343,6 +346,7 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
         elif raw["actor"].get("initial_actor_checkpoint"):
             actor, _ = load_actor_checkpoint(resolve(raw["actor"]["initial_actor_checkpoint"]), model, contract,
                 distribution.base, require_model_identity=False, residual_limits=actor_options.residual_limit_rad)
+        model.configure_observation_loss(contract["source"]["preprocessing"])
         wm_learner = WorldModelLearner(model, raw["wm"]["training"], raw["wm"]["training"]["loss"])
         actor_learner = ActorLearner(actor, rollout, {**asdict(actor_options), "window_steps": options.capture.window_steps}, calibration["costs"])
         engine = JointTrainer(wm_learner, actor_learner, replay, options.schedule, wm_batch_size=raw["wm"]["training"]["batch_size"], physical_control_steps=physical_steps)
@@ -363,12 +367,14 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
             if not engine.at_boundary:
                 raise RuntimeError("refusing a partial joint-iteration checkpoint")
             state = {"iteration": engine.iteration, "physical_control_steps": engine.physical_control_steps,
+                "critic_updates": actor_learner.critic_learner.updates,
                 "training_dirs": training_dirs, "validation_dirs": validation_dirs,
                 "validation_sampler_state": validation_sampler.state_dict(), "calibration": calibration,
                 "collector_states": collectors.state_dict(), "random_state": _random_state(device)}
             path = save_joint_checkpoint(output / "last.pt", wm_learner, actor_learner, replay,
                                          run_id=run_id, signature=signature, state=state)
             summary.update(joint_checkpoint=str(path), iteration=engine.iteration, actor_updates=actor_learner.updates,
+                critic_updates=actor_learner.critic_learner.updates,
                 wm_updates=wm_learner.updates, physical_control_steps=engine.physical_control_steps,
                 total_real_records=replay.total_collected, replay_transitions=replay.transitions)
             _publish(output / "summary.json", summary)
@@ -389,7 +395,8 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                 if wm_learner.updates % raw["wm"]["training"]["checkpoint_every"] == 0 or final:
                     checkpoint()
             if not engine.iteration:
-                save_world_model(output / "warmup_world_model.pt", model, contract, training_state={"optimizer_steps": wm_learner.updates})
+                save_world_model(output / "warmup_world_model.pt", model, contract,
+                    training_state={"optimizer_steps": wm_learner.updates, "loss_config": wm_learner.loss_config})
             collectors.bind(model, actor)
             while engine.iteration < options.schedule.online_iterations:
                 block = collectors.advance(options.capture.steps_per_iteration, replay, versions=engine.versions)
@@ -403,9 +410,11 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                 if engine.iteration % options.schedule.checkpoint_every == 0 or final:
                     checkpoint()
         collectors.flush(replay)
-        exported_wm = save_world_model(output / "world_model.pt", model, contract, training_state={"optimizer_steps": wm_learner.updates})
+        exported_wm = save_world_model(output / "world_model.pt", model, contract,
+            training_state={"optimizer_steps": wm_learner.updates, "loss_config": wm_learner.loss_config})
         exported_actor = save_actor_checkpoint(output / "actor.pt", actor, model, contract, distribution.base,
-            training_state={"optimizer_steps": actor_learner.updates, "joint_iteration": engine.iteration})
+            training_state={"optimizer_steps": actor_learner.updates, "joint_iteration": engine.iteration},
+            learner_state=actor_learner.state_dict())
         summary.update(training_complete=True, world_model_checkpoint=str(exported_wm), actor_checkpoint=str(exported_actor))
         collectors.close()
         if raw["evaluation"]["enabled"]:

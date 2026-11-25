@@ -46,7 +46,8 @@ class LatentResidualActor(nn.Module):
         self.hidden_dims = tuple(int(width) for width in widths)
         self.register_buffer("residual_limit_rad29", limits)
         layers: list[nn.Module] = []
-        previous = self.feature_dim + 2 + self.command_dim + 5 * self.preview_points
+        self.input_dim = self.feature_dim + 2 + self.command_dim + 5 * self.preview_points + 29
+        previous = self.input_dim
         for width in self.hidden_dims:
             layer = nn.Linear(previous, width)
             nn.init.normal_(layer.weight, std=hidden_init_std)
@@ -59,17 +60,24 @@ class LatentResidualActor(nn.Module):
         layers.append(output)
         self.net = nn.Sequential(*layers)
 
-    def forward(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
-                preview: torch.Tensor) -> torch.Tensor:
+    def context(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
+                preview: torch.Tensor, previous_residual: torch.Tensor) -> torch.Tensor:
         if (
             features.ndim != 2 or features.shape[0] < 1 or features.shape[1] != self.feature_dim
             or errors.shape != (features.shape[0], 2) or command.shape != (features.shape[0], self.command_dim)
             or preview.shape != (features.shape[0], self.preview_points, 5)
+            or previous_residual.shape != (features.shape[0], 29)
         ):
-            raise ValueError("latent actor feature/error/command shapes differ from its execution contract")
-        for value in (features, errors, command, preview):
+            raise ValueError("latent actor inputs differ from its execution contract")
+        for value in (features, errors, command, preview, previous_residual):
             if value.dtype != self.residual_limit_rad29.dtype or value.device != self.residual_limit_rad29.device:
                 raise ValueError("latent actor inputs must match its floating-point dtype and device")
             if not bool(torch.isfinite(value).all()):
                 raise ValueError("latent actor inputs must be finite")
-        return torch.tanh(self.net(torch.cat((features, errors, command, preview.flatten(1)), dim=-1))) * self.residual_limit_rad29
+        return torch.cat((features, errors, command, preview.flatten(1),
+                          previous_residual / self.residual_limit_rad29), dim=-1)
+
+    def forward(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
+                preview: torch.Tensor, previous_residual: torch.Tensor) -> torch.Tensor:
+        context = self.context(features, errors, command, preview, previous_residual)
+        return torch.tanh(self.net(context)) * self.residual_limit_rad29

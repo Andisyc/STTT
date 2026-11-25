@@ -26,7 +26,8 @@ _TRAINING_DEFAULTS = {
     "resume_checkpoint": None, "initial_checkpoint": None, "loss": {},
     "microbatch_size": None,
 }
-_LOSS_KEYS = {"free_nats", "kl_scale", "reconstruction_scale", "motion_scale", "risk_scale", "overshoot_scale", "kl_balance", "prior_reconstruction_scale", "window_scale"}
+_LOSS_KEYS = {"free_nats", "kl_scale", "reconstruction_scale", "motion_scale", "risk_scale", "overshoot_scale", "kl_balance", "prior_reconstruction_scale", "window_scale",
+              "motion_velocity_tolerance", "motion_yaw_rate_tolerance", "window_xy_tolerance", "window_yaw_tolerance"}
 
 
 def _positive_integer(value: Any, name: str, *, zero: bool = False) -> int:
@@ -227,8 +228,8 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
         required = {"run_id", "optimizer_state", "optimizer_steps", "rng_state", "history",
                     "sampler_state", "validation_sampler_state", "validation_indices",
                     "data_sources", "training_signature", "best_state_dict", "best_metric", "best_step"}
-        if resumed_state.get("trainer_version") != 2 or not required <= resumed_state.keys():
-            raise ValueError("exact resume requires version-2 update-budget training state")
+        if resumed_state.get("trainer_version") != 3 or not required <= resumed_state.keys():
+            raise ValueError("exact resume requires version-3 physical-tolerance training state; use initial_checkpoint for old WM weights")
         if resumed_state["training_signature"] != signature or resumed_state["data_sources"] != sources:
             raise ValueError("resume training configuration or data identity changed")
         if resumed_state["validation_indices"] != validation_indices:
@@ -256,6 +257,7 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     history = list(resumed_state.get("history", []))
     best_metric, best_step = resumed_state.get("best_metric"), resumed_state.get("best_step")
     best_state = resumed_state.get("best_state_dict")
+    model.configure_observation_loss(contract["source"]["preprocessing"])
     learner = WorldModelLearner(model, {**training, "learning_rate": learning_rate, "weight_decay": weight_decay,
                                        "gradient_clip_norm": gradient_clip}, loss_config, updates=optimizer_steps)
     optimizer = learner.optimizer
@@ -265,8 +267,8 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
 
     def export_best(physical_model: LatentWorldModel) -> None:
         save_training_checkpoint(best_path, physical_model, contract, run_id=run_id, training_state={
-            "trainer_version": 2, "run_id": run_id, "optimizer_steps": best_step,
-            "selection_metric": "window_xy_rmse_m", "best_metric": best_metric,
+            "trainer_version": 3, "run_id": run_id, "optimizer_steps": best_step,
+            "selection_metric": "window_xy_rmse_m", "best_metric": best_metric, "loss_config": loss_config,
         })
 
     if best_state is not None and existing_best_step != best_step:
@@ -300,7 +302,7 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
         if optimizer_steps % integers["checkpoint_every"] == 0 or final:
             optimizer.zero_grad(set_to_none=True)
             state = {
-                "trainer_version": 2, "run_id": run_id, "optimizer_steps": optimizer_steps,
+                "trainer_version": 3, "run_id": run_id, "optimizer_steps": optimizer_steps, "loss_config": loss_config,
                 "optimizer_state": optimizer.state_dict(), "history": history,
                 "sampler_state": sampler.state_dict(), "validation_sampler_state": validation_sampler.state_dict(),
                 "validation_indices": validation_indices, "data_sources": sources,

@@ -148,7 +148,8 @@ def test_causal_actor_start_and_multistep_tracker_gradients(tmp_path):
     torch.testing.assert_close(start.observation_history[:, :3], start.observation_history[:, -1:].expand(-1, 3, -1))
     actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=3)
     result = rollout.run(start, actor, window_steps=2, horizon_windows=2)
-    cost = latent_actor_loss(result, start, ctrl_dt=.02, window_steps=2, config=LatentCostConfig())["loss"]
+    cost = latent_actor_loss(result, start, ctrl_dt=.02, window_steps=2, config=LatentCostConfig(),
+                            residual_limits=actor.residual_limit_rad29)["loss"]
     cost.backward()
     assert sum(float(parameter.grad.abs().sum()) for parameter in actor.parameters() if parameter.grad is not None) > 0
     assert all(parameter.grad is None for parameter in (*loaded.model.parameters(), *rollout.policy.parameters()))
@@ -517,7 +518,8 @@ def test_joint_effective_updates_and_paired_resume(tmp_path):
         for key, value in rollout.policy.state_dict().items():
             torch.testing.assert_close(value, source_before[key], rtol=0, atol=0)
         saved_state = {"iteration": engine.iteration, "physical_control_steps": engine.physical_control_steps,
-                       "random_state": _random_state(torch.device("cpu"))}
+                       "random_state": _random_state(torch.device("cpu")),
+                       "critic_updates": engine.actor.critic_learner.updates}
         path = save_joint_checkpoint(tmp_path / "joint.pt", engine.world_model, engine.actor, engine.replay,
             run_id="paired-test", signature={"schedule": asdict(schedule)}, state=saved_state)
         payload = load_joint_checkpoint(path)
@@ -540,6 +542,9 @@ def test_joint_effective_updates_and_paired_resume(tmp_path):
             torch.testing.assert_close(value, restored.world_model.model.state_dict()[key], rtol=0, atol=0)
         for key, value in engine.actor.actor.state_dict().items():
             torch.testing.assert_close(value, restored.actor.actor.state_dict()[key], rtol=0, atol=0)
+        assert engine.actor.critic_learner.updates == restored.actor.critic_learner.updates
+        for key, value in engine.actor.critic_learner.target.state_dict().items():
+            torch.testing.assert_close(value, restored.actor.critic_learner.target.state_dict()[key], rtol=0, atol=0)
     finally:
         torch.set_num_threads(threads)
         _restore_random_state(initial_rng, torch.device("cpu"))
@@ -598,12 +603,12 @@ def test_joint_cli_budget_contract_and_physical_cost_scales(tmp_path):
     cfg.refinement_cycles = 2
     with pytest.raises(ValueError, match="refinement_cycles"):
         JointTrainingConfig.from_mapping(cfg)
-    costs = {"lateral_weight": 1., "lateral_velocity_weight": 1., "forward_weight": 1.,
-             "smoothness_weight": 1., "risk_weight": 1., "huber_delta": None}
-    calibration = {"response_probe_result": None, "require_response_probe": False,
-                   "cost_scales": {"lateral_m": 2., "lateral_velocity_m_s": 4., "forward_velocity_m_s": 5., "residual_rate_rad_s": 10.}}
+    costs = asdict(LatentCostConfig())
+    calibration = {"response_probe_result": None, "require_response_probe": False}
     report = prepare_calibration(calibration, costs, directories=[], contract={},
                                  residual_limits=(.02,) * 29, horizon_steps=20, root=tmp_path)
-    assert report["costs"]["lateral_weight"] == .25
-    assert report["costs"]["forward_weight"] == .04
-    assert report["costs"]["risk_weight"] == 1.
+    assert report["costs"] == costs
+    assert report["scale_method"] == "declared_physical_task_tolerances"
+    with pytest.raises(ValueError, match="calibration requires"):
+        prepare_calibration({**calibration, "cost_scales": {}}, costs, directories=[], contract={},
+                            residual_limits=(.02,) * 29, horizon_steps=20, root=tmp_path)

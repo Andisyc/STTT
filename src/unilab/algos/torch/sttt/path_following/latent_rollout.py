@@ -40,6 +40,7 @@ class RolloutResult:
     final_latent: LatentState
     target_speed: torch.Tensor
     body_delta: torch.Tensor
+    decision_contexts: torch.Tensor
 
 
 @contextmanager
@@ -184,6 +185,9 @@ class PlannerTrackerRollout:
         self._validate_history(observations, source_actions, valid)
         self._validate_context(observations.shape[0], errors, query.command, previous_residual)
         batch, history = observations.shape[:2]
+        ego_motion = observations.new_zeros(batch, history, 3) if ego_motion is None else ego_motion
+        ego_valid = torch.zeros(batch, history, 1, device=self.device, dtype=torch.bool) if ego_valid is None else ego_valid
+        ego_age_s = observations.new_zeros(batch, history, 1) if ego_age_s is None else ego_age_s
         for name, value, width in (("ego_motion", ego_motion, 3), ("ego_valid", ego_valid, 1), ("ego_age_s", ego_age_s, 1)):
             if value is not None and (value.shape != (batch, history, width) or value.device != self.device):
                 raise ValueError(f"{name} must cover the full current [B,H,{width}] history")
@@ -209,6 +213,8 @@ class PlannerTrackerRollout:
             action_history=source_actions, history_valid_mask=valid,
             errors=errors.detach().clone(), command=query.command.detach().clone(),
             previous_residual=previous_residual.detach().clone(),
+            ego_motion=ego_motion.detach().clone(), ego_valid=ego_valid.detach().clone(),
+            ego_age_s=ego_age_s.detach().clone(),
             path_state=path_state.detach(),
         )
 
@@ -257,6 +263,8 @@ class PlannerTrackerRollout:
         residuals, risks, commands, target_speeds = [], [], [], []
         body_deltas = []
         held_residual: torch.Tensor | None = None
+        previous_residual = start.previous_residual
+        decision_contexts = []
         with _frozen_model(self.model):
             for step in range(int(window_steps * horizon_windows)):
                 # Step zero already contains the current real observation.
@@ -279,8 +287,11 @@ class PlannerTrackerRollout:
                     if update_reference_commands:
                         command = path.command(command)
                 if step % window_steps == 0:
-                    held_residual = actor(latent.feature(), errors, command, path.preview())
+                    preview = path.preview()
+                    decision_contexts.append(actor.context(latent.feature(), errors, command, preview, previous_residual))
+                    held_residual = actor(latent.feature(), errors, command, preview, previous_residual)
                     residuals.append(held_residual)
+                    previous_residual = held_residual
                 assert held_residual is not None
                 nominal = invoke_fada_planner(self.policy, self.spec,
                     observations, history_actions, command, history_valid_mask=valid)
@@ -316,6 +327,11 @@ class PlannerTrackerRollout:
                 source_actions.append(source_action)
                 risks.append(risk)
                 commands.append(command)
+        final_command = self._advance_command(command)
+        if update_reference_commands:
+            final_command = path.command(final_command)
+        decision_contexts.append(actor.context(latent.feature(), errors, final_command,
+                                               path.preview(), previous_residual))
         return RolloutResult(
             errors=torch.stack(all_errors, dim=1), path_delta=torch.stack(deltas, dim=1),
             actions=torch.stack(actions, dim=1), source_actions=torch.stack(source_actions, dim=1),
@@ -323,4 +339,5 @@ class PlannerTrackerRollout:
             commands=torch.stack(commands, dim=1), final_latent=latent,
             target_speed=torch.stack(target_speeds, dim=1),
             body_delta=torch.stack(body_deltas, dim=1),
+            decision_contexts=torch.stack(decision_contexts, dim=1),
         )

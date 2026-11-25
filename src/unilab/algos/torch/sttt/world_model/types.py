@@ -36,6 +36,9 @@ class RolloutStart:
     errors: torch.Tensor
     command: torch.Tensor
     previous_residual: torch.Tensor
+    ego_motion: torch.Tensor
+    ego_valid: torch.Tensor
+    ego_age_s: torch.Tensor
     path_state: PathState | None = None
 
     def __post_init__(self) -> None:
@@ -56,6 +59,10 @@ class RolloutStart:
             raise ValueError("rollout history requires a boolean validity mask")
         if self.history_valid_mask.device != obs.device or not bool(self.history_valid_mask[:, -1].all()):
             raise ValueError("rollout requires a current valid observation on the history device")
+        for name, value, width in (("ego_motion", self.ego_motion, 3), ("ego_valid", self.ego_valid, 1),
+                                   ("ego_age_s", self.ego_age_s, 1)):
+            if value.shape != (batch, history, width) or value.device != obs.device:
+                raise ValueError(f"{name} must cover the owned observation history")
         if self.latent.belief.shape[0] != batch or self.latent.state.shape[0] != batch:
             raise ValueError("rollout latent and history batches differ")
         if self.path_state is not None:

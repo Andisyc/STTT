@@ -44,6 +44,10 @@ training:
     overshoot_scale: 1.0
     prior_reconstruction_scale: 1.0
     window_scale: 1.0
+    motion_velocity_tolerance: 0.05
+    motion_yaw_rate_tolerance: 0.1
+    window_xy_tolerance: 0.01
+    window_yaw_tolerance: 0.02
 device: cpu
 seed: 0
 output_dir: null
