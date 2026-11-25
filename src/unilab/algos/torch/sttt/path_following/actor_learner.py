@@ -85,6 +85,10 @@ class ActorLearner:
                failures: tuple[tuple[RolloutStart, ObservedCostWindow], ...] = ()) -> dict[str, float]:
         start = self.refresh_start(start)
         critic_metrics = self.fit_critic(start, failures)
+        return {**self.actor_step(start), **critic_metrics}
+
+    def actor_step(self, start: RolloutStart) -> dict[str, float]:
+        """Apply the production actor substep without fitting or changing the Critic."""
         self.actor.train()
         self.optimizer.zero_grad(set_to_none=True)
         batch_size = start.command.shape[0]
@@ -109,7 +113,7 @@ class ActorLearner:
         self.updates += 1
         totals["gradient_norm"] = norm.detach()
         values = torch.stack([value.float() for value in totals.values()]).cpu().tolist()
-        return {**dict(zip(totals, values)), **critic_metrics}
+        return dict(zip(totals, values))
 
     def state_dict(self) -> dict[str, Any]:
         return {"version": 2, "signature": self.signature, "optimizer_steps": self.updates,

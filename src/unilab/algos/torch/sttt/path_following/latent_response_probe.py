@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import random
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -21,18 +20,18 @@ from unilab.algos.torch.distill.fada.official_playback import OfficialFADAPlayba
 from unilab.algos.torch.distill.fada.playback import FADAPlaybackController
 from unilab.algos.torch.sttt.path_following.contract import _integer
 from unilab.algos.torch.sttt.path_following.features import pack_response_context
-from unilab.algos.torch.sttt.path_following.intervention import compose_joint_position_residual
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout, RolloutResult
+from unilab.algos.torch.sttt.path_following.control_probe import run_physical_branch
+from unilab.algos.torch.sttt.path_following.control_response import relative_motion
+from unilab.algos.torch.sttt.path_following.trajectory import TrajectoryConfig
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath
 from unilab.algos.torch.sttt.path_following.response_probe import (
-    _identity, _pose, _positive, _publish, _same_start, compare_probe_responses,
+    _identity, _positive, _publish, compare_probe_responses,
 )
 from unilab.algos.torch.sttt.pose_data import ReceivedPose, TimedPelvisPose
 from unilab.algos.torch.sttt.world_model.checkpoint import load_world_model
 from unilab.algos.torch.sttt.world_model.motion import MOTION_FRAME, motion_prefix
-from unilab.algos.torch.sttt.world_model.sequence_collection import CausalEgoHistory, _path_delta
-from unilab.visualization.playback_distill_sessions import create_fada_playback_session
-from unilab.visualization.playback_sessions import RslRlPlaybackConfig
+from unilab.algos.torch.sttt.world_model.sequence_collection import CausalEgoHistory
 
 
 def _canonical(value: Any) -> Any:
@@ -72,7 +71,7 @@ class _Intervention:
         if self.reference is None:
             self.reference = FixedStraightPath.from_initial_pose(pose)
 
-    def __call__(self, query):
+    def decide(self, query):
         if self.step == self.last_query_step:
             raise ValueError("multiple inference queries in one probe control step")
         self.last_query_step = self.step
@@ -117,11 +116,7 @@ class _Intervention:
                 self.prediction = rollout.run(start, _HeldResidual(self.residual),
                     window_steps=self.loaded.contract["data"]["window_steps"], horizon_windows=self.horizon,
                     update_reference_commands=False)
-        residual = self.residual.to(query.planner_future) if self.step >= self.warmup else torch.zeros_like(self.residual).to(query.planner_future)
-        scales = query.preprocessing["term_scale"]
-        return compose_joint_position_residual(query.planner_future, residual, ctrl_dt=query.profile.ctrl_dt,
-            position_scale=scales["dof_pos"], velocity_scale=scales["dof_vel"],
-            observation_contract=query.preprocessing.get("observation_contract", "official_compact_64_v1"))
+        return self.residual.to(query.planner_future) if self.step >= self.warmup else torch.zeros_like(self.residual).to(query.planner_future)
 
 
 def _bind(loaded, controller, env, policy_identity) -> PlannerTrackerRollout:
@@ -158,92 +153,57 @@ def _bind(loaded, controller, env, policy_identity) -> PlannerTrackerRollout:
 
 
 def _run_branch(name, residual, cfg, *, root, output, seed, warmup, horizon, loaded, policy_identity, canonical, playback_deps):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
     intervention = _Intervention(warmup, residual, loaded, horizon, seed ^ 0x5DEECE66D, canonical)
-    session = None
-    poses, times, actions = [], [], []
-    start: dict[str, np.ndarray] = {}
-    result = {"branch": name, "complete": False, "error": None,
-              "residual_rad": residual[0].cpu().tolist(), "completed_steps": 0}
+    def bind(controller, env):
+        intervention.rollout = _bind(loaded, controller, env, policy_identity)
+    def program(decision):
+        intervention.step = decision.step + warmup
+        return intervention.decide(decision.query)
+    trace = run_physical_branch(cfg, root=root, policy=Path(cfg.training.play_checkpoint_path), program=program,
+        name=name, seed=seed, warmup_steps=warmup, window_steps=loaded.contract["data"]["window_steps"],
+        observation_steps=loaded.contract["data"]["window_steps"] * horizon,
+        residual_limits=np.maximum(np.abs(residual[0].cpu().numpy()), 1e-12),
+        trajectory=TrajectoryConfig(speed_m_s=float(cfg.env.commands.vel_limit[0][0])),
+        canonical=None if canonical is None else canonical["_physical_trace"],
+        device=str(residual.device), playback_deps=playback_deps, on_session=bind, observer=intervention.observe,
+        stop_on_risk=False)
+    a = trace.arrays
+    poses = np.concatenate((a.get("origin_warmup_poses", np.empty((0, 4, 4))), a["poses"][1:]), axis=0) if len(a["poses"]) else a["poses"]
+    actions = np.concatenate((a.get("origin_warmup_actions", np.empty((0, 29))), a["actions"]), axis=0) if len(a["actions"]) else a["actions"]
+    times = np.concatenate((a.get("origin_warmup_times_ns", np.empty(0, np.int64)), a["timestamps_ns"][1:]))
+    start = {"_physical_trace": trace}
+    for key in ("warmup_times_ns", "warmup_actions", "warmup_poses", "native_state", "gait_phase", "command"):
+        if "origin_" + key in a:
+            start[key] = a["origin_" + key]
+    result = {"branch": name, "complete": False, "error": trace.metadata["error"],
+              "residual_rad": residual[0].cpu().tolist(), "completed_steps": warmup + len(a["actions"])}
     try:
-        playback = RslRlPlaybackConfig(task="G1WalkFlat", load_run="-1", checkpoint=None, action_mode="policy",
-            policy_obs_mode="actor", algo_log_name="distill", log_root=None, num_envs=1,
-            checkpoint_path=str(cfg.training.play_checkpoint_path), keyboard=False)
-        session, _, resolved = create_fada_playback_session(playback_cfg=playback, cfg=cfg, root_dir=root,
-            device=str(residual.device), future_transform=intervention, deps=playback_deps, log=lambda _: None)
-        if resolved is None or _identity(Path(resolved))["sha256"] != policy_identity["sha256"]:
-            raise ValueError("actual policy checkpoint differs from the requested source")
-        rollout = _bind(loaded, session.controller, session.env, policy_identity)
-        intervention.rollout = rollout
-        session.set_autoreset(False)
-        session.reset()
-        pose = _pose(session.env)
-        intervention.observe(pose)
-        poses.append(pose.navigation_from_pelvis)
-        times.append(pose.timestamp_ns)
-        first_probe_pose = None
-        window_steps = loaded.contract["data"]["window_steps"]
-        for step in range(warmup + window_steps * horizon):
-            if step == warmup:
-                native = np.asarray(session.env.capture_rollout_snapshot().backend_state["physics_state"])
-                if native.dtype != np.float64 or native.ndim != 2 or native.shape[0] != 1 or not np.isfinite(native).all():
-                    raise ValueError("probe requires finite native float64 physics state")
-                start = {"warmup_times_ns": np.asarray(times, dtype=np.int64), "warmup_actions": np.asarray(actions),
-                         "warmup_poses": np.asarray(poses), "native_state": native.copy(),
-                         "gait_phase": np.asarray(session.info["gait_phase"]).copy(),
-                         "command": np.asarray(session.info["commands"]).copy()}
-                if canonical is not None:
-                    _same_start(canonical, start)
-                first_probe_pose = pose
-            intervention.step = step
-            session.step_once()
-            next_pose = _pose(session.env)
-            if next_pose.timestamp_ns - pose.timestamp_ns != round(rollout.profile.ctrl_dt * 1e9):
-                raise ValueError("probe control period differs from the WM contract")
-            action = np.asarray(session.info["current_actions"], dtype=np.float32)
-            if action.shape != (1, 29) or not np.isfinite(action).all():
-                raise ValueError("probe requires finite actual env-input actions [1,29]")
-            actions.append(action[0].copy())
-            poses.append(next_pose.navigation_from_pelvis)
-            times.append(next_pose.timestamp_ns)
-            pose = next_pose
-            intervention.observe(pose)
-            result["completed_steps"] += 1
-            if bool(np.any(session.env.state.terminated | session.env.state.truncated)):
-                raise ValueError("probe branch terminated/truncated; no retry or replacement")
-        if first_probe_pose is None or intervention.prediction is None or intervention.context is None:
-            raise RuntimeError("probe did not reach its prediction origin")
-        predicted_actions = intervention.prediction.actions[0].cpu().numpy()
-        if not np.allclose(predicted_actions[0], actions[warmup], rtol=1e-6, atol=1e-6):
+        if not trace.metadata["complete"] or not trace.metadata["valid"]:
+            raise ValueError(str(trace.metadata["error"] or trace.metadata["end_reason"]))
+        if intervention.prediction is None or intervention.context is None:
+            raise ValueError("probe did not reach its prediction origin")
+        if not np.allclose(intervention.prediction.actions[0, 0].cpu().numpy(), a["actions"][0], rtol=1e-6, atol=1e-6):
             raise ValueError("first imagined action differs from actual Planner–Tracker execution")
         delta = motion_prefix(intervention.prediction.body_delta)[0, -1].cpu().numpy().copy()
+        heading = np.arctan2(a["poses"][0, 1, 0], a["poses"][0, 0, 0]) - np.arctan2(a["origin_warmup_poses"][0, 1, 0], a["origin_warmup_poses"][0, 0, 0])
+        x, y = float(delta[0]), float(delta[1])
+        delta[:2] = [np.cos(heading) * x - np.sin(heading) * y, np.sin(heading) * x + np.cos(heading) * y]
         delta[2] = math.atan2(math.sin(delta[2]), math.cos(delta[2]))
-        if not np.isfinite(delta).all():
-            raise ValueError("WM produced non-finite probe motion")
-        result.update(complete=True, delta_m_m_rad=_path_delta(first_probe_pose, pose).tolist(),
-            predicted_delta_m_m_rad=delta.tolist(), context_sha256=hashlib.sha256(intervention.context.numpy().tobytes()).hexdigest())
+        actual = relative_motion(trace)[-1].tolist()
+        result.update(complete=True, delta_m_m_rad=actual, predicted_delta_m_m_rad=delta.tolist(),
+            context_sha256=hashlib.sha256(intervention.context.numpy().tobytes()).hexdigest())
         start.update(context=intervention.context.numpy().copy(), **intervention.encoded)
     except Exception as error:
-        result["error"] = {"type": type(error).__name__, "message": str(error)}
-        result["failed_step_physics_may_have_advanced"] = True
-    finally:
-        if session is not None:
-            try:
-                session.close()
-            except Exception as error:
-                result.update(complete=False, close_error={"type": type(error).__name__, "message": str(error)})
-        arrays = {"timestamps_ns": np.asarray(times, dtype=np.int64), "poses": np.asarray(poses),
-                  "executed_actions": np.asarray(actions), "residual_rad": residual.cpu().numpy(),
-                  **{f"start_{key}": value for key, value in start.items()}}
-        if intervention.prediction is not None:
-            arrays.update(predicted_actions=intervention.prediction.actions[0].cpu().numpy(),
-                          predicted_source_actions=intervention.prediction.source_actions[0].cpu().numpy(),
-                          predicted_path_delta=intervention.prediction.path_delta[0].cpu().numpy())
-            arrays["predicted_body_delta"] = intervention.prediction.body_delta[0].cpu().numpy()
-        np.savez_compressed(output / f"{name}.npz", **arrays)
-    return result, start, np.asarray(poses[warmup:])
+        result.update(error={"type": type(error).__name__, "message": str(error)}, failed_step_physics_may_have_advanced=True)
+    arrays = {"timestamps_ns": times, "poses": poses, "executed_actions": actions, "residual_rad": residual.cpu().numpy(),
+              **{f"start_{key}": value for key, value in start.items() if key != "_physical_trace"}}
+    if intervention.prediction is not None:
+        arrays.update(predicted_actions=intervention.prediction.actions[0].cpu().numpy(),
+            predicted_source_actions=intervention.prediction.source_actions[0].cpu().numpy(),
+            predicted_path_delta=intervention.prediction.path_delta[0].cpu().numpy(),
+            predicted_body_delta=intervention.prediction.body_delta[0].cpu().numpy())
+    np.savez_compressed(output / f"{name}.npz", **arrays)
+    return result, start, a["poses"]
 
 
 def run_latent_response_direction_probe(cfg: DictConfig, *, root_dir=None, playback_deps=None):

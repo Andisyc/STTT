@@ -1,0 +1,32 @@
+# Native Planner–Tracker diagnostics. Training artifacts are read-only.
+mode: all  # all, physical (no WM required), analyze (existing data_dir)
+run_dir: null
+policy_checkpoint: null  # Inherited from run_dir/summary.json when omitted.
+profile_path: null
+output_dir: null
+data_dir: null
+source_overrides: []
+device: cpu
+seed: 0
+window_steps: null  # Inherited from the paired training run.
+residual_limits_rad: null  # 29 source-order radians; inherited from the paired run.
+warmup_steps: 50
+phase_fractions: [0.0, 0.25, 0.5, 0.75]
+amplitude_fractions: [0.5, 1.0]
+observation_cycles: 2.0
+speed_m_s: 0.35
+risk_tilt_limit_rad: 0.8
+minimum_effect_m: 0.0001
+minimum_effect_rad: 0.0001
+replay_position_tolerance_m: 0.0000001
+replay_heading_tolerance_rad: 0.0000001
+feedback_offsets_m: [-0.15, 0.15]
+feedback_duration_s: 30.0
+minimum_forward_retention: 0.8
+feedback_solver_iterations: 96
+# Replay the three strongest measured joint directions per phase, at both amplitudes.
+model_top_directions: 3
+model_seeds: [0, 1, 2]
+critic_trajectory_kinds: [straight, circle]
+critic_initial_lateral_m: 0.15
+continuation_duration_s: 30.0
