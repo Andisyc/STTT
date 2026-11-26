@@ -32,9 +32,10 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
     if mode not in {"all", "physical", "analyze", "feedback"}:
         raise ValueError("mode must be all, physical, analyze or feedback")
     run = resolve(raw["run_dir"]) if raw["run_dir"] else None
-    training = json.loads((run / "summary.json").read_text())["config"] if run is not None else None
+    training_summary = json.loads((run / "summary.json").read_text()) if run is not None else None
+    training = training_summary["config"] if training_summary is not None else None
     if mode in {"all", "analyze"} and training is None:
-        raise ValueError("model/value/actor diagnostics require run_dir with paired exported checkpoints")
+        raise ValueError("model/context diagnostics require run_dir with paired exported checkpoints")
     policy = resolve(raw["policy_checkpoint"] or (training or {}).get("policy_checkpoint"))
     if not policy.is_file():
         raise FileNotFoundError(policy)
@@ -68,7 +69,7 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
         raise FileExistsError(output)
     output.mkdir(parents=True)
     data_root = resolve(raw["data_dir"]) if mode in {"analyze", "feedback"} else output
-    report = {"format": "sttt_control_diagnostics", "version": 1, "complete": False, "mode": mode,
+    report = {"format": "sttt_control_diagnostics", "version": 2, "complete": False, "mode": mode,
         "policy_identity": _identity(policy), "configuration": raw, "stages": {}, "error": None}
     _publish(output / "summary.json", report)
     _publish(output / "source.json", {"policy_identity": report["policy_identity"], "training_run": str(run) if run else None,
@@ -153,10 +154,11 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
             _publish(output / "summary.json", report)
             return report
 
-        from .control_model_diagnostics import (DiagnosticModels, FrozenActorProgram, critic_counterfactual,
-            replay_world_model, response_contrast, shadow_actor_update)
-        models = DiagnosticModels.load(run / "world_model.pt", run / "actor.pt", policy, trajectory=base, device=raw["device"])
-        if models.learner.window_steps != k or not np.array_equal(models.actor.residual_limit_rad29.detach().cpu().numpy(), limits.astype(np.float32)):
+        from .control_model_diagnostics import (DiagnosticModels, FrozenActorProgram,
+            replay_world_model, response_contrast, shadow_context_update)
+        models = DiagnosticModels.load(Path(training_summary["world_model_checkpoint"]), Path(training_summary["actor_checkpoint"]),
+            policy, trajectory=base, device=raw["device"])
+        if models.window_steps != k or not np.array_equal(models.actor.residual_limit_rad29.detach().cpu().numpy(), limits.astype(np.float32)):
             raise ValueError("diagnostic timing/bounds differ from the paired actor checkpoint")
         direction_scores = np.max(np.abs(response.response[:, :, 1]) / response.noise[:, None, 1, None], axis=1)
         selected = np.argsort(direction_scores, axis=1)[:, -min(29, raw["model_top_directions"]):]
@@ -191,32 +193,20 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
         model_report["response_rankings"] = rankings
         stage("world_model", model_report)
 
-        prefix_steps = models.learner.window_steps * models.learner.horizon_windows
+        prefix_steps = models.window_steps * models.horizon_windows
         suffix_steps = math.ceil(raw["continuation_duration_s"] / response.dt / k) * k
-        critic_report, shadow_report = {}, {}
-        strongest = int(np.argmax(direction_scores.max(0)))
-        direction = np.zeros(29); direction[strongest] = limits[strongest]
-        for kind in raw["critic_trajectory_kinds"]:
-            case = replace(base, kind=kind, initial_lateral_m=raw["critic_initial_lateral_m"])
-            groups = {}
-            canonical = None
-            for name, residual in (("zero", np.zeros(29)), ("plus", direction), ("minus", -direction), ("actor", None)):
-                program = FrozenActorProgram(models, seed=raw["seed"], prefix_steps=prefix_steps, prefix_residual=residual)
-                trace = branch(f"critic/{kind}_{name}", program, trajectory=case, steps=prefix_steps + suffix_steps,
-                    canonical=canonical, reference_commands=True, capture_steps=(0, prefix_steps))
-                if canonical is None: canonical = trace
-                groups[name] = trace
-            critic_report[kind] = critic_counterfactual(groups, models, prefix_steps=prefix_steps, seed=raw["model_seeds"][0])
-            shadow, changed_actor = shadow_actor_update(groups["actor"], models, seed=raw["model_seeds"][0])
-            changed = branch(f"shadow/{kind}_after", FrozenActorProgram(models, seed=raw["seed"], prefix_steps=prefix_steps,
-                prefix_actor=changed_actor), trajectory=case, steps=prefix_steps + suffix_steps,
-                canonical=canonical, reference_commands=True, capture_steps=(0, prefix_steps))
-            shadow["physical_comparison"] = critic_counterfactual({"before": groups["actor"], "after": changed}, models,
-                prefix_steps=prefix_steps, seed=raw["model_seeds"][0])
-            shadow["physical_tracking"] = {"before": tracking_metrics(groups["actor"]), "after": tracking_metrics(changed)}
+        shadow_report = {}
+        for kind in raw["context_trajectory_kinds"]:
+            case = replace(base, kind=kind, initial_lateral_m=raw["context_initial_lateral_m"])
+            before = branch(f"context/{kind}_before", FrozenActorProgram(models, seed=raw["seed"], prefix_steps=prefix_steps),
+                trajectory=case, steps=prefix_steps + suffix_steps, reference_commands=True, capture_steps=(0,))
+            shadow, context = shadow_context_update(before, models, seed=raw["model_seeds"][0])
+            after = branch(f"context/{kind}_after", FrozenActorProgram(models, seed=raw["seed"],
+                prefix_steps=prefix_steps, adaptation_context=context), trajectory=case,
+                steps=prefix_steps + suffix_steps, canonical=before, reference_commands=True, capture_steps=(0,))
+            shadow["physical_tracking"] = {"before": tracking_metrics(before), "after": tracking_metrics(after)}
             shadow_report[kind] = shadow
-        stage("critic", {"status": "compared", "prefix_steps": prefix_steps, "continuation_steps": suffix_steps, "cases": critic_report})
-        stage("actor_shadow", {"status": "compared", "cases": shadow_report})
+        stage("context_shadow", {"status": "compared", "cases": shadow_report})
         report["complete"] = True
     except Exception as error:
         report["error"] = {"type": type(error).__name__, "message": str(error)}

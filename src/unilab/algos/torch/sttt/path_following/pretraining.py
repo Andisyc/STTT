@@ -1,4 +1,4 @@
-"""Offline reference-conditioned policy learning and explicit data/model cycles."""
+"""Real-simulation residual PPO entrypoints and causal reference conditioning."""
 from __future__ import annotations
 
 import hashlib
@@ -20,16 +20,10 @@ from unilab.algos.torch.distill.fada.legacy_deployment import LegacyFADAPlayback
 from unilab.algos.torch.distill.fada.runtime_policy import (
     FADAFutureQuery, OfficialFADAPlaybackProfile, invoke_fada_planner,
 )
-from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint, save_actor_checkpoint
-from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
-from unilab.algos.torch.sttt.path_following.critic import CriticConfig
-from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
-from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.trajectory import PathState, ReferenceTrajectory, TrajectoryConfig
-from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel, load_world_model
-from unilab.algos.torch.sttt.world_model.pretraining_data import PretrainingBatch, PretrainingSequenceSampler
-from unilab.algos.torch.sttt.world_model.training import _restore_rng, _rng_state
+from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel
+from unilab.algos.torch.sttt.world_model.pretraining_data import PretrainingBatch
 from unilab.algos.torch.sttt.world_model.types import RolloutStart
 
 
@@ -72,17 +66,13 @@ class TrajectoryDistribution:
 class ActorTrainingConfig:
     residual_limit_rad: tuple[float, ...]
     hidden_dims: tuple[int, ...] = (256, 128)
-    max_updates: int = 10000
-    batch_size: int = 16
+    max_updates: int = 3000
+    batch_size: int = 64
     horizon_windows: int = 2
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     max_grad_norm: float = 1.
     checkpoint_every: int = 1000
     seed: int = 0
-    microbatch_size: int | None = None
-    critic: CriticConfig = field(default_factory=CriticConfig)
-    optimizer_betas: tuple[float, float] = (.7, .95)
-    final_learning_rate: float = 1e-5
 
     def __post_init__(self) -> None:
         if len(self.residual_limit_rad) != 29 or any(not math.isfinite(x) or x <= 0 for x in self.residual_limit_rad):
@@ -96,21 +86,15 @@ class ActorTrainingConfig:
             raise ValueError("actor seed must be a nonnegative integer")
         if any(not math.isfinite(x) or x <= 0 for x in (self.learning_rate, self.max_grad_norm)):
             raise ValueError("actor learning rate/gradient norm must be positive")
-        if self.microbatch_size is not None and (type(self.microbatch_size) is not int or self.microbatch_size < 1):
-            raise ValueError("actor microbatch size must be a positive integer or None")
-        if not isinstance(self.critic, CriticConfig):
-            raise ValueError("actor training requires a validated critic configuration")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ActorTrainingConfig:
         raw = dict(values)
-        for name in ("residual_limit_rad", "hidden_dims", "optimizer_betas"):
+        for name in ("residual_limit_rad", "hidden_dims"):
             if name in raw and raw[name] is not None:
                 raw[name] = tuple(raw[name])
         if raw.get("residual_limit_rad") is None:
             raise ValueError("set explicit source-order residual_limit_rad before pretraining A")
-        if "critic" in raw:
-            raw["critic"] = CriticConfig.from_mapping(raw["critic"])
         return cls(**raw)
 
 
@@ -171,81 +155,11 @@ def actor_training_start(batch: PretrainingBatch, rollout: PlannerTrackerRollout
 
 
 def train_latent_actor(cfg: Mapping[str, Any] | DictConfig, *, root_dir: str | Path = ".") -> dict[str, Any]:
+    """Train base A with real-simulation PPO through the shared pipeline."""
+    from .joint_training import run_joint_pretraining
     raw = OmegaConf.to_container(cfg, resolve=True) if OmegaConf.is_config(cfg) else dict(cfg)
-    allowed = {"world_model_checkpoint", "policy_checkpoint", "data_dirs", "output_dir", "device", "training", "trajectories", "costs", "resume_checkpoint", "initial_actor_checkpoint"}
-    if not isinstance(raw, dict) or set(raw) - allowed:
-        raise ValueError("unknown offline actor training fields")
-    root = Path(root_dir).resolve()
-    def resolve(value):
-        if not value:
-            raise ValueError("provide explicit actor data/checkpoint/output paths")
-        path = Path(value).expanduser()
-        return path if path.is_absolute() else root / path
-    options = ActorTrainingConfig.from_mapping(raw["training"])
-    distribution = TrajectoryDistribution.from_mapping(raw.get("trajectories", {}))
-    costs = LatentCostConfig(**raw.get("costs", {}))
-    device = str(raw.get("device", "cpu"))
-    torch.manual_seed(options.seed)
-    rng = random.Random(options.seed)
-    loaded = load_world_model(resolve(raw["world_model_checkpoint"]), device=device)
-    rollout = load_rollout(loaded, resolve(raw["policy_checkpoint"]), device=device)
-    loaded.model.eval().requires_grad_(False)
-    sampler = PretrainingSequenceSampler([resolve(path) for path in raw["data_dirs"]], rollout_windows=1, seed=options.seed)
-    if sampler.contract != loaded.contract:
-        raise ValueError("A pretraining data differs from the loaded physical model contract")
-    if raw.get("resume_checkpoint") and raw.get("initial_actor_checkpoint"):
-        raise ValueError("select exact resume or actor warm start, not both")
-    state = {}
-    initial = raw.get("resume_checkpoint") or raw.get("initial_actor_checkpoint")
-    if initial:
-        actor, state = load_actor_checkpoint(resolve(initial), loaded.model, loaded.contract, distribution.base,
-                                             require_model_identity=bool(raw.get("resume_checkpoint")),
-                                             residual_limits=options.residual_limit_rad)
-        if actor.hidden_dims != options.hidden_dims or actor.command_dim != rollout.spec.command_dim:
-            raise ValueError("actor architecture differs from requested offline training")
-    else:
-        actor = LatentResidualActor(loaded.model.feature_dim, options.hidden_dims, options.residual_limit_rad,
-                                    command_dim=rollout.spec.command_dim, preview_points=distribution.base.preview_points).to(next(loaded.model.parameters()))
-    learner = ActorLearner(actor, rollout, {**asdict(options), "window_steps": loaded.contract["data"]["window_steps"]}, costs)
-    signature = {"training": {key: value for key, value in asdict(options).items()
-                              if key != "max_updates" and not (key == "microbatch_size" and value is None)},
-                 "trajectories": asdict(distribution), "costs": asdict(costs), "device": device}
-    updates = 0
-    if raw.get("resume_checkpoint"):
-        if state["signature"] != signature:
-            raise ValueError("actor resume configuration changed")
-        sampler.load_state_dict(state["sampler_state"])
-        learner.load_state_dict(state["learner_state"])
-        rng.setstate(state["task_rng_state"])
-        _restore_rng(state, torch.device(device))
-        updates = state["optimizer_steps"]
-    learner.updates = updates
-    if updates >= options.max_updates:
-        raise ValueError("max_updates must exceed completed actor updates")
-    output = resolve(raw["output_dir"])
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError("actor training requires a new output directory")
-    output.mkdir(parents=True, exist_ok=True)
-    checkpoint = None
-    metrics = {}
-    with (output / "training.jsonl").open("x") as log:
-        while updates < options.max_updates:
-            batch = sampler.sample(options.batch_size, device=device)
-            task = distribution.sample(rng)
-            start = actor_training_start(batch, rollout, task, seed=rng.randrange(2**31))
-            losses = learner.update(start)
-            updates = learner.updates
-            if updates % options.checkpoint_every == 0 or updates == options.max_updates:
-                metrics = losses
-                log.write(json.dumps({"optimizer_steps": updates, "task": asdict(task), **metrics}) + "\n")
-                log.flush()
-                print(json.dumps({"actor_updates": updates, **metrics}), flush=True)
-                checkpoint = save_actor_checkpoint(output / f"actor_{updates:08d}.pt", actor, loaded.model, loaded.contract,
-                                                    distribution.base, training_state={"optimizer_steps": updates,
-                                                        "sampler_state": sampler.state_dict(),
-                                                        "task_rng_state": rng.getstate(), "signature": signature,
-                                                        **_rng_state(torch.device(device))}, learner_state=learner.state_dict())
-    return {"actor_checkpoint": str(checkpoint), "optimizer_steps": updates, "metrics": metrics}
+    raw["stage"] = "base"
+    return run_joint_pretraining(raw, root_dir=root_dir)
 
 
 def capture_configuration(root: Path, policy_checkpoint: Path, *, source_overrides: list[str],
@@ -274,7 +188,7 @@ def capture_configuration(root: Path, policy_checkpoint: Path, *, source_overrid
 
 
 def run_pretraining_pipeline(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Path = ".") -> dict[str, Any]:
-    """Run continuous collection, WM warmup and persistent alternating updates."""
+    """Run supervised WM warmup, real-simulation A PPO, then frozen-prior FiLM PPO."""
     from unilab.algos.torch.sttt.path_following.joint_training import run_joint_pretraining
 
     return run_joint_pretraining(cfg, root_dir=root_dir)

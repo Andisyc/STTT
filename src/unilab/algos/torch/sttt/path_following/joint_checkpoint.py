@@ -1,4 +1,4 @@
-"""Atomic WM/Actor/Critic state; physics resumes in new episodes."""
+"""Atomic WM/PPO/FiLM/context state; physical streams resume in new episodes."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -31,13 +31,14 @@ def save_joint_checkpoint(path, world_model_learner, actor_learner, replay, *, r
     actor_state = {key: value.detach().cpu() for key, value in actor.state_dict().items()}
     if any(value.is_floating_point() and not bool(torch.isfinite(value).all()) for value in (*model_state.values(), *actor_state.values())):
         raise ValueError("cannot checkpoint non-finite joint weights")
-    payload = {"format": FORMAT, "schema_version": 3, "model_source": dict(SOURCE), "run_id": run_id,
+    payload = {"format": FORMAT, "schema_version": 4, "model_source": dict(SOURCE), "run_id": run_id,
         "signature": _safe_training_state(signature), "state": _safe_training_state(state),
         "contract": canonical_contract(replay.contract), "model_config": model.model_config,
         "world_model": model_state, "actor": actor_state,
         "actor_architecture": {"feature_dim": actor.feature_dim, "hidden_dims": actor.hidden_dims,
             "command_dim": actor.command_dim, "preview_points": actor.preview_points,
-            "residual_limit_rad29": actor.residual_limit_rad29.detach().cpu().tolist()},
+            "residual_limit_rad29": actor.residual_limit_rad29.detach().cpu().tolist(),
+            "adaptation_dim": actor.adaptation_dim},
         "world_model_learner": _safe_training_state(world_model_learner.state_dict()),
         "actor_learner": _safe_training_state(actor_learner.state_dict()), "replay": replay.state_dict()}
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,8 +58,8 @@ def load_joint_checkpoint(path) -> dict[str, Any]:
     payload = torch.load(Path(path).expanduser(), map_location="cpu", weights_only=True)
     fields = {"format", "schema_version", "model_source", "run_id", "signature", "state", "contract", "model_config",
               "world_model", "actor", "actor_architecture", "world_model_learner", "actor_learner", "replay"}
-    if not isinstance(payload, dict) or set(payload) != fields or payload["format"] != FORMAT or payload["schema_version"] != 3 or payload["model_source"] != SOURCE:
-        raise ValueError("expected a version-3 stochastic WM/Actor/Critic joint checkpoint")
+    if not isinstance(payload, dict) or set(payload) != fields or payload["format"] != FORMAT or payload["schema_version"] != 4 or payload["model_source"] != SOURCE:
+        raise ValueError("expected a version-4 real-PPO/FiLM joint checkpoint")
     canonical_contract(payload["contract"])
     if not isinstance(payload["run_id"], str) or not payload["run_id"]:
         raise ValueError("paired checkpoint has no run identity")

@@ -15,10 +15,10 @@ from omegaconf import OmegaConf
 from test_latent_response_direction_probe import probe_case
 from test_latent_world_model import ROOT
 from unilab.algos.torch.sttt.path_following.actor_checkpoint import save_actor_checkpoint
-from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
+from test_residual_film_ppo import make_ppo_learner
 from unilab.algos.torch.sttt.path_following.control_diagnostics import run_control_diagnostics
 from unilab.algos.torch.sttt.path_following.control_model_diagnostics import (
-    DiagnosticModels, interval_order, measured_return_interval, shadow_actor_update, trace_start,
+    DiagnosticModels, isolated_randomness, shadow_context_update, trace_start,
 )
 from unilab.algos.torch.sttt.path_following.control_probe import PhysicalTrace
 from unilab.algos.torch.sttt.path_following.control_response import (
@@ -49,16 +49,18 @@ def paired_run(tmp_path):
     loaded = load_world_model(checkpoint)
     rollout = load_rollout(loaded, policy)
     trajectory = TrajectoryConfig(preview_points=2, speed_m_s=.35)
-    actor = LatentResidualActor(loaded.model.feature_dim, (16,), [.001] * 29, command_dim=3, preview_points=2)
-    training = {"learning_rate": .001, "max_grad_norm": 10., "window_steps": 2, "horizon_windows": 2,
-                "microbatch_size": 1, "batch_size": 1, "critic": {"hidden_dims": [16], "epochs": 1, "minibatches": 1}}
-    learner = ActorLearner(actor, rollout, training, {})
+    actor = LatentResidualActor(loaded.model.feature_dim, (16,), [.001] * 29, command_dim=3, preview_points=2,
+                                adaptation_dim=16)
+    with torch.no_grad():
+        actor.net[-1].weight.normal_(std=.01)
+    learner = make_ppo_learner(actor, rollout, stage="film", batch_size=1)
     save_actor_checkpoint(run / "actor.pt", actor, loaded.model, loaded.contract, trajectory,
         training_state={"optimizer_steps": 0}, learner_state=learner.state_dict())
     config = {"policy_checkpoint": str(policy), "profile_path": None, "source_overrides": [],
         "capture": {"window_steps": 2}, "actor": {"training": {"residual_limit_rad": [.001] * 29},
         "trajectories": {"base": asdict(trajectory)}}}
-    (run / "summary.json").write_text(json.dumps({"config": config}))
+    (run / "summary.json").write_text(json.dumps({"config": config,
+        "world_model_checkpoint": str(run / "world_model.pt"), "actor_checkpoint": str(run / "actor.pt")}))
     cfg = OmegaConf.load(ROOT / "conf/sttt/latent_control_diagnostics.yaml")
     cfg.run_dir = str(run)
     cfg.output_dir = str(tmp_path / "diagnostics")
@@ -70,7 +72,7 @@ def paired_run(tmp_path):
     cfg.continuation_duration_s = .08
     cfg.model_top_directions = 1
     cfg.model_seeds = [0]
-    cfg.critic_trajectory_kinds = ["straight"]
+    cfg.context_trajectory_kinds = ["straight"]
     return case, cfg, trajectory, policies
 
 
@@ -80,12 +82,12 @@ def test_complete_diagnostics_and_offline_reanalysis_preserve_artifacts(tmp_path
     before = {name: (run / name).read_bytes() for name in ("actor.pt", "world_model.pt")}
     report = run_control_diagnostics(cfg, root_dir=ROOT, playback_deps=case.deps)
     assert report["complete"], report["error"]
-    assert set(report["stages"]) == {"physical_authority", "measured_feedback", "world_model", "critic", "actor_shadow"}
+    assert set(report["stages"]) == {"physical_authority", "measured_feedback", "world_model", "context_shadow"}
     assert report["stages"]["physical_authority"]["status"] == "unresolved_effect"
     assert all(row["first_action_matches"] for row in report["stages"]["world_model"]["branches"])
-    shadow = report["stages"]["actor_shadow"]["cases"]["straight"]
-    assert not shadow["critic_refit"] and shadow["optimizer_steps"] == 1
-    assert "terminal_without_direct_memory" in shadow["term_gradients"]
+    shadow = report["stages"]["context_shadow"]["cases"]["straight"]
+    assert shadow["status"] == "context_updated" and shadow["optimizer_steps"] == 1
+    assert shadow["optimizer_metrics"]["context_gradient_norm"] > 0
     assert all(env.closed and not env.autoreset for env in case.environments)
     assert all(not parameter.requires_grad and parameter.grad is None for policy in policies for parameter in policy.parameters())
     for name, value in before.items():
@@ -98,33 +100,23 @@ def test_complete_diagnostics_and_offline_reanalysis_preserve_artifacts(tmp_path
     offline = run_control_diagnostics(analyzed, root_dir=ROOT, playback_deps=case.deps)
     assert offline["complete"], offline["error"]
     assert len(case.environments) == original_env_count
-    assert offline["stages"]["actor_shadow"] == report["stages"]["actor_shadow"]
+    assert offline["stages"]["context_shadow"] == report["stages"]["context_shadow"]
     models = DiagnosticModels.load(run / "world_model.pt", run / "actor.pt", case.deps["resolve_checkpoint"](None), trajectory=trajectory, device="cpu")
-    trace = PhysicalTrace.load(tmp_path / "diagnostics/critic/straight_actor")
+    trace = PhysicalTrace.load(tmp_path / "diagnostics/context/straight_before")
     actor_before = {key: value.clone() for key, value in models.actor.state_dict().items()}
-    critic_before = {key: value.clone() for key, value in models.learner.critic_learner.target.state_dict().items()}
-    shadow_actor_update(trace, models)
+    wm_before = {key: value.clone() for key, value in models.loaded.model.state_dict().items()}
+    from unilab.algos.torch.sttt.path_following.context_adaptation import ContextAdapter
+    _, changed = shadow_context_update(trace, models, seed=19)
+    direct = ContextAdapter(models.actor, models.rollout, batch_size=1, window_steps=models.window_steps,
+                            config=models.context_config)
+    start = trace_start(trace, models, seed=19)
+    with isolated_randomness(models.loaded.model, 19):
+        direct.step(start)
+    torch.testing.assert_close(changed, direct.context, rtol=0, atol=0)
     for key, value in actor_before.items():
         torch.testing.assert_close(models.actor.state_dict()[key], value, rtol=0., atol=0.)
-    for key, value in critic_before.items():
-        torch.testing.assert_close(models.learner.critic_learner.target.state_dict()[key], value, rtol=0., atol=0.)
-    # A real terminal tail cannot disappear merely because recording stopped.
-    failed = PhysicalTrace({**trace.metadata, "end_reason": "terminated"}, trace.arrays)
-    interval = measured_return_interval(failed, models, step=4)
-    assert interval["lower"] >= models.learner.costs.discount**4 * models.learner.critic_learner.failure_value
-    assert interval_order({"status": "bounded", "lower": 1., "upper": 3.}, {"status": "bounded", "lower": 2., "upper": 4.}) is None
-    # The extracted actor-only operation retains the exact production update.
-    original = models.shadow_learner()
-    split = models.shadow_learner()
-    start = trace_start(trace, models)
-    torch.manual_seed(19)
-    original.update(start)
-    torch.manual_seed(19)
-    refreshed = split.refresh_start(start)
-    split.fit_critic(refreshed)
-    split.actor_step(refreshed)
-    for key, value in original.actor.state_dict().items():
-        torch.testing.assert_close(split.actor.state_dict()[key], value, rtol=0., atol=0.)
+    for key, value in wm_before.items():
+        torch.testing.assert_close(models.loaded.model.state_dict()[key], value, rtol=0., atol=0.)
 
 
 def pulse_dataset():

@@ -163,6 +163,9 @@ class PathFollowingUpdater:
         self._last_window_end_ns = -1
         self._last_actor_timestamp_ns = -1
 
+    def update_counters(self) -> dict[str, int]:
+        return {"a_updates": self.actor_updates, "b_updates": self.response_updates}
+
     @property
     def calibration_complete(self) -> bool:
         return self.zero_calibration_windows >= self.calibration_windows

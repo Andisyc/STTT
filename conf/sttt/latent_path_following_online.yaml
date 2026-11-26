@@ -8,23 +8,16 @@ online:
   replay_sequence_windows: 2
   wm_updates_per_cycle: 1
   wm_learning_rate: 0.0001
-  actor_learning_rate: 0.0001
+  context_learning_rate: 0.001
+  context_dim: 16
+  context_updates_per_cycle: 1
   lora_rank: 8
   lora_alpha: 16.0
   lora_weight_decay: 0.0
   max_grad_norm: 1.0
   adapt_world_model: true
   risk_threshold: 0.5
-  adapt_actor: true
-  critic:
-    hidden_dims: [256, 128]
-    learning_rate: 0.0001
-    epochs: 1
-    minibatches: 1
-    lambda_return: 0.95
-    target_tau: 0.01
-    max_grad_norm: 100.0
-    optimizer_betas: [0.7, 0.95]
+  adapt_context: true
   trajectory:
     kind: straight
     length_m: 30.0
@@ -36,14 +29,3 @@ online:
     projection_window_m: 0.5
     initial_lateral_m: 0.0
     initial_heading_rad: 0.0
-costs:
-  lateral_weight: 0.5
-  lateral_velocity_weight: 1.0
-  forward_weight: 1.0
-  smoothness_weight: 0.01
-  risk_weight: 1.0
-  lateral_tolerance_m: 0.3
-  lateral_velocity_tolerance_m_s: 1.0
-  forward_speed_floor_m_s: 0.1
-  discount: 0.99
-  failure_cost_rate: 4.0

@@ -10,8 +10,6 @@ from omegaconf import OmegaConf
 
 from test_latent_pretraining import physical_inputs
 from test_latent_world_model import ROOT, actor_artifact, create_session, model_config, parts, sequence
-from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
-from unilab.algos.torch.sttt.path_following.critic import CriticConfig, CriticLearner, lambda_cost_targets
 from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
 from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig, ObservedCostWindow, latent_actor_loss
 from unilab.algos.torch.sttt.path_following.pretraining import actor_training_start, load_rollout
@@ -85,59 +83,6 @@ def test_motion_tolerances_follow_physical_time_and_keep_window_precision():
     torch.testing.assert_close(slow["window_loss"], fast["window_loss"])
 
 
-def test_failure_retains_absorbing_tail_while_time_limit_bootstraps():
-    discount = .99**10
-    costs = torch.full((2, 2), .1, dtype=torch.float64)
-    values = torch.tensor([[1., 2., 3.], [1., 2., 3.]], dtype=torch.float64)
-    terminal = torch.tensor([[False, True], [False, False]])
-    target = lambda_cost_targets(costs, values, discount=discount, lambda_return=.95,
-                                terminal=terminal, failure_value=8.)
-    failure_end, continuing_end = .1 + discount * 8., .1 + discount * 3.
-    assert float(target[0, 1]) == pytest.approx(failure_end)
-    assert float(target[1, 1]) == pytest.approx(continuing_end)
-    assert float(target[0, 0]) == pytest.approx(.1 + discount * (.05 * 2 + .95 * failure_end))
-    assert target[0, 0] > target[1, 0]
-    assert not target.requires_grad
-
-
-def test_measured_failure_returns_raise_the_fitted_cost_value():
-    cfg = CriticConfig(hidden_dims=(8,), epochs=1, minibatches=1, learning_rate=.001)
-    torch.manual_seed(3)
-    clean = CriticLearner(3, cfg, parameter=torch.zeros(1), ctrl_dt=.02, window_steps=10,
-                          discount=.99, failure_cost_rate=4.)
-    torch.manual_seed(3)
-    failed = CriticLearner(3, cfg, parameter=torch.zeros(1), ctrl_dt=.02, window_steps=10,
-                           discount=.99, failure_cost_rate=4.)
-    contexts, costs = torch.zeros(1, 2, 3), torch.zeros(1, 1)
-    terminal = torch.zeros_like(costs, dtype=torch.bool)
-    before = float(clean.critic(contexts[:, 0]).detach())
-    clean.update(contexts, costs, terminal)
-    failed.update(contexts, costs, terminal, observed_contexts=contexts[:, 0],
-                  observed_targets=torch.tensor([failed.failure_value]))
-    assert float(clean.critic(contexts[:, 0]).detach()) < before
-    assert float(failed.critic(contexts[:, 0]).detach()) > before
-
-
-def test_terminal_critic_gradient_crosses_real_planner_tracker_and_world_model(tmp_path):
-    policy, contract, model = physical_inputs(tmp_path)
-    rollout = load_rollout(LoadedWorldModel(model, contract, {}), policy)
-    actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=3)
-    learner = ActorLearner(actor, rollout, {"batch_size": 1, "microbatch_size": 1, "window_steps": 2,
-        "horizon_windows": 2, "learning_rate": .0001, "max_grad_norm": 10.,
-        "critic": {"hidden_dims": (8,), "epochs": 1, "minibatches": 1}}, LatentCostConfig())
-    sampler = PretrainingSequenceSampler(tmp_path / "train", rollout_windows=1)
-    start = actor_training_start(sampler.sample_indices([0]), rollout,
-                                 TrajectoryConfig(initial_lateral_m=.2), seed=1)
-    start = learner.refresh_start(start)
-    learner.fit_critic(start)
-    result = rollout.run(start, actor, window_steps=2, horizon_windows=2)
-    terminal = learner.critic_learner.target(result.decision_contexts[:, -1]).mean()
-    terminal.backward()
-    assert sum(float(p.grad.abs().sum()) for p in actor.parameters() if p.grad is not None) > 0.
-    assert all(p.grad is None for p in (*model.parameters(), *rollout.policy.parameters(),
-                                      *learner.critic_learner.target.parameters()))
-
-
 def test_control_keeps_advancing_while_learning_worker_is_paused(tmp_path, monkeypatch):
     case, _, contract, model, factory = parts(tmp_path / "case")
     wm_path = save_world_model(tmp_path / "wm.pt", model, contract)
@@ -148,7 +93,7 @@ def test_control_keeps_advancing_while_learning_worker_is_paused(tmp_path, monke
     node.update_interval_steps = 2
     node.learning = {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8],
         "calibration_windows": 1, "horizon_windows": 1, "replay_sequence_windows": 1,
-        "lora_rank": 2, "critic": {"hidden_dims": [8]}}}
+        "lora_rank": 2}}
     case.cfg.path_following = node
     session = create_session(case)
     runtime = session.controller
@@ -173,7 +118,7 @@ def test_control_keeps_advancing_while_learning_worker_is_paused(tmp_path, monke
         assert runtime.collector.completed_windows == 2 and len(runtime._pending) == 1
         release.set()
         runtime._finish_learning(wait=True)
-        assert runtime.updater.actor_updates == runtime.updater.response_updates == 1
+        assert runtime.updater.context_updates == runtime.updater.response_updates == 1
     finally:
         release.set()
         session.close()
@@ -193,67 +138,6 @@ def test_stochastic_actor_keeps_deterministic_deployment_and_bounded_exploration
         assert actor.log_std.grad is not None and bool((actor.log_std.grad > 0).all())
         actor.eval()
         assert torch.equal(actor(*inputs), actor(*inputs))
-
-
-def test_actor_and_critic_learn_from_the_same_sampled_trajectory(tmp_path, monkeypatch):
-    import unilab.algos.torch.sttt.path_following.actor_learner as owner
-    from unilab.algos.torch.sttt.path_following.latent_objectives import latent_window_costs, weighted_window_costs
-
-    with torch.random.fork_rng():
-        torch.manual_seed(23)
-        policy, contract, model = physical_inputs(tmp_path)
-        rollout = load_rollout(LoadedWorldModel(model, contract, {}), policy)
-        actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=3)
-        learner = ActorLearner(actor, rollout, {"batch_size": 1, "microbatch_size": 1,
-            "window_steps": 2, "horizon_windows": 2, "learning_rate": .0005, "max_grad_norm": 1.,
-            "max_updates": 4, "critic": {"hidden_dims": (8,), "epochs": 1, "minibatches": 1}},
-            LatentCostConfig())
-        sampler = PretrainingSequenceSampler(tmp_path / "train", rollout_windows=1)
-        start = actor_training_start(sampler.sample_indices([0]), rollout,
-                                     TrajectoryConfig(initial_lateral_m=.2), seed=1)
-        captured = {}
-        loss_function = owner.latent_actor_loss
-        fit = learner.critic_learner.update
-        sample = actor.sample
-        initial_weights = actor.net[-1].weight.detach().clone()
-
-        def actor_loss(result, part, **kwargs):
-            captured["contexts"] = result.decision_contexts.detach().clone()
-            with torch.no_grad():
-                windows = latent_window_costs(result, part, ctrl_dt=rollout.profile.ctrl_dt,
-                    window_steps=2, config=learner.costs, residual_limits=actor.residual_limit_rad29)
-                captured["costs"] = weighted_window_costs(windows, learner.costs)
-                captured["targets"] = lambda_cost_targets(captured["costs"],
-                    learner.critic_learner.target(captured["contexts"]),
-                    discount=learner.critic_learner.discount, lambda_return=.95,
-                    terminal=torch.zeros_like(captured["costs"], dtype=torch.bool),
-                    failure_value=learner.critic_learner.failure_value)
-            return loss_function(result, part, **kwargs)
-
-        def fit_critic(contexts, costs, terminal, **kwargs):
-            torch.testing.assert_close(contexts, captured["contexts"], rtol=0., atol=0.)
-            torch.testing.assert_close(costs, captured["costs"], rtol=0., atol=0.)
-            assert not torch.equal(actor.net[-1].weight, initial_weights)
-            return fit(contexts, costs, terminal, **kwargs)
-
-        def sample_policy(*inputs):
-            assert all(not value.requires_grad for value in inputs)
-            return sample(*inputs)
-
-        monkeypatch.setattr(owner, "latent_actor_loss", actor_loss)
-        monkeypatch.setattr(learner.critic_learner, "update", fit_critic)
-        monkeypatch.setattr(actor, "sample", sample_policy)
-        result = learner.update(start)
-        assert result["value_target_mean"] == pytest.approx(float(captured["targets"].mean()), rel=1e-6)
-        assert result["gradient_norm"] > 0.
-        assert all(parameter.grad is None for parameter in (*model.parameters(), *rollout.policy.parameters()))
-        saved = learner.state_dict()
-        restored = ActorLearner(actor, rollout, {"batch_size": 1, "microbatch_size": 1,
-            "window_steps": 2, "horizon_windows": 2, "learning_rate": .0005, "max_grad_norm": 1.,
-            "critic": {"hidden_dims": (8,), "epochs": 1, "minibatches": 1}}, learner.costs)
-        restored.load_state_dict(saved)
-        torch.testing.assert_close(restored.return_moments, learner.return_moments, rtol=0., atol=0.)
-        assert restored.schedule_updates == 4
 
 
 def test_independent_joint_exploration_survives_a_saturated_policy(tmp_path):

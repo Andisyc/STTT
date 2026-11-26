@@ -92,8 +92,9 @@ def prepare_path_following(
 
 class PathFollowingLearner(Protocol):
     contract: dict[str, Any]
-    actor_updates: int
     response_updates: int
+
+    def update_counters(self) -> dict[str, int]: ...
 
     @property
     def actor(self) -> torch.nn.Module: ...
@@ -340,7 +341,7 @@ class PathFollowingController(Generic[LearnerT]):
             self._record(after)
             stats = dict(inner_stats or {})
             stats.update({"path_steps": self._steps, "path_windows": self.collector.completed_windows,
-                          "path_a_updates": self.updater.actor_updates, "path_b_updates": self.updater.response_updates,
+                          **{f"path_{key}": value for key, value in self.updater.update_counters().items()},
                           "path_pending_windows": len(self._pending), "path_cached_queries": len(self._queries)})
             return stats
         except Exception as error:
@@ -356,7 +357,7 @@ class PathFollowingController(Generic[LearnerT]):
             "observation_age_ns": None if decision is None else clock.timestamp_ns - decision.timestamp_ns,
             "errors_m_rad": None if decision is None else decision.errors[0].cpu().tolist(),
             "candidate_rad": self._candidate[0].cpu().tolist(), "locked_rad": self._locked[0].cpu().tolist(),
-            "a_updates": self.updater.actor_updates, "b_updates": self.updater.response_updates,
+            **self.updater.update_counters(),
             "dropped_windows": dict(self.collector.dropped_windows), "expired_queries": self.expired_queries,
         })
 

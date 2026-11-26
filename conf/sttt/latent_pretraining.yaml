@@ -10,10 +10,11 @@ device: cpu
 seed: 0
 source_overrides: []  # Physical settings; measurement noise remains disabled.
 resume_checkpoint: null  # Paired joint state; collectors resume in new physical episodes.
+stage: all  # all: base PPO + FiLM PPO; base / film run one stage.
 schedule:
   pretrain_wm_updates: 10000  # Shortened training budget; convergence is measured separately.
-  online_iterations: 3000
-  actor_updates_per_iteration: 1
+  base_iterations: 3000
+  film_iterations: 1000
   wm_updates_per_iteration: 8
   checkpoint_every: 2500
 replay:
@@ -27,16 +28,13 @@ capture:
   max_episode_steps: 1000
   window_steps: 10
   residual_amplitude_rad: null  # Explicit physical-radian exploration bound.
-  random_residual_probability: 0.1  # Independent joint-vector exploration; remaining windows use A samples.
+  random_residual_probability: 0.1  # Initial WM capture only; PPO executes its own samples.
   risk_tilt_limit_rad: null
   command_resampling_s: 10.0
   command_ranges: null  # [vx, vy, yaw_rate] lower/upper pairs; otherwise use source-profile ranges.
   conditions:
     - name: nominal
       source_overrides: []
-calibration:
-  response_probe_result: null
-  require_response_probe: false  # Hand-designed feedback is not a pretraining admission gate.
 wm:
   device: ${device}
   seed: ${seed}
@@ -51,25 +49,13 @@ actor:
   training:
     residual_limit_rad: null  # 29 explicit source-order physical-radian limits.
     hidden_dims: [256, 128]
-    max_updates: ${schedule.online_iterations}
+    max_updates: ${schedule.base_iterations}
     batch_size: 64
-    microbatch_size: 8
     horizon_windows: 2
     learning_rate: 0.0005
     max_grad_norm: 1.0
-    optimizer_betas: [0.7, 0.95]
-    final_learning_rate: 0.00001
     checkpoint_every: ${schedule.checkpoint_every}
     seed: ${seed}
-    critic:
-      hidden_dims: [256, 128]
-      learning_rate: 0.0005
-      epochs: 8
-      minibatches: 4
-      lambda_return: 0.95
-      target_tau: 0.01
-      max_grad_norm: 100.0
-      optimizer_betas: [0.7, 0.95]
   trajectories:
     base:
       preview_points: 8
@@ -77,17 +63,39 @@ actor:
       projection_window_m: 0.5
     lateral_range: [-0.3, 0.3]
     heading_range: [-0.3, 0.3]
-  costs:
-    lateral_weight: 0.5
-    lateral_velocity_weight: 1.0
-    forward_weight: 1.0
-    smoothness_weight: 0.01
-    risk_weight: 1.0
-    lateral_tolerance_m: 0.3
-    lateral_velocity_tolerance_m_s: 1.0
-    forward_speed_floor_m_s: 0.1
-    discount: 0.99
-    failure_cost_rate: 4.0
+ppo:
+  rollout_windows: 16
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  clip_param: 0.2
+  gamma: 0.99
+  lam: 0.95
+  value_loss_coef: 1.0
+  entropy_coef: 0.01
+  learning_rate: ${actor.training.learning_rate}
+  max_grad_norm: ${actor.training.max_grad_norm}
+  desired_kl: 0.01
+context_adaptation:
+  dimension: 16
+  learning_rate: 0.001
+  updates_per_window: 1
+  horizon_windows: ${actor.training.horizon_windows}
+  max_grad_norm: ${actor.training.max_grad_norm}
+rewards:
+  joint_position_weight: 0.75
+  joint_velocity_weight: 0.5
+  velocity_weight: 1.0
+  yaw_rate_weight: 0.5
+  posture_weight: 1.0
+  path_weight: 1.0
+  action_rate_weight: 0.01
+  termination_cost: 200.0
+  joint_position_tolerance_rad: 0.25
+  joint_velocity_tolerance_rad_s: 2.0
+  velocity_tolerance_m_s: 0.5
+  yaw_rate_tolerance_rad_s: 1.0
+  lateral_tolerance_m: 0.3
+  tilt_tolerance_rad: 0.5
 evaluation:
   horizon_windows: ${actor.training.horizon_windows}
 

@@ -25,8 +25,8 @@ from unilab.algos.torch.sttt.world_model.sequence_data import SequenceDatasetWri
 from unilab.algos.torch.sttt.world_model.training import train_world_model
 
 
-def physical_inputs(tmp_path):
-    case, profile = legacy_case(tmp_path / "source")
+def physical_inputs(tmp_path, *, source=None):
+    case, profile = legacy_case(tmp_path / "source") if source is None else source
     checkpoint = Path(case.cfg.training.play_checkpoint_path)
     contract = {
         "data": {"window_steps": 2, "ctrl_dt": .02, "history_length": 4, "prediction_horizon": 3,
@@ -157,30 +157,28 @@ def test_causal_actor_start_and_multistep_tracker_gradients(tmp_path):
     assert not torch.equal(result.commands[:, 0], result.commands[:, -1])
 
 
-def test_real_wm_actor_pretraining_and_exact_actor_resume(tmp_path):
-    policy, _, model = physical_inputs(tmp_path)
-    wm = train_world_model({"data": {"train_dirs": [str(tmp_path / "train")], "validation_dirs": [str(tmp_path / "validation")]},
-                            "model": asdict(model.config), "seed": 7, "device": "cpu", "output_dir": str(tmp_path / "wm_training"),
-                            "training": {"max_updates": 1, "batch_size": 1, "validation_every": 1, "validation_batches": 1, "checkpoint_every": 1}})
-    cfg = {"world_model_checkpoint": wm["best_checkpoint_path"], "policy_checkpoint": str(policy),
-           "data_dirs": [str(tmp_path / "train")], "output_dir": str(tmp_path / "actor_full"), "device": "cpu",
-           "training": {"residual_limit_rad": [.02] * 29, "hidden_dims": [8], "max_updates": 2,
-                        "batch_size": 1, "horizon_windows": 1, "checkpoint_every": 1, "seed": 5}}
-    full = train_latent_actor(cfg)
-    split = deepcopy(cfg)
-    split["output_dir"] = str(tmp_path / "actor_resumed")
-    split["resume_checkpoint"] = str(tmp_path / "actor_full" / "actor_00000001.pt")
-    resumed = train_latent_actor(split)
-    loaded = load_world_model(wm["best_checkpoint_path"])
-    a, _ = load_actor_checkpoint(full["actor_checkpoint"], loaded.model, loaded.contract, TrajectoryConfig())
-    b, _ = load_actor_checkpoint(resumed["actor_checkpoint"], loaded.model, loaded.contract, TrajectoryConfig())
-    for name, value in a.state_dict().items():
-        torch.testing.assert_close(value, b.state_dict()[name], rtol=0, atol=0)
-    assert int(torch.count_nonzero(a.net[-1].state_dict()["weight"])) > 0
+def test_native_ppo_actor_artifact_preserves_weights_and_model_binding(tmp_path):
+    from test_residual_film_ppo import make_ppo_learner
+    from unilab.algos.torch.sttt.path_following.actor_checkpoint import save_actor_checkpoint
+    from unilab.algos.torch.sttt.path_following.joint_config import TrainingVersions
+    from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel
+    policy, contract, model = physical_inputs(tmp_path)
+    rollout = load_rollout(LoadedWorldModel(model, contract, {}), policy)
+    actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=3)
+    learner = make_ppo_learner(actor, rollout, stage="base")
+    learner.update(versions=TrainingVersions())
+    checkpoint = save_actor_checkpoint(tmp_path / "actor.pt", actor, model, contract, TrajectoryConfig(),
+                                      training_state={}, learner_state=learner.state_dict())
+    restored, metadata = load_actor_checkpoint(checkpoint, model, contract, TrajectoryConfig())
+    resumed = make_ppo_learner(restored, rollout, stage="base")
+    resumed.load_state_dict(metadata["learner_state"])
+    for name, value in actor.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+    assert torch.count_nonzero(restored.net[-1].weight) > 0
     with torch.no_grad():
-        next(loaded.model.parameters()).add_(.01)
+        next(model.parameters()).add_(.01)
     with pytest.raises(ValueError, match="another WM base"):
-        load_actor_checkpoint(full["actor_checkpoint"], loaded.model, loaded.contract, TrajectoryConfig())
+        load_actor_checkpoint(checkpoint, model, contract, TrajectoryConfig())
 
 
 
@@ -471,15 +469,13 @@ def test_command_references_keep_their_anchor_and_cover_preview():
 
 
 def test_joint_effective_updates_and_paired_resume(tmp_path):
-    from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
+    from test_residual_film_ppo import make_ppo_learner
     from unilab.algos.torch.sttt.path_following.joint_checkpoint import load_joint_checkpoint, save_joint_checkpoint
     from unilab.algos.torch.sttt.path_following.joint_config import JointSchedule
     from unilab.algos.torch.sttt.path_following.joint_training import JointTrainer, _random_state, _restore_random_state
     from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel
-    from unilab.algos.torch.sttt.world_model.joint_collection import CollectionBlock
     from unilab.algos.torch.sttt.world_model.learner import WorldModelLearner
     from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay
-
     initial_rng, threads = _random_state(torch.device("cpu")), torch.get_num_threads()
     torch.set_num_threads(1)
     try:
@@ -488,41 +484,32 @@ def test_joint_effective_updates_and_paired_resume(tmp_path):
         schedule = JointSchedule(2, 2, 1, 8, 1)
         wm_options = {"batch_size": 2, "microbatch_size": 1, "learning_rate": .0003,
                       "weight_decay": .000001, "gradient_clip_norm": 100.}
-        actor_options = {"batch_size": 2, "microbatch_size": 1, "window_steps": 2,
-                         "horizon_windows": 1, "learning_rate": .0001, "max_grad_norm": 10.}
-
         def build(model):
             rollout = load_rollout(LoadedWorldModel(model, contract, {}), policy)
             actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=3)
             wm = WorldModelLearner(model, wm_options, {})
-            learner = ActorLearner(actor, rollout, actor_options, LatentCostConfig())
+            learner = make_ppo_learner(actor, rollout, stage="base")
             replay = EpisodeReplay(contract, capacity_transitions=32, rollout_windows=1, seed=3)
             return JointTrainer(wm, learner, replay, schedule, wm_batch_size=2), rollout
-
         engine, rollout = build(initial_model)
         engine.replay.update_episode("physical", _raw_capture(tmp_path / "train"))
         engine.warmup_update()
         engine.warmup_update()
         source_before = {key: value.clone() for key, value in rollout.policy.state_dict().items()}
-        start = actor_training_start(engine.replay.sample_indices([0, 1]), rollout,
-                                     TrajectoryConfig(initial_lateral_m=.2), seed=1)
-        engine.update_iteration(CollectionBlock(4, start, ()))
-        assert (engine.world_model.updates, engine.actor.updates, engine.physical_control_steps) == (10, 1, 4)
+        engine.update_iteration()
+        assert (engine.world_model.updates, engine.actor.updates, engine.physical_control_steps) == (10, 1, 8)
         assert int(next(iter(engine.world_model.optimizer.state.values()))["step"]) == 10
-        assert int(next(iter(engine.actor.optimizer.state.values()))["step"]) == 1
-        assert all(parameter.requires_grad for parameter in engine.world_model.model.parameters())
+        assert int(next(iter(engine.actor.algorithm.optimizer.state.values()))["step"]) == 1
         for key, value in rollout.policy.state_dict().items():
             torch.testing.assert_close(value, source_before[key], rtol=0, atol=0)
-        saved_state = {"iteration": engine.iteration, "physical_control_steps": engine.physical_control_steps,
-                       "random_state": _random_state(torch.device("cpu")),
-                       "critic_updates": engine.actor.critic_learner.updates}
+        saved_state = {"phase": "base", "iteration": engine.iteration, "base_updates": engine.base_updates,
+            "film_updates": engine.film_updates, "physical_control_steps": engine.physical_control_steps,
+            "random_state": _random_state(torch.device("cpu"))}
         path = save_joint_checkpoint(tmp_path / "joint.pt", engine.world_model, engine.actor, engine.replay,
             run_id="paired-test", signature={"schedule": asdict(schedule)}, state=saved_state)
         payload = load_joint_checkpoint(path)
-        continuation = actor_training_start(engine.replay.sample_indices([0, 1]), rollout,
-                                            TrajectoryConfig(initial_lateral_m=.2), seed=1)
-        engine.update_iteration(CollectionBlock(4, continuation, ()))
-        restored, restored_rollout = build(LatentWorldModel(initial_model.config))
+        engine.update_iteration()
+        restored, _ = build(LatentWorldModel(initial_model.config))
         restored.world_model.model.load_state_dict(payload["world_model"])
         restored.actor.actor.load_state_dict(payload["actor"])
         restored.world_model.load_state_dict(payload["world_model_learner"])
@@ -530,17 +517,14 @@ def test_joint_effective_updates_and_paired_resume(tmp_path):
         restored.replay.load_state_dict(payload["replay"])
         restored.restore_counters(payload["state"])
         _restore_random_state(payload["state"]["random_state"], torch.device("cpu"))
-        continuation = actor_training_start(restored.replay.sample_indices([0, 1]), restored_rollout,
-                                            TrajectoryConfig(initial_lateral_m=.2), seed=1)
-        restored.update_iteration(CollectionBlock(4, continuation, ()))
-        assert (restored.world_model.updates, restored.actor.updates, restored.physical_control_steps) == (18, 2, 8)
+        restored.update_iteration()
+        assert (restored.world_model.updates, restored.actor.updates, restored.physical_control_steps) == (18, 2, 16)
         for key, value in engine.world_model.model.state_dict().items():
             torch.testing.assert_close(value, restored.world_model.model.state_dict()[key], rtol=0, atol=0)
         for key, value in engine.actor.actor.state_dict().items():
             torch.testing.assert_close(value, restored.actor.actor.state_dict()[key], rtol=0, atol=0)
-        assert engine.actor.critic_learner.updates == restored.actor.critic_learner.updates
-        for key, value in engine.actor.critic_learner.target.state_dict().items():
-            torch.testing.assert_close(value, restored.actor.critic_learner.target.state_dict()[key], rtol=0, atol=0)
+        for key, value in engine.actor.algorithm.critic.state_dict().items():
+            torch.testing.assert_close(value, restored.actor.algorithm.critic.state_dict()[key], rtol=0, atol=0)
     finally:
         torch.set_num_threads(threads)
         _restore_random_state(initial_rng, torch.device("cpu"))
@@ -583,7 +567,7 @@ def test_joint_cli_budget_contract_and_physical_cost_scales(tmp_path):
 
     root = Path(__file__).resolve().parents[3]
     result = subprocess.run(["uv", "run", "--no-sync", "scripts/pretrain_latent_path_following.py", "--cfg", "job",
-                             "schedule.pretrain_wm_updates=7", "schedule.online_iterations=3"],
+                             "schedule.pretrain_wm_updates=7", "schedule.base_iterations=3"],
                             cwd=root, capture_output=True, text=True, check=True)
     cfg = OmegaConf.create(result.stdout)
     cfg.capture.residual_amplitude_rad = .005
@@ -597,7 +581,7 @@ def test_joint_cli_budget_contract_and_physical_cost_scales(tmp_path):
         JointTrainingConfig.from_mapping(cfg)
     cfg.capture.steps_per_iteration = 20
     cfg.refinement_cycles = 2
-    with pytest.raises(ValueError, match="refinement_cycles"):
+    with pytest.raises(ValueError):
         JointTrainingConfig.from_mapping(cfg)
     costs = asdict(LatentCostConfig())
     calibration = {"response_probe_result": None, "require_response_probe": False}

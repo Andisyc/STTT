@@ -150,12 +150,14 @@ def evaluate_pretrained_actor(cfg: Mapping[str, Any], *, root_dir: str | Path, o
     loaded = load_world_model(world_model_checkpoint, device=device)
     payload = torch.load(actor_checkpoint, map_location="cpu", weights_only=True)
     base = TrajectoryConfig(preview_points=payload["architecture"]["preview_points"], preview_spacing_m=payload["preview"]["spacing_m"])
-    load_actor_checkpoint(actor_checkpoint, loaded.model, loaded.contract, base)
+    validated_actor, _ = load_actor_checkpoint(actor_checkpoint, loaded.model, loaded.contract, base)
+    modes = ("nominal", "fixed_context", "adaptive_context") if validated_actor.adaptation_dim else ("nominal", "pretrained_actor")
     contract = loaded.contract
-    del loaded
+    del loaded, validated_actor
     ensure_registries()
     output.mkdir(parents=True, exist_ok=True)
-    summary = {"format": "sttt_pretrained_actor_evaluation", "schema_version": 2, "complete": False,
+    summary = {"format": "sttt_pretrained_actor_evaluation", "schema_version": 3, "complete": False,
+        "modes": list(modes),
         "world_model_checkpoint": str(world_model_checkpoint), "actor_checkpoint": str(actor_checkpoint), "runs": []}
     for condition in conditions:
         for index, values in enumerate(cfg["trajectories"]):
@@ -165,7 +167,7 @@ def evaluate_pretrained_actor(cfg: Mapping[str, Any], *, root_dir: str | Path, o
             for seed in cfg["seeds"]:
                 initial = None
                 row = {"condition": condition["name"], "trajectory": asdict(trajectory), "seed": seed}
-                for mode in ("nominal", "pretrained_actor"):
+                for mode in modes:
                     random.seed(seed)
                     np.random.seed(seed)
                     torch.manual_seed(seed)
@@ -175,16 +177,17 @@ def evaluate_pretrained_actor(cfg: Mapping[str, Any], *, root_dir: str | Path, o
                     result = collect_world_model_sequences(source, root_dir=root, output_dir=directory, num_steps=cfg["num_steps"],
                         window_steps=contract["data"]["window_steps"], residual_amplitude_rad=0., seed=seed,
                         risk_tilt_limit_rad=contract["source"]["risk_tilt_limit_rad"], device=device, trajectory=trajectory,
-                        actor_checkpoint=actor_checkpoint if mode == "pretrained_actor" else None,
-                        world_model_checkpoint=world_model_checkpoint if mode == "pretrained_actor" else None,
-                        forecast_windows=horizon if mode == "pretrained_actor" else None)
+                        actor_checkpoint=actor_checkpoint if mode != "nominal" else None,
+                        world_model_checkpoint=world_model_checkpoint if mode != "nominal" else None,
+                        forecast_windows=horizon if mode != "nominal" else None,
+                        adapt_context=mode == "adaptive_context")
                     if result["localization_invalidated"] or result["reset_crossed"]:
                         raise RuntimeError("evaluation crossed a physical/localization boundary")
                     metrics, observation, matrix = score_capture(directory, trajectory, cfg["num_steps"])
                     if initial is None:
                         initial = observation, matrix
                     elif not np.allclose(initial[0], observation, atol=1e-7, rtol=0) or not np.allclose(initial[1], matrix, atol=1e-7, rtol=0):
-                        raise ValueError("nominal and A evaluation did not start from the same physical state")
+                        raise ValueError("evaluation modes did not start from the same physical state")
                     row[mode] = {"directory": str(directory), **metrics,
                                  "forecast_diagnostics": score_forecasts(directory, risk_threshold=threshold)}
                 summary["runs"].append(row)
@@ -192,6 +195,6 @@ def evaluate_pretrained_actor(cfg: Mapping[str, Any], *, root_dir: str | Path, o
                 temporary.write_text(json.dumps(summary, allow_nan=False, indent=2) + "\n")
                 temporary.replace(output / "summary.json")
     summary["evaluation_finished"] = True
-    summary["complete"] = all(row[mode]["horizon_reached"] for row in summary["runs"] for mode in ("nominal", "pretrained_actor"))
+    summary["complete"] = all(row[mode]["horizon_reached"] for row in summary["runs"] for mode in modes)
     (output / "summary.json").write_text(json.dumps(summary, allow_nan=False, indent=2) + "\n")
     return summary

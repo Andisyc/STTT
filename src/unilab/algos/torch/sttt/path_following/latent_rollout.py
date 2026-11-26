@@ -179,11 +179,26 @@ class PlannerTrackerRollout:
         """
         if query.profile != self.profile or validate_execution_preprocessing(query.preprocessing) != self.preprocessing:
             raise ValueError("rollout query source profile or preprocessing mismatch")
-        observations = query.observation_history.detach().clone()
-        source_actions = query.action_history.detach().clone()
-        valid = query.history_valid_mask.detach().clone()
+        return self.encode_observed_start(
+            query.observation_history, query.action_history, query.history_valid_mask, query.command,
+            errors=errors, previous_residual=previous_residual, ego_motion=ego_motion,
+            ego_valid=ego_valid, ego_age_s=ego_age_s, path_state=path_state,
+        )
+
+    @torch.no_grad()
+    def encode_observed_start(
+        self, observation_history: torch.Tensor, action_history: torch.Tensor,
+        history_valid_mask: torch.Tensor, command: torch.Tensor, *,
+        errors: torch.Tensor, previous_residual: torch.Tensor,
+        ego_motion: torch.Tensor | None = None, ego_valid: torch.Tensor | None = None,
+        ego_age_s: torch.Tensor | None = None, path_state: PathState | None = None,
+    ) -> RolloutStart:
+        """Encode owned physical histories without querying or advancing Tracker."""
+        observations = observation_history.detach().clone()
+        source_actions = action_history.detach().clone()
+        valid = history_valid_mask.detach().clone()
         self._validate_history(observations, source_actions, valid)
-        self._validate_context(observations.shape[0], errors, query.command, previous_residual)
+        self._validate_context(observations.shape[0], errors, command, previous_residual)
         batch, history = observations.shape[:2]
         ego_motion = observations.new_zeros(batch, history, 3) if ego_motion is None else ego_motion
         ego_valid = torch.zeros(batch, history, 1, device=self.device, dtype=torch.bool) if ego_valid is None else ego_valid
@@ -199,7 +214,7 @@ class PlannerTrackerRollout:
                 ego_motion=ego_motion, ego_valid=ego_valid, ego_age_s=ego_age_s,
             )
         if path_state is None:
-            config = TrajectoryConfig(speed_m_s=max(float(query.command[:, :2].norm(dim=-1).mean()), .01))
+            config = TrajectoryConfig(speed_m_s=max(float(command[:, :2].norm(dim=-1).mean()), .01))
             reference = ReferenceTrajectory.generate(config, batch_size=batch, device=self.device, dtype=self.dtype)
             heading = -errors[:, 1:2]
             c, s = heading.cos(), heading.sin()
@@ -211,7 +226,7 @@ class PlannerTrackerRollout:
         return RolloutStart(
             latent=latent.detach().clone(), observation_history=observations,
             action_history=source_actions, history_valid_mask=valid,
-            errors=errors.detach().clone(), command=query.command.detach().clone(),
+            errors=errors.detach().clone(), command=command.detach().clone(),
             previous_residual=previous_residual.detach().clone(),
             ego_motion=ego_motion.detach().clone(), ego_valid=ego_valid.detach().clone(),
             ego_age_s=ego_age_s.detach().clone(),
@@ -247,6 +262,7 @@ class PlannerTrackerRollout:
         horizon_windows: int,
         update_reference_commands: bool = True,
         stochastic_policy: bool = False,
+        adaptation_context: torch.Tensor | None = None,
     ) -> RolloutResult:
         """Replan every tick; hold each actor residual for ``window_steps`` ticks."""
         for name, value in (("window_steps", window_steps), ("horizon_windows", horizon_windows)):
@@ -291,8 +307,13 @@ class PlannerTrackerRollout:
                     preview = path.preview()
                     inputs = (latent.feature(), errors, command, preview, previous_residual)
                     decision_contexts.append(actor.context(*inputs))
-                    policy_inputs = tuple(value.detach() for value in inputs)
-                    held_residual = actor.sample(*policy_inputs) if stochastic_policy else actor(*policy_inputs)
+                    if adaptation_context is None:
+                        policy_inputs = tuple(value.detach() for value in inputs)
+                        held_residual = actor.sample(*policy_inputs) if stochastic_policy else actor(*policy_inputs)
+                    elif stochastic_policy:
+                        held_residual = actor.sample(*inputs, adaptation_context=adaptation_context)
+                    else:
+                        held_residual = actor(*inputs, adaptation_context=adaptation_context)
                     residuals.append(held_residual)
                     previous_residual = held_residual
                 assert held_residual is not None

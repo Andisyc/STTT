@@ -45,14 +45,16 @@ def save_actor_checkpoint(path: str | Path, actor: LatentResidualActor, model: L
     state = {name: value.detach().cpu().clone() for name, value in actor.state_dict().items()}
     if any(not bool(torch.isfinite(value).all()) for value in state.values()):
         raise ValueError("pretrained actor contains non-finite parameters")
-    if learner_state.get("version") != 3 or "critic_learner" not in learner_state:
-        raise ValueError("deployment requires the paired Actor/Critic learner state")
-    payload = {"format": FORMAT, "schema_version": 3,
+    stage = "film" if actor.adaptation_dim else "base"
+    if learner_state.get("algorithm") != "rsl_rl_ppo" or learner_state.get("stage") != stage:
+        raise ValueError("actor artifacts require matching base/FiLM PPO learner state")
+    payload = {"format": FORMAT, "schema_version": 4, "stage": stage,
                "physical_model_identity": physical_model_identity(model, contract),
                "contract": canonical_contract(contract),
                "architecture": {"feature_dim": actor.feature_dim, "hidden_dims": actor.hidden_dims,
                                 "command_dim": actor.command_dim, "preview_points": actor.preview_points,
-                                "residual_limit_rad29": actor.residual_limit_rad29.detach().cpu().tolist()},
+                                "residual_limit_rad29": actor.residual_limit_rad29.detach().cpu().tolist(),
+                                "adaptation_dim": actor.adaptation_dim},
                "preview": {"channels": PREVIEW_CHANNELS, "spacing_m": trajectory.preview_spacing_m},
                "actor": state, "training_state": _safe_training_state(dict(training_state)),
                "learner_state": _safe_training_state(dict(learner_state))}
@@ -69,8 +71,8 @@ def load_actor_checkpoint(path: str | Path, model: LatentWorldModel, contract: M
                           residual_limits: tuple[float, ...] | None = None) -> tuple[LatentResidualActor, dict[str, Any]]:
     parameter = next(model.parameters())
     payload = torch.load(path, map_location=parameter.device, weights_only=True)
-    if not isinstance(payload, dict) or payload.get("format") != FORMAT or payload.get("schema_version") != 3:
-        raise ValueError("expected a version-3 stochastic Actor/Critic artifact; retrain legacy A")
+    if not isinstance(payload, dict) or payload.get("format") != FORMAT or payload.get("schema_version") != 4:
+        raise ValueError("expected a version-4 base/FiLM PPO artifact; legacy Actor/Critic state is not a PPO resume")
     if payload["contract"] != canonical_contract(contract):
         raise ValueError("pretrained actor belongs to another physical control contract")
     if require_model_identity and payload["physical_model_identity"] != physical_model_identity(model, contract):
@@ -88,9 +90,8 @@ def load_actor_checkpoint(path: str | Path, model: LatentWorldModel, contract: M
         if not bool(torch.isfinite(value).all()):
             raise ValueError("pretrained actor contains non-finite tensors")
     learner_state = payload["learner_state"]
-    if learner_state.get("version") != 3 or "critic_learner" not in learner_state:
-        raise ValueError("pretrained actor has no paired cost Critic")
-    for group in ("critic", "target"):
-        if any(not bool(torch.isfinite(value).all()) for value in learner_state["critic_learner"][group].values()):
-            raise ValueError("pretrained cost critic contains non-finite tensors")
-    return actor.eval(), {**payload["training_state"], "learner_state": learner_state}
+    if learner_state.get("algorithm") != "rsl_rl_ppo" or learner_state.get("stage") != payload["stage"]:
+        raise ValueError("pretrained actor has no matching PPO training stage")
+    if (payload["stage"] == "film") != bool(actor.adaptation_dim):
+        raise ValueError("pretrained actor stage and FiLM architecture differ")
+    return actor.eval(), {**payload["training_state"], "stage": payload["stage"], "learner_state": learner_state}

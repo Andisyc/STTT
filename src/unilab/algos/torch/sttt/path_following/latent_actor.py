@@ -24,6 +24,7 @@ class LatentResidualActor(nn.Module):
         hidden_init_std: float = .01,
         command_dim: int = 7,
         preview_points: int = 8,
+        adaptation_dim: int = 0,
     ) -> None:
         super().__init__()
         widths = tuple(hidden_dims)
@@ -38,6 +39,8 @@ class LatentResidualActor(nn.Module):
         if type(preview_points) is not int or preview_points < 2:
             raise ValueError("latent actor requires at least two reference preview points")
         self.preview_points = preview_points
+        if type(adaptation_dim) is not int or adaptation_dim < 0:
+            raise ValueError("adaptation_dim must be a nonnegative integer")
         if isinstance(hidden_init_std, bool) or not math.isfinite(hidden_init_std) or hidden_init_std <= 0:
             raise ValueError("hidden_init_std must be positive and finite")
         self.log_std = nn.Parameter(torch.full((29,), -1.))
@@ -61,6 +64,44 @@ class LatentResidualActor(nn.Module):
         nn.init.zeros_(output.bias)
         layers.append(output)
         self.net = nn.Sequential(*layers)
+        self.adaptation_dim = 0
+        self.film: nn.Linear | None = None
+        self.register_buffer("default_context", limits.new_zeros(0))
+        if adaptation_dim:
+            self.enable_film(adaptation_dim)
+
+    def enable_film(self, adaptation_dim: int = 16) -> None:
+        if type(adaptation_dim) is not int or adaptation_dim < 1 or self.film is not None:
+            raise ValueError("enable FiLM once with a positive context dimension")
+        width = self.hidden_dims[-1] if self.hidden_dims else self.input_dim
+        self.film = nn.Linear(adaptation_dim, 2 * width, bias=False).to(self.residual_limit_rad29)
+        nn.init.normal_(self.film.weight, std=.01)
+        self.adaptation_dim = adaptation_dim
+        self.default_context = self.residual_limit_rad29.new_zeros(adaptation_dim)
+
+    def train_stage(self, stage: str) -> None:
+        if stage not in {"base", "film"} or (stage == "film") != bool(self.adaptation_dim):
+            raise ValueError("actor architecture differs from the PPO training stage")
+        self.requires_grad_(stage == "base")
+        if self.film is not None:
+            self.film.requires_grad_(stage == "film")
+
+    def raw_action(self, context: torch.Tensor, adaptation_context: torch.Tensor | None = None) -> torch.Tensor:
+        hidden = context
+        for index in range(len(self.net) - 1):
+            hidden = self.net[index](hidden)
+        if self.film is not None:
+            value = self.default_context.expand(context.shape[0], -1) if adaptation_context is None else adaptation_context
+            if value.shape != (context.shape[0], self.adaptation_dim):
+                raise ValueError("adaptation context must have shape [batch, adaptation_dim]")
+            scale, shift = self.film(value).chunk(2, dim=-1)
+            hidden = hidden * (1. + scale) + shift
+        elif adaptation_context is not None and adaptation_context.shape[-1]:
+            raise ValueError("base policy has no adaptation interface")
+        return self.net[-1](hidden)
+
+    def physical_residual(self, raw_action: torch.Tensor) -> torch.Tensor:
+        return raw_action.tanh() * self.residual_limit_rad29
 
     def context(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
                 preview: torch.Tensor, previous_residual: torch.Tensor) -> torch.Tensor:
@@ -80,13 +121,15 @@ class LatentResidualActor(nn.Module):
                           previous_residual / self.residual_limit_rad29), dim=-1)
 
     def forward(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
-                preview: torch.Tensor, previous_residual: torch.Tensor) -> torch.Tensor:
+                preview: torch.Tensor, previous_residual: torch.Tensor, *,
+                adaptation_context: torch.Tensor | None = None) -> torch.Tensor:
         context = self.context(features, errors, command, preview, previous_residual)
-        return torch.tanh(self.net(context)) * self.residual_limit_rad29
+        return self.physical_residual(self.raw_action(context, adaptation_context))
 
     def sample(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
-               preview: torch.Tensor, previous_residual: torch.Tensor) -> torch.Tensor:
+               preview: torch.Tensor, previous_residual: torch.Tensor, *,
+               adaptation_context: torch.Tensor | None = None) -> torch.Tensor:
         context = self.context(features, errors, command, preview, previous_residual)
-        mean = self.net(context)
+        mean = self.raw_action(context, adaptation_context)
         std = self.log_std.clamp_min(self.min_log_std).exp()
-        return torch.tanh(mean + torch.randn_like(mean) * std) * self.residual_limit_rad29
+        return self.physical_residual(mean + torch.randn_like(mean) * std)

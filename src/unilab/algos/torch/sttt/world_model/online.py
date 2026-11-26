@@ -1,4 +1,4 @@
-"""Recent real-action identification followed by frozen-model policy learning."""
+"""Real-action WM identification and persistent frozen-prior context adaptation."""
 from __future__ import annotations
 
 import copy
@@ -17,10 +17,8 @@ from torch import nn
 from unilab.algos.torch.distill.fada.adaptation import FADALoRALinear
 from unilab.algos.torch.distill.fada.runtime_policy import FADAFutureQuery
 from unilab.algos.torch.sttt.path_following.features import context_dimension
-from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
-from unilab.algos.torch.sttt.path_following.critic import CriticConfig
+from unilab.algos.torch.sttt.path_following.context_adaptation import ContextAdaptationConfig, ContextAdapter
 from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
-from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.online_learning import ActorUpdateContext
 from unilab.algos.torch.sttt.path_following.reference import FixedStraightPath
@@ -56,7 +54,9 @@ class LatentOnlineConfig:
     replay_sequence_windows: int = 2
     wm_updates_per_cycle: int = 1
     wm_learning_rate: float = 1e-4
-    actor_learning_rate: float = 1e-4
+    context_learning_rate: float = .001
+    context_dim: int = 16
+    context_updates_per_cycle: int = 1
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_weight_decay: float = 0.0
@@ -64,9 +64,7 @@ class LatentOnlineConfig:
     adapt_world_model: bool = True
     risk_threshold: float = 0.5
     trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
-    adapt_actor: bool = True
-    critic: CriticConfig = field(default_factory=lambda: CriticConfig(
-        learning_rate=1e-4, epochs=1, minibatches=1))
+    adapt_context: bool = True
 
     def __post_init__(self) -> None:
         if len(self.residual_limit_rad) != 29:
@@ -77,11 +75,11 @@ class LatentOnlineConfig:
             raise ValueError("actor hidden dimensions must be nonempty")
         for width in self.actor_hidden_dims:
             _count(width, "actor width")
-        for name in ("calibration_windows", "horizon_windows", "replay_capacity_windows", "replay_sequence_windows", "wm_updates_per_cycle", "lora_rank"):
+        for name in ("calibration_windows", "horizon_windows", "replay_capacity_windows", "replay_sequence_windows", "wm_updates_per_cycle", "lora_rank", "context_dim", "context_updates_per_cycle"):
             _count(getattr(self, name), name)
         if self.replay_capacity_windows < self.replay_sequence_windows:
             raise ValueError("replay capacity must cover the imagined identification sequence")
-        for name in ("wm_learning_rate", "actor_learning_rate", "lora_alpha", "max_grad_norm"):
+        for name in ("wm_learning_rate", "context_learning_rate", "lora_alpha", "max_grad_norm"):
             _positive(getattr(self, name), name)
         if not math.isfinite(self.lora_weight_decay) or self.lora_weight_decay < 0:
             raise ValueError("LoRA weight decay must be finite and nonnegative")
@@ -89,12 +87,10 @@ class LatentOnlineConfig:
             raise ValueError("seed must be a nonnegative integer")
         if not isinstance(self.adapt_world_model, bool):
             raise ValueError("adapt_world_model must be boolean")
-        if not isinstance(self.adapt_actor, bool) or not isinstance(self.trajectory, TrajectoryConfig):
-            raise ValueError("adapt_actor/trajectory have invalid types")
+        if not isinstance(self.adapt_context, bool) or not isinstance(self.trajectory, TrajectoryConfig):
+            raise ValueError("adapt_context/trajectory have invalid types")
         if isinstance(self.risk_threshold, bool) or not math.isfinite(self.risk_threshold) or not 0 < self.risk_threshold < 1:
             raise ValueError("risk_threshold must be a probability in (0,1)")
-        if not isinstance(self.critic, CriticConfig):
-            raise ValueError("online learning requires a validated cost Critic configuration")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> LatentOnlineConfig:
@@ -106,9 +102,6 @@ class LatentOnlineConfig:
             raw["actor_hidden_dims"] = tuple(raw["actor_hidden_dims"])
         if "trajectory" in raw:
             raw["trajectory"] = TrajectoryConfig.from_mapping(raw["trajectory"])
-        if "critic" in raw:
-            raw["critic"] = CriticConfig.from_mapping({
-                "learning_rate": 1e-4, "epochs": 1, "minibatches": 1, **raw["critic"]})
         return cls(**raw)
 
 
@@ -121,7 +114,6 @@ class LatentUpdateResult:
     calibration_complete: bool
     actor_skip_reason: str | None
     elapsed_s: float
-    critic_loss: float | None = None
 
 
 @dataclass(frozen=True)
@@ -160,15 +152,15 @@ def _join_windows(sequences: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 
 class LatentPathFollowingUpdater:
-    """Own exactly WM adapters and A; the playback controller owns the clock."""
+    """Own WM LoRA and c; A/FiLM weights and the playback clock remain fixed."""
 
     def __init__(self, loaded: LoadedWorldModel, rollout: PlannerTrackerRollout,
-                 config: LatentOnlineConfig, costs: LatentCostConfig) -> None:
+                 config: LatentOnlineConfig) -> None:
         if rollout.model is not loaded.model:
             raise ValueError("rollout and learner must share the loaded physical model")
         self.model = loaded.model
         self.contract = copy.deepcopy(loaded.contract)
-        self.rollout, self.config, self.costs = rollout, config, costs
+        self.rollout, self.config = rollout, config
         self.window_steps = _count(self.contract["data"]["window_steps"], "window_steps")
         self.ctrl_dt = _positive(self.contract["data"]["ctrl_dt"], "ctrl_dt")
         self.model.eval().requires_grad_(False)
@@ -196,14 +188,14 @@ class LatentPathFollowingUpdater:
             torch.manual_seed(config.seed)
             self.actor = LatentResidualActor(self.model.feature_dim, config.actor_hidden_dims, config.residual_limit_rad,
                                               command_dim=rollout.spec.command_dim,
-                                              preview_points=config.trajectory.preview_points).to(parameter)
+                                              preview_points=config.trajectory.preview_points,
+                                              adaptation_dim=config.context_dim).to(parameter).eval().requires_grad_(False)
         self.model_optimizer = torch.optim.AdamW(self.adapters, lr=config.wm_learning_rate, weight_decay=config.lora_weight_decay)
-        self.actor_learner = ActorLearner(self.actor, rollout, {
-            "window_steps": self.window_steps, "horizon_windows": config.horizon_windows,
-            "batch_size": 1, "microbatch_size": 1, "learning_rate": config.actor_learning_rate,
-            "max_grad_norm": config.max_grad_norm, "critic": asdict(config.critic),
-        }, costs)
-        self.actor_optimizer = self.actor_learner.optimizer
+        self.context_adapter = ContextAdapter(self.actor, rollout, batch_size=1, window_steps=self.window_steps,
+            config=ContextAdaptationConfig(dimension=config.context_dim, learning_rate=config.context_learning_rate,
+                updates_per_window=config.context_updates_per_cycle, horizon_windows=config.horizon_windows,
+                max_grad_norm=config.max_grad_norm))
+        self.inference_context = self.context_adapter.context.detach().clone()
         self.inference_model = copy.deepcopy(self.model).eval().requires_grad_(False)
         self.inference_actor = copy.deepcopy(self.actor).eval().requires_grad_(False)
         source = self.contract["source"]
@@ -214,41 +206,37 @@ class LatentPathFollowingUpdater:
         self._publication = None
         self.replay: deque[tuple[Any, dict[str, Any]]] = deque(maxlen=config.replay_capacity_windows)
         self.records: OrderedDict[int, dict[str, Any]] = OrderedDict()
-        self.actor_updates = self.response_updates = self.zero_calibration_windows = 0
+        self.context_updates = self.response_updates = self.zero_calibration_windows = 0
         self._reference: FixedStraightPath | MeasuredTrajectory | None = None
         self._last_window_id = -1
         self.previous_residual = torch.zeros(1, 29, device=parameter.device, dtype=parameter.dtype)
         self.ego_history: Any = None
 
     def initialize_pretrained(self, state: Mapping[str, Any]) -> None:
-        if state["signature"]["costs"] != asdict(self.costs):
-            raise ValueError("pretrained Actor/Critic and online task costs differ")
-        saved = state["critic_learner"]
-        expected = self.actor_learner.critic_learner.signature
-        if any(saved["signature"][key] != expected[key] for key in
-               ("context_dim", "discount", "failure_value")):
-            raise ValueError("pretrained cost critic temporal or input contract differs")
-        learner = self.actor_learner.critic_learner
-        learner.critic.load_state_dict(saved["critic"], strict=True)
-        learner.target.load_state_dict(saved["target"], strict=True)
-        self.actor_learner.return_moments.copy_(
-            torch.as_tensor(state["return_moments"]).to(self.actor_learner.return_moments))
+        if state.get("algorithm") != "rsl_rl_ppo" or state.get("stage") != "film":
+            raise ValueError("online c adaptation requires a stage-2 FiLM PPO artifact")
+        self.actor.eval().requires_grad_(False)
+        self.inference_actor.load_state_dict(self.actor.state_dict(), strict=True)
+        self.context_adapter.reset()
         self.stage_publication()
         self.publish()
+
+    def update_counters(self) -> dict[str, int]:
+        return {"context_updates": self.context_updates, "b_updates": self.response_updates}
 
     def stage_publication(self) -> None:
         self._publication = (
             {name: value.detach().cpu().clone() for name, value in self.model.state_dict().items()},
-            {name: value.detach().cpu().clone() for name, value in self.actor.state_dict().items()},
+            self.context_adapter.context.detach().cpu().clone(),
         )
 
     def publish(self) -> bool:
         """Only the control thread activates a complete, finished learner snapshot."""
         if self._publication is None:
             return False
-        model, actor = self._publication
+        model, context = self._publication
         self.inference_model.load_state_dict(model, strict=True)
-        self.inference_actor.load_state_dict(actor, strict=True)
+        self.inference_context.copy_(context.to(self.inference_context))
         self._publication = None
         return True
 
@@ -314,7 +302,8 @@ class LatentPathFollowingUpdater:
         with torch.no_grad():
             if start.path_state is None:
                 raise ValueError("A requires the current reference preview")
-            return self.inference_actor(start.latent.feature(), start.errors, start.command, start.path_state.preview(), start.previous_residual)
+            return self.inference_actor(start.latent.feature(), start.errors, start.command, start.path_state.preview(),
+                                        start.previous_residual, adaptation_context=self.inference_context)
 
     def _recent_batch(self) -> dict[str, torch.Tensor] | None:
         count = self.config.replay_sequence_windows
@@ -349,7 +338,7 @@ class LatentPathFollowingUpdater:
         if torch.is_inference_mode_enabled():
             raise ValueError("online learning must run outside inference_mode")
         started = time.perf_counter()
-        wm_value = actor_value = critic_value = None
+        wm_value = actor_value = None
         for sample, sequence in zip(prepared.samples, prepared.sequences):
             if self._reference is None:
                 self.begin_episode(sample.reference)
@@ -378,16 +367,16 @@ class LatentPathFollowingUpdater:
                 self.model_optimizer.zero_grad(set_to_none=True)
                 self.model.eval()
         reason = "calibration" if not self.calibration_complete else ("missing_context" if prepared.start is None else None)
-        if not self.config.adapt_actor:
-            reason = "frozen_actor"
+        if not self.config.adapt_context:
+            reason = "frozen_context"
         if reason is None:
-            metrics = self.actor_learner.update(prepared.start)
-            actor_value, critic_value = metrics["loss"], metrics["critic_loss"]
-            self.actor_updates = self.actor_learner.updates
+            metrics = self.context_adapter.step(prepared.start)
+            actor_value = metrics["context_loss"]
+            self.context_updates = self.context_adapter.updates
         if wm_value is not None or actor_value is not None:
             self.stage_publication()
         return LatentUpdateResult(wm_value, actor_value, len(prepared.samples), self.zero_calibration_windows,
-                                  self.calibration_complete, reason, time.perf_counter() - started, critic_value)
+                                  self.calibration_complete, reason, time.perf_counter() - started)
 
     def save(self, path: str | Path) -> None:
         destination = Path(path)
@@ -403,13 +392,13 @@ class LatentPathFollowingUpdater:
                     name = target + "." + name[len(target + ".base."):]
                     break
             base_state[name] = value.detach().cpu()
-        payload = {"format": "sttt_latent_path_following_online", "schema_version": 4,
+        payload = {"format": "sttt_latent_path_following_online", "schema_version": 5,
                    "model_config": asdict(self.model.config), "contract": self.contract,
                    "base_state": base_state, "adapters": adapters, "adapter_targets": list(self.adapter_targets),
-                   "actor": self.actor.state_dict(), "config": asdict(self.config), "costs": asdict(self.costs),
+                   "actor": self.actor.state_dict(), "config": asdict(self.config),
                    "model_optimizer": self.model_optimizer.state_dict(),
-                   "actor_learner": self.actor_learner.state_dict(), "loss_config": self.loss_config,
-                   "actor_updates": self.actor_updates, "response_updates": self.response_updates,
+                   "context_adapter": self.context_adapter.state_dict(), "loss_config": self.loss_config,
+                   "context_updates": self.context_updates, "response_updates": self.response_updates,
                    "zero_calibration_windows": self.zero_calibration_windows}
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         torch.save(payload, temporary)
@@ -418,14 +407,14 @@ class LatentPathFollowingUpdater:
     @classmethod
     def restore(cls, path: str | Path, rollout_factory: Any, *, device: str = "cpu", expected_contract: Mapping[str, Any] | None = None) -> LatentPathFollowingUpdater:
         payload = torch.load(path, map_location=device, weights_only=True)
-        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 4:
-            raise ValueError("expected a version-4 stochastic WM/Actor/Critic online checkpoint")
+        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 5:
+            raise ValueError("expected a version-5 frozen-prior/FiLM/context online checkpoint")
         if expected_contract is not None and payload["contract"] != dict(expected_contract):
             raise ValueError("online checkpoint control contract differs from deployment")
         model = LatentWorldModel(WorldModelConfig.from_mapping(payload["model_config"])).to(device)
         model.load_state_dict(payload["base_state"], strict=True)
         loaded = LoadedWorldModel(model, payload["contract"], {"loss_config": payload["loss_config"]})
-        updater = cls(loaded, rollout_factory(model), LatentOnlineConfig.from_mapping(payload["config"]), LatentCostConfig(**payload["costs"]))
+        updater = cls(loaded, rollout_factory(model), LatentOnlineConfig.from_mapping(payload["config"]))
         if tuple(payload["adapter_targets"]) != updater.adapter_targets:
             raise ValueError("online LoRA target manifest differs from this physical model")
         parameters = dict(updater.model.named_parameters())
@@ -436,8 +425,9 @@ class LatentPathFollowingUpdater:
                 parameters[name].copy_(value)
         updater.actor.load_state_dict(payload["actor"], strict=True)
         updater.model_optimizer.load_state_dict(payload["model_optimizer"])
-        updater.actor_learner.load_state_dict(payload["actor_learner"])
-        for name in ("actor_updates", "response_updates", "zero_calibration_windows"):
+        updater.inference_actor.load_state_dict(updater.actor.state_dict(), strict=True)
+        updater.context_adapter.load_state_dict(payload["context_adapter"])
+        for name in ("context_updates", "response_updates", "zero_calibration_windows"):
             setattr(updater, name, int(payload[name]))
         updater.stage_publication()
         updater.publish()

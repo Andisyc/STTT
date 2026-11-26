@@ -136,7 +136,7 @@ class _RuntimeEvidence:
                     self.saturation_sum += saturation
                     self.saturation_max = max(self.saturation_max, saturation)
             elif record["event"] == "learning_complete":
-                self.latest.update({key: record[key] for key in ("a_updates", "b_updates", "critic_updates")})
+                self.latest.update({key: record[key] for key in ("a_updates", "context_updates", "b_updates") if key in record})
             row["new_measurement"] = new_measurement
             self.handle.write(json.dumps(_plain(row), allow_nan=False) + "\n")
             self.records += 1
@@ -149,7 +149,7 @@ class _RuntimeEvidence:
             "unique_mean_age_s": self.age_sum / self.unique / 1e9 if self.unique else None,
             "unique_max_age_s": self.age_max / 1e9 if self.unique else None,
             "a_updates": self.latest.get("a_updates"), "b_updates": self.latest.get("b_updates"),
-            "critic_updates": self.latest.get("critic_updates"),
+            "context_updates": self.latest.get("context_updates"),
             "dropped_windows": self.latest.get("dropped_windows", {}),
             "expired_queries": self.latest.get("expired_queries"),
         }
@@ -371,10 +371,8 @@ def run_path_following_evaluation(
         if not latent_keys <= set(cfg):
             raise ValueError("latent modes require world_model_checkpoint and latent_learning")
         latent_learning = _plain(cfg.latent_learning)
-        if not isinstance(latent_learning, dict) or not {"online"} <= set(latent_learning) <= {"online", "costs"} or not isinstance(latent_learning["online"], dict):
-            raise ValueError("latent_learning requires online overrides and optional costs overrides")
-        if "costs" in latent_learning and not isinstance(latent_learning["costs"], dict):
-            raise ValueError("latent_learning.costs must contain cost overrides")
+        if not isinstance(latent_learning, dict) or set(latent_learning) != {"online"} or not isinstance(latent_learning["online"], dict):
+            raise ValueError("latent_learning requires online WM/context overrides")
         from unilab.algos.torch.sttt.world_model.online import LatentOnlineConfig
         LatentOnlineConfig.from_mapping(latent_learning["online"])
     for seed in seeds:

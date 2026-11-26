@@ -16,7 +16,6 @@ from omegaconf import OmegaConf
 from unilab.algos.torch.sttt.odometry_runtime import create_pose_runtime
 from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint
 from unilab.algos.torch.sttt.path_following.latent_actor import LatentResidualActor
-from unilab.algos.torch.sttt.path_following.latent_objectives import LatentCostConfig
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.runtime import PathFollowingController, PathFollowingRuntimeConfig
 from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory
@@ -42,7 +41,6 @@ def _positive_count(value: Any, name: str) -> int:
 class LatentRuntimeSetup:
     loaded: LoadedWorldModel
     learning: LatentOnlineConfig
-    costs: LatentCostConfig
     runtime: PathFollowingRuntimeConfig
     resume_checkpoint_path: Path | None
     save_checkpoint_path: Path | None
@@ -72,12 +70,14 @@ class LatentRuntimeSetup:
             parameter = next(self.loaded.model.parameters())
             updater = LatentPathFollowingUpdater.restore(self.resume_checkpoint_path, rollout_factory,
                                                          device=str(parameter.device), expected_contract=self.loaded.contract)
-            if updater.config != self.learning or updater.costs != self.costs:
+            if updater.config != self.learning:
                 raise ValueError("resume configuration differs from the saved online learning contract")
             return updater
-        updater = LatentPathFollowingUpdater(self.loaded, rollout_factory(self.loaded.model), self.learning, self.costs)
+        updater = LatentPathFollowingUpdater(self.loaded, rollout_factory(self.loaded.model), self.learning)
         if self.pretrained_actor is not None:
             updater.actor.load_state_dict(self.pretrained_actor.state_dict(), strict=True)
+            if self.pretrained_learning is None:
+                raise ValueError("pretrained A is missing its stage-2 learner contract")
             updater.initialize_pretrained(self.pretrained_learning)
         return updater
 
@@ -96,7 +96,7 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
         raise ValueError("latent path following requires task=g1_walk_flat/mujoco")
     for path in ("interactive.keyboard", "env.commands.heading_command", "demo.figure_eight.enabled", "online_adaptation.enabled"):
         if OmegaConf.select(cfg, path, default=False):
-            raise ValueError(f"disable {path}; latent adaptation owns WM/A and keeps Tracker frozen")
+            raise ValueError(f"disable {path}; latent adaptation owns WM/c and keeps A/Tracker frozen")
     if OmegaConf.select(cfg, "env.commands.resampling_time", default=None) != 0:
         raise ValueError("latent path following requires resampling_time=0; the reference supplies nominal commands")
     root = Path(root_dir)
@@ -140,26 +140,27 @@ def prepare_latent_path_following(node: Any, *, cfg: Any, playback_cfg: Any, roo
         raise ValueError("provide a latent learning configuration")
     learning = OmegaConf.merge(OmegaConf.load(learning_path), OmegaConf.create(values["learning"]))
     raw = OmegaConf.to_container(learning, resolve=True)
-    if not isinstance(raw, dict) or set(raw) != {"online", "costs"}:
-        raise ValueError("latent learning configuration requires online and costs sections")
+    if not isinstance(raw, dict) or set(raw) != {"online"}:
+        raise ValueError("latent learning configuration requires its online section")
     save_path = resolve(values["save_checkpoint_path"], optional=True)
     resume_path = resolve(values["resume_checkpoint_path"], optional=True)
     pretrained_path = resolve(values["pretrained_actor_checkpoint"], optional=True)
     if resume_path is not None and pretrained_path is not None:
         raise ValueError("select an online resume or pretrained A initialization, not both")
     learning_config = LatentOnlineConfig.from_mapping(raw["online"])
-    if learning_config.adapt_actor and pretrained_path is None and resume_path is None:
-        raise ValueError("online A/Critic adaptation requires pretrained_actor_checkpoint or an online resume")
+    if pretrained_path is None and resume_path is None:
+        raise ValueError("latent control requires a stage-2 pretrained_actor_checkpoint or an online resume")
     actor, pretrained_learning = None, None
     if pretrained_path is not None:
         actor, metadata = load_actor_checkpoint(pretrained_path, loaded.model, loaded.contract, learning_config.trajectory,
                                           residual_limits=learning_config.residual_limit_rad)
-        if actor.hidden_dims != learning_config.actor_hidden_dims or actor.command_dim != spec.command_dim:
+        if (actor.hidden_dims != learning_config.actor_hidden_dims or actor.command_dim != spec.command_dim
+                or actor.adaptation_dim != learning_config.context_dim):
             raise ValueError("pretrained A architecture differs from the deployment configuration")
         pretrained_learning = metadata["learner_state"]
     if save_path is not None and save_path.exists() and save_path != resume_path:
         raise FileExistsError("online output already exists; select a new checkpoint path")
-    return LatentRuntimeSetup(loaded, learning_config, LatentCostConfig(**raw["costs"]),
+    return LatentRuntimeSetup(loaded, learning_config,
                               PathFollowingRuntimeConfig(pose=pose, **counts), resume_path, save_path,
                               actor, pretrained_learning)
 
@@ -232,9 +233,8 @@ class LatentPathFollowingController(PathFollowingController[LatentPathFollowingU
         if self.last_update.a_loss is not None:
             self._last_decision_update = self._submitted_timestamp
         self.trace.append({"event": "learning_complete", "step": self._steps,
-            "a_updates": self.updater.actor_updates, "b_updates": self.updater.response_updates,
-            "critic_updates": self.updater.actor_learner.critic_learner.updates,
-            "elapsed_s": self.last_update.elapsed_s, "critic_loss": self.last_update.critic_loss})
+            "context_updates": self.updater.context_updates, "b_updates": self.updater.response_updates,
+            "elapsed_s": self.last_update.elapsed_s, "context_loss": self.last_update.a_loss})
         budget = self.updater.window_steps * self.updater.ctrl_dt
         self._budget_updates += 1
         self._budget_overruns += int(self.last_update.elapsed_s > budget)

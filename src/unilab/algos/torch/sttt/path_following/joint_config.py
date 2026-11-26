@@ -24,14 +24,17 @@ def positive_scale(value: Any, name: str) -> float:
 @dataclass(frozen=True)
 class JointSchedule:
     pretrain_wm_updates: int
-    online_iterations: int
-    actor_updates_per_iteration: int
+    base_iterations: int
+    film_iterations: int
     wm_updates_per_iteration: int
     checkpoint_every: int
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
-            positive_count(getattr(self, name), f"schedule.{name}")
+            value = getattr(self, name)
+            if name == "pretrain_wm_updates" and type(value) is int and value == 0:
+                continue
+            positive_count(value, f"schedule.{name}")
 
 
 @dataclass(frozen=True)
@@ -93,9 +96,11 @@ class JointTrainingConfig:
     @classmethod
     def from_mapping(cls, cfg: Mapping[str, Any]) -> JointTrainingConfig:
         raw = OmegaConf.to_container(cfg, resolve=True) if OmegaConf.is_config(cfg) else dict(cfg)
-        expected = {"output_dir", "policy_checkpoint", "profile_path", "device", "seed", "source_overrides", "wm", "actor", "evaluation", "capture", "schedule", "replay", "resume_checkpoint", "calibration"}
+        expected = {"output_dir", "policy_checkpoint", "profile_path", "device", "seed", "source_overrides", "wm", "actor", "evaluation", "capture", "schedule", "replay", "resume_checkpoint", "stage", "ppo", "context_adaptation", "rewards"}
         if not isinstance(raw, dict) or set(raw) != expected:
-            raise ValueError("use latent_pretraining.yaml; refinement_cycles/refine_* were replaced by schedule and replay")
+            raise ValueError("use the two-stage PPO/FiLM latent_pretraining.yaml")
+        if raw["stage"] not in {"all", "base", "film"}:
+            raise ValueError("stage must be all, base or film")
         if type(raw["seed"]) is not int or raw["seed"] < 0:
             raise ValueError("seed must be a nonnegative integer")
         if not isinstance(raw["source_overrides"], list) or any(not isinstance(x, str) for x in raw["source_overrides"]):
@@ -114,7 +119,7 @@ class JointTrainingConfig:
             raise ValueError("WM forecast and collection block must cover the same complete residual windows")
         if positive_count(raw["actor"]["training"]["horizon_windows"], "actor.training.horizon_windows") * capture.window_steps != horizon:
             raise ValueError("actor and WM forecast horizons must agree")
-        if raw["wm"]["training"]["max_updates"] != schedule.pretrain_wm_updates or raw["actor"]["training"]["max_updates"] != schedule.online_iterations:
+        if raw["wm"]["training"]["max_updates"] != schedule.pretrain_wm_updates or raw["actor"]["training"]["max_updates"] != schedule.base_iterations:
             raise ValueError("joint execution budgets must be owned by schedule (use YAML interpolation)")
         return cls(cast(dict[str, Any], raw), schedule, capture, capacity)
 

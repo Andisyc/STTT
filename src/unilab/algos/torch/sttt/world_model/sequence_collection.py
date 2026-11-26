@@ -179,7 +179,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                                   residual_amplitude_rad, seed, risk_tilt_limit_rad,
                                   device=None, playback_deps=None, observation_augmentation=None,
                                   trajectory=None, actor_checkpoint=None, world_model_checkpoint=None,
-                                  forecast_windows=None) -> dict[str, Any]:
+                                  forecast_windows=None, adapt_context: bool = False) -> dict[str, Any]:
     """Capture one real episode without changing existing B collection or training."""
     from unilab.visualization.playback_distill_sessions import create_fada_playback_session
     from unilab.visualization.playback_sessions import RslRlPlaybackConfig
@@ -196,6 +196,8 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
         raise ValueError("residual_amplitude_rad must be an explicit finite nonnegative scalar or per-joint 29-vector")
     if forecast_windows is not None and (type(forecast_windows) is not int or forecast_windows < 1 or actor_checkpoint is None or np.any(amplitude != 0)):
         raise ValueError("forecast diagnostics require a frozen actor and zero exploration")
+    if adapt_context and actor_checkpoint is None:
+        raise ValueError("context adaptation requires a stage-2 actor checkpoint")
     if not isinstance(cfg, DictConfig):
         raise TypeError("collection requires a composed Hydra DictConfig")
     if str(cfg.training.task_name) != "G1WalkFlat" or str(cfg.training.sim_backend) != "mujoco":
@@ -234,7 +236,7 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
         raise ValueError("actor capture requires its WM checkpoint and reference trajectory")
     if task_config is not None and pose_config.odometry_source != "simulation":
         raise ValueError("offline reference capture requires simulation truth")
-    actor = rollout = task_reference = None
+    actor = rollout = task_reference = context_adapter = None
     initial_path = None
     forecasts = []
     history = CausalEgoHistory()
@@ -273,11 +275,18 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                     ego_valid=torch.tensor([[row[1]] for row in samples], device=parameter.device, dtype=torch.bool)[None],
                     ego_age_s=parameter.new_tensor([[row[2]] for row in samples])[None], path_state=state,
                 )
-                proposed = actor(start.latent.feature(), start.errors, start.command, state.preview(), start.previous_residual) + capture["residual"]
+            if context_adapter is not None:
+                context_adapter.step(start)
+            adaptation = None if not actor.adaptation_dim else (
+                actor.default_context[None] if context_adapter is None else context_adapter.context.detach())
+            with torch.no_grad():
+                proposed = actor(start.latent.feature(), start.errors, start.command, state.preview(), start.previous_residual,
+                                 adaptation_context=adaptation) + capture["residual"]
                 limits = actor.residual_limit_rad29
                 capture["residual"] = proposed.clamp(-limits, limits)
                 if forecast_windows is not None:
-                    prediction = rollout.run(start, actor, window_steps=window_steps, horizon_windows=forecast_windows)
+                    prediction = rollout.run(start, actor, window_steps=window_steps, horizon_windows=forecast_windows,
+                                             adaptation_context=adaptation)
                     forecasts.append({"origin_step": step, "risk": prediction.risk[0, :, 0].cpu().tolist(),
                         "body_delta": prediction.body_delta[0].cpu().tolist(), "actions": prediction.actions[0].cpu().tolist()})
         return compose_joint_position_residual(
@@ -340,7 +349,15 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
                 target_joint_names=contract["source"]["target_joint_names"],
                 target_default_joint_angles=contract["source"]["target_default_joint_angles"],
                 target_action_scale=contract["source"]["target_action_scale"])
-            actor, _ = load_actor_checkpoint(actor_checkpoint, loaded.model, contract, task_config)
+            actor, actor_metadata = load_actor_checkpoint(actor_checkpoint, loaded.model, contract, task_config)
+            actor.eval().requires_grad_(False)
+            if adapt_context:
+                from unilab.algos.torch.sttt.path_following.context_adaptation import ContextAdaptationConfig, ContextAdapter
+                if actor_metadata["stage"] != "film":
+                    raise ValueError("adaptive evaluation requires a stage-2 FiLM actor")
+                context_config = ContextAdaptationConfig(**actor_metadata["learner_state"]["context"]["config"])
+                context_adapter = ContextAdapter(actor, rollout, batch_size=1, window_steps=window_steps, config=context_config)
+            provenance["context_mode"] = "adaptive" if adapt_context else "fixed"
             provenance["actor_checkpoint"] = str(Path(actor_checkpoint).resolve())
             provenance["world_model_checkpoint"] = str(Path(world_model_checkpoint).resolve())
         writer = SequenceDatasetWriter(output, contract)
@@ -493,6 +510,9 @@ def collect_world_model_sequences(cfg, *, root_dir, output_dir, num_steps, windo
             {"timestamp_ns": p.timestamp_ns, "source_timestamps_ns": p.source_timestamps_ns,
              "sequence_id": p.sequence_id, "tracking_epoch": p.tracking_epoch, "frame_id": p.frame_id}
             for p in label_poses.values()]
+        provenance["context_updates"] = 0 if context_adapter is None else context_adapter.updates
+        if actor is not None and actor.adaptation_dim:
+            provenance["final_context"] = (actor.default_context if context_adapter is None else context_adapter.context[0]).detach().cpu().tolist()
         provenance["rollout_forecasts"] = forecasts
         provenance["end_reason"] = ("terminated" if bool(np.any(session.env.state.terminated)) else "time_limit") if terminated else "requested_horizon"
         (output / "capture.json").write_text(json.dumps(provenance, allow_nan=False, indent=2) + "\n", encoding="utf-8")

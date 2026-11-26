@@ -1,4 +1,4 @@
-"""Pretrain one reference-conditioned residual policy through a frozen WM."""
+"""Pretrain base residual A with real-simulation PPO and supervised WM updates."""
 from __future__ import annotations
 
 import json

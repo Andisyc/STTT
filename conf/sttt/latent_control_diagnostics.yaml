@@ -27,6 +27,6 @@ feedback_solver_iterations: 96
 # Replay the three strongest measured joint directions per phase, at both amplitudes.
 model_top_directions: 3
 model_seeds: [0, 1, 2]
-critic_trajectory_kinds: [straight, circle]
-critic_initial_lateral_m: 0.15
+context_trajectory_kinds: [straight, circle]
+context_initial_lateral_m: 0.15
 continuation_duration_s: 30.0

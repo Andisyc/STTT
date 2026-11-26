@@ -26,6 +26,7 @@ from unilab.algos.torch.sttt.path_following.joint_data import join_rollout_start
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.latent_objectives import ObservedCostWindow
 from unilab.algos.torch.sttt.path_following.trajectory import PathState, ReferenceTrajectory
+from unilab.algos.torch.sttt.path_following.residual_rewards import ResidualRewardConfig, measured_residual_reward
 from unilab.visualization.playback_sessions import RslRlPlaybackConfig
 
 from .checkpoint import canonical_contract
@@ -42,6 +43,16 @@ class CollectionBlock:
     starts: RolloutStart | None
     completed_directories: tuple[str, ...]
     failures: tuple[tuple[RolloutStart, ObservedCostWindow], ...] = ()
+
+
+@dataclass(frozen=True)
+class PhysicalWindow:
+    block: CollectionBlock
+    rewards: torch.Tensor
+    done: torch.Tensor
+    timeouts: torch.Tensor
+    terminal_start: RolloutStart
+    reward_terms: dict[str, float]
 
 
 class _Episode:
@@ -151,6 +162,9 @@ class BatchedSequenceCollector:
         self._roots: list[RolloutStart | None] = [None] * num_envs
         self._latest_starts: list[RolloutStart | None] = [None] * num_envs
         self._query_observation = self._query_command = None
+        self._external_residual = None
+        self._reward_config = None
+        self._query_nominal = None
         policy_path = Path(str(cfg.training.play_checkpoint_path)).expanduser()
         policy_path = policy_path if policy_path.is_absolute() else Path(root_dir) / policy_path
         playback = RslRlPlaybackConfig(task="G1WalkFlat", load_run="-1", checkpoint=None,
@@ -227,6 +241,68 @@ class BatchedSequenceCollector:
             target_joint_names=source["target_joint_names"], target_default_joint_angles=source["target_default_joint_angles"],
             target_action_scale=source["target_action_scale"])
 
+    @torch.no_grad()
+    def current_start(self) -> RolloutStart:
+        if self.rollout is None:
+            raise RuntimeError("bind the physical model before requesting PPO observations")
+        history, width = self.spec.history_length, self.spec.obs_dim
+        observations = np.zeros((self.num_envs, history, width), np.float32)
+        actions = np.zeros((self.num_envs, history, 29), np.float32)
+        valid = np.zeros((self.num_envs, history), bool)
+        ego = np.zeros((self.num_envs, history, 3), np.float32)
+        ego_valid = np.zeros((self.num_envs, history, 1), bool)
+        ego_age = np.zeros((self.num_envs, history, 1), np.float32)
+        for row, record in enumerate(self._records):
+            count = min(history, record.steps + 1)
+            begin = record.steps + 1 - count
+            if self.spec.family == "legacy":
+                observations[row] = record.arrays["observations"][0]
+            observations[row, -count:] = record.arrays["observations"][begin:record.steps + 1]
+            valid[row, -count:] = True
+            for offset, instant in enumerate(range(begin, record.steps + 1)):
+                if instant:
+                    actions[row, history - count + offset] = record.arrays["source_actions"][instant - 1]
+            ego[row, -count:] = record.arrays["ego_motion"][begin:record.steps + 1]
+            ego_valid[row, -count:] = record.arrays["ego_valid"][begin:record.steps + 1]
+            ego_age[row, -count:] = record.arrays["ego_age_s"][begin:record.steps + 1]
+        commands = self.session.info["commands"]
+        if self.session.official_adapter is not None:
+            commands = self.session.official_adapter.command(commands, self.session.info.get("gait_phase"))
+        def tensor(value):
+            return torch.as_tensor(value, device=self.device)
+        return self.rollout.encode_observed_start(
+            tensor(observations).to(self.dtype), tensor(actions).to(self.dtype), tensor(valid),
+            tensor(commands).to(self.dtype), errors=self._path.errors(), previous_residual=self._residual,
+            ego_motion=tensor(ego).to(self.dtype), ego_valid=tensor(ego_valid),
+            ego_age_s=tensor(ego_age).to(self.dtype), path_state=self._path,
+        )
+
+    def step_residual_window(self, residual: torch.Tensor, replay, *,
+                             versions: TrainingVersions, rewards: ResidualRewardConfig) -> PhysicalWindow:
+        if residual.shape != (self.num_envs, 29) or not bool(torch.isfinite(residual).all()):
+            raise ValueError("PPO must provide one finite physical residual per stream")
+        self._external_residual = residual.detach().clone()
+        self._reward_config = rewards
+        self._window_rewards = np.zeros(self.num_envs, np.float32)
+        self._window_done = np.zeros(self.num_envs, bool)
+        self._window_timeouts = np.zeros(self.num_envs, bool)
+        self._window_terms = {}
+        self._terminal_starts = [None] * self.num_envs
+        try:
+            block = self.advance(self.capture.window_steps, replay, versions=versions)
+            end = self.current_start()
+            terminal = join_rollout_starts([
+                saved if saved is not None else select_rollout_start(end, slice(row, row + 1))
+                for row, saved in enumerate(self._terminal_starts)
+            ])
+            return PhysicalWindow(
+                block, torch.as_tensor(self._window_rewards, device=self.device),
+                torch.as_tensor(self._window_done, device=self.device),
+                torch.as_tensor(self._window_timeouts, device=self.device), terminal, self._window_terms,
+            )
+        finally:
+            self._external_residual = self._reward_config = None
+
     def _decision_observation(self):
         """Publish the next command before freezing the next Tracker observation."""
         command = self._path.command(self._command_template)
@@ -284,8 +360,13 @@ class BatchedSequenceCollector:
     def _transform(self, query):
         self._query_observation = query.observation_history[:, -1].detach().cpu().numpy().copy()
         self._query_command = query.command.detach().cpu().numpy().copy()
+        if self._reward_config is not None:
+            self._query_nominal = query.planner_future[:, 0].detach().cpu().numpy()
+        if self._external_residual is not None:
+            self._residual.copy_(self._external_residual)
+            self._residual_versions[:] = (self.versions.actor, self.versions.world_model)
         indices = np.flatnonzero(self._steps % self.capture.window_steps == 0)
-        if len(indices):
+        if self._external_residual is None and len(indices):
             self._residual_versions[indices] = (self.versions.actor, self.versions.world_model)
             index = torch.as_tensor(indices, device=self.device, dtype=torch.long)
             noise = torch.as_tensor(self.rng.uniform(-1., 1., (len(indices), 29)) * self.amplitude,
@@ -401,6 +482,28 @@ class BatchedSequenceCollector:
                     terminal=bool(done[row]), risk=float(risk),
                     versions=TrainingVersions(actor=int(self._residual_versions[row, 0]), world_model=int(self._residual_versions[row, 1])),
                     next_errors=errors[row])
+            if self._reward_config is not None:
+                live = ~self._window_done
+                motion = np.stack([record.arrays["path_delta"][record.steps - 1] for record in self._records])
+                previous = np.stack([record.arrays["actions"][record.steps - 2]
+                    if record.steps > 1 else np.zeros(29, np.float32) for record in self._records])
+                tilt = np.asarray([proprio_tilt_rad(value, observation_contract=self.spec.observation_contract) for value in following])
+                reward, terms = measured_residual_reward(
+                    following=following, nominal=self._query_nominal, command=self._query_command,
+                    motion=motion, errors=errors, tilt=tilt, actions=actions, previous_actions=previous,
+                    terminated=terminated, ctrl_dt=self.profile.ctrl_dt, preprocessing=self.preprocessing,
+                    observation_contract=self.spec.observation_contract, config=self._reward_config,
+                )
+                self._window_rewards += np.where(live, reward, 0.)
+                for name, values in terms.items():
+                    self._window_terms[name] = self._window_terms.get(name, 0.) + float(np.where(live, values, 0.).sum())
+                newly_done = live & done
+                if newly_done.any():
+                    terminal_start = self.current_start()
+                    for row in np.flatnonzero(newly_done):
+                        self._terminal_starts[int(row)] = select_rollout_start(terminal_start, slice(int(row), int(row) + 1))
+                    self._window_timeouts[newly_done] = ~terminated[newly_done]
+                self._window_done |= done
             self._steps += 1
             self.total_steps += self.num_envs
             if done.any():
@@ -431,12 +534,14 @@ class BatchedSequenceCollector:
                 self.poses.reset(indices)
                 self.session.reset_rows(indices)
                 self._new_rows(indices, self.poses.sample())
+                if self._external_residual is not None:
+                    self._external_residual[indices] = 0.
         for row, record in enumerate(self._records):
             if record.steps:
                 self._store(replay, row)
-        if self.actor is not None and any(start is None for start in self._roots):
+        if self.actor is not None and self._external_residual is None and any(start is None for start in self._roots):
             raise RuntimeError("collection block did not visit an actor decision in every stream")
-        starts = join_rollout_starts([start for start in self._roots if start is not None]) if self.actor is not None else None
+        starts = join_rollout_starts([start for start in self._roots if start is not None]) if self.actor is not None and self._external_residual is None else None
         return CollectionBlock(steps * self.num_envs, starts, tuple(completed), tuple(failures))
 
     def flush(self, replay) -> tuple[str, ...]:

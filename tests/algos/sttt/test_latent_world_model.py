@@ -119,14 +119,13 @@ def captured_query(case, profile):
 
 def actor_artifact(path, model, contract, rollout):
     from unilab.algos.torch.sttt.path_following.actor_checkpoint import save_actor_checkpoint
-    from unilab.algos.torch.sttt.path_following.actor_learner import ActorLearner
+    from test_residual_film_ppo import make_ppo_learner
     from unilab.algos.torch.sttt.path_following.trajectory import TrajectoryConfig
-    actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=rollout.spec.command_dim)
-    learner = ActorLearner(actor, rollout, {
-        "window_steps": contract["data"]["window_steps"], "horizon_windows": 1,
-        "batch_size": 1, "microbatch_size": 1, "learning_rate": 1e-4, "max_grad_norm": 10.,
-        "critic": {"hidden_dims": (8,), "learning_rate": 1e-4, "epochs": 1, "minibatches": 1},
-    }, LatentCostConfig())
+    actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=rollout.spec.command_dim,
+                                adaptation_dim=16)
+    with torch.no_grad():
+        actor.net[-1].weight.normal_(std=.01)
+    learner = make_ppo_learner(actor, rollout, stage="film", batch_size=1)
     return save_actor_checkpoint(path, actor, model, contract, TrajectoryConfig(),
                                   training_state={}, learner_state=learner.state_dict())
 
@@ -262,12 +261,17 @@ def test_actual_tracker_rollout_and_actor_credit_are_preserved(tmp_path):
     assert result.commands[0, 1, 3].item() == pytest.approx(expected_phase, abs=1e-6)
 
 
-def test_online_lora_actor_ownership_and_resume(tmp_path):
+def test_online_lora_and_context_ownership_and_resume(tmp_path):
     case, profile, contract, model, factory = parts(tmp_path / "case")
     query, source = captured_query(case, profile)
     config = LatentOnlineConfig(tuple([.02] * 29), actor_hidden_dims=(8,), calibration_windows=1,
                                horizon_windows=1, replay_sequence_windows=1, lora_rank=2)
-    updater = LatentPathFollowingUpdater(LoadedWorldModel(model, contract, {}), factory(model), config, LatentCostConfig())
+    updater = LatentPathFollowingUpdater(LoadedWorldModel(model, contract, {}), factory(model), config)
+    from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint
+    pretrained, metadata = load_actor_checkpoint(
+        actor_artifact(tmp_path / "prior.pt", model, contract, factory(model)), model, contract, config.trajectory)
+    updater.actor.load_state_dict(pretrained.state_dict())
+    updater.initialize_pretrained(metadata["learner_state"])
     base = {name: p.detach().clone() for name, p in model.named_parameters() if "lora_" not in name}
     actor_before = {name: p.detach().clone() for name, p in updater.actor.named_parameters()}
     actions = factory(model).source_to_env(source).detach().numpy()[0]
@@ -296,11 +300,12 @@ def test_online_lora_actor_ownership_and_resume(tmp_path):
     for name, value in updater.actor.state_dict().items():
         torch.testing.assert_close(updater.inference_actor.state_dict()[name], value, rtol=0, atol=0)
     assert result.b_loss is not None and result.a_loss is not None
-    assert updater.response_updates == updater.actor_updates == 1
+    assert updater.response_updates == updater.context_updates == 1
     for name, parameter in model.named_parameters():
         if name in base:
             torch.testing.assert_close(parameter, base[name], atol=0, rtol=0)
-    assert any(not torch.equal(p, actor_before[name]) for name, p in updater.actor.named_parameters())
+    assert all(torch.equal(p, actor_before[name]) for name, p in updater.actor.named_parameters())
+    assert torch.count_nonzero(updater.context_adapter.context) > 0
     assert any(bool(p.abs().sum()) for name, p in model.named_parameters() if name.endswith("lora_B.weight"))
     checkpoint = tmp_path / "online.pt"
     updater.save(checkpoint)
@@ -309,13 +314,14 @@ def test_online_lora_actor_ownership_and_resume(tmp_path):
         torch.testing.assert_close(value, restored.actor.state_dict()[name], atol=0, rtol=0)
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, restored.model.state_dict()[name], atol=0, rtol=0)
-    assert restored.response_updates == restored.actor_updates == 1
-    for name, value in updater.actor_learner.critic_learner.target.state_dict().items():
-        torch.testing.assert_close(value, restored.actor_learner.critic_learner.target.state_dict()[name], rtol=0, atol=0)
-    assert updater.actor_learner.critic_learner.updates == restored.actor_learner.critic_learner.updates == 1
+    assert restored.response_updates == restored.context_updates == 1
+    torch.testing.assert_close(updater.context_adapter.context, restored.context_adapter.context, rtol=0, atol=0)
+    torch.testing.assert_close(updater.context_adapter.optimizer.state[updater.context_adapter.context]["exp_avg"],
+                               restored.context_adapter.optimizer.state[restored.context_adapter.context]["exp_avg"], rtol=0, atol=0)
     updater.discard_pending()
     assert not updater.replay and not updater.records
     assert updater.calibration_complete
+    torch.testing.assert_close(updater.context_adapter.context, restored.context_adapter.context, rtol=0, atol=0)
 
 
 def test_public_training_resume_and_whole_capture_split(tmp_path):
@@ -382,8 +388,7 @@ def test_factory_latent_mode_uses_real_history_and_window_activation(tmp_path):
     node.pose.odometry_source = "simulation"
     node.update_interval_steps = 2
     node.learning = {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8], "calibration_windows": 1,
-                                "horizon_windows": 1, "replay_sequence_windows": 1, "lora_rank": 2,
-                                "critic": {"hidden_dims": [8]}}}
+                                "horizon_windows": 1, "replay_sequence_windows": 1, "lora_rank": 2}}
     case.cfg.path_following = node
     session = create_session(case)
     try:
@@ -392,7 +397,7 @@ def test_factory_latent_mode_uses_real_history_and_window_activation(tmp_path):
             if (index + 1) % 2 == 0:
                 session.controller._finish_learning(wait=True)
         runtime = session.controller
-        assert runtime.updater.actor_updates == runtime.updater.response_updates == 2
+        assert runtime.updater.context_updates == runtime.updater.response_updates == 2
         assert runtime.collector.completed_windows == 2
         _, replay = runtime.updater.replay[-1]
         torch.testing.assert_close(torch.from_numpy(replay["actions"][-1]), torch.as_tensor(session.info["current_actions"][0]).float())
@@ -421,8 +426,7 @@ def test_latent_evaluation_compares_adaptation_with_frozen_world_model(tmp_path)
         {"world_model_checkpoint": str(artifact), "pretrained_actor_checkpoint": str(actor_path),
          "latent_learning": {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8],
                                          "calibration_windows": 1, "horizon_windows": 1,
-                                         "replay_sequence_windows": 1, "lora_rank": 2,
-                                         "critic": {"hidden_dims": [8]}}},
+                                         "replay_sequence_windows": 1, "lora_rank": 2}},
          "thresholds": {"heading_tolerance_rad": math.pi}},
     )
     result = run_path_following_evaluation(cfg, root_dir=ROOT, playback_deps=case.deps)
@@ -430,7 +434,7 @@ def test_latent_evaluation_compares_adaptation_with_frozen_world_model(tmp_path)
     adapted, frozen = result["runs"]
     assert adapted["runtime"]["b_updates"] == 1
     assert frozen["runtime"]["b_updates"] == 0
-    assert adapted["runtime"]["a_updates"] == frozen["runtime"]["a_updates"] == 1
+    assert adapted["runtime"]["context_updates"] == frozen["runtime"]["context_updates"] == 1
     assert adapted["risk_diagnostics"]["labelled_windows"] == frozen["risk_diagnostics"]["labelled_windows"] == 5
     assert all(env.closed and not env.autoreset for env in case.environments)
 
@@ -750,8 +754,7 @@ def test_legacy_capture_pretraining_resume_and_runtime_without_yaml(tmp_path):
     node.update_interval_steps = 2
     node.learning = {"online": {"residual_limit_rad": [.02] * 29, "actor_hidden_dims": [8],
                                "calibration_windows": 1, "horizon_windows": 1,
-                               "replay_sequence_windows": 1, "lora_rank": 2,
-                               "critic": {"hidden_dims": [8]}}}
+                               "replay_sequence_windows": 1, "lora_rank": 2}}
     case.cfg.path_following = node
     session = create_session(case)
     before = {name: value.clone() for name, value in session.controller.playback.policy.state_dict().items()}
@@ -761,7 +764,7 @@ def test_legacy_capture_pretraining_resume_and_runtime_without_yaml(tmp_path):
             if (index + 1) % 2 == 0:
                 session.controller._finish_learning(wait=True)
         updater = session.controller.updater
-        assert updater.actor.command_dim == 3 and updater.actor_updates > 0 and updater.response_updates > 0
+        assert updater.actor.command_dim == 3 and updater.context_updates > 0 and updater.response_updates > 0
         for name, value in session.controller.playback.policy.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
         updater.save(tmp_path / "online.pt")

@@ -180,11 +180,13 @@ def choose_backend(cgroup: Cgroup, resources: Resources, environment: dict[str, 
 
 
 def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str,
-                     *, actor_microbatch_size: int | None = None) -> list[str]:
+                     *, ppo_minibatches: int | None = None, stage: str = "all") -> list[str]:
     def relative(path: Path) -> str:
         return str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
-    if actor_microbatch_size is not None and (type(actor_microbatch_size) is not int or actor_microbatch_size < 1):
-        raise ValueError("actor microbatch size must be a positive integer")
+    if stage not in ("all", "base"):
+        raise ValueError("stage must be all or base")
+    if ppo_minibatches is not None and (type(ppo_minibatches) is not int or ppo_minibatches < 1):
+        raise ValueError("PPO minibatch count must be a positive integer")
 
     train = sorted(relative(p.parent) for p in (data_dir / "capture" / "nominal").glob("*/metadata.json"))
     validation = sorted(relative(p.parent) for p in (data_dir / "validation").rglob("metadata.json"))
@@ -195,15 +197,14 @@ def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str,
     # All model/environment/schedule settings remain owned by latent_pretraining.yaml.
     return [uv, "run", "--no-sync", "scripts/pretrain_latent_path_following.py",
             f"policy_checkpoint={json.dumps(relative(checkpoint))}",
-            f"output_dir={json.dumps(str(output))}", "device=cuda", "capture.initial=false",
+            f"output_dir={json.dumps(str(output))}", f"stage={stage}", "device=cuda", "capture.initial=false",
             "wm.data.train_dirs=" + json.dumps(train, separators=(",", ":")),
             "wm.data.validation_dirs=" + json.dumps(validation, separators=(",", ":")),
             "wm.training.microbatch_size=256", "capture.residual_amplitude_rad=0.005",
             "capture.risk_tilt_limit_rad=0.8",
             "capture.command_ranges=[[-0.6,1.0],[-0.4,0.4],[-0.8,0.8]]",
             "actor.training.residual_limit_rad=" + json.dumps([0.005] * 29),
-            "calibration.require_response_probe=false",
-            *([] if actor_microbatch_size is None else [f"actor.training.microbatch_size={actor_microbatch_size}"])]
+            *([] if ppo_minibatches is None else [f"ppo.num_mini_batches={ppo_minibatches}"])]
 
 
 def worker(payload: str, command: list[str]) -> None:
@@ -281,7 +282,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--data-dir", type=Path, required=True, help="包含 capture/nominal 和 validation 的旧运行目录")
     parser.add_argument("--policy-checkpoint", type=Path, default=Path("model/mixup_0kg/student_iter_0031.pt"))
     parser.add_argument("--output-dir", type=Path, help="新运行目录；默认自动生成时间戳")
-    parser.add_argument("--actor-microbatch-size", type=int, help="A 推演的单组样本数；不改变有效 batch 或训练次数")
+    parser.add_argument("--stage", choices=("all", "base"), default="all",
+                        help="base 仅执行阶段1；all 依次执行阶段1和阶段2")
+    parser.add_argument("--ppo-minibatches", type=int, help="每个 PPO epoch 的 minibatch 数；默认由训练 YAML 指定")
     parser.add_argument("--dry-run", action="store_true", help="仅显示资源分配，不创建输出文件或启动进程")
     options = parser.parse_args(argv)
     output = (options.output_dir or Path(f"outputs/latent_joint_reuse_{datetime.now():%Y%m%d_%H%M%S_%f}")).resolve()
@@ -289,7 +292,7 @@ def main(argv: list[str] | None = None) -> None:
     if uv is None or ionice is None:
         raise RuntimeError("需要已安装的 uv 和 ionice；本脚本不安装工具。")
     command = training_command(options.data_dir.resolve(), options.policy_checkpoint.resolve(), output, uv,
-                               actor_microbatch_size=options.actor_microbatch_size)
+                               ppo_minibatches=options.ppo_minibatches, stage=options.stage)
     cgroup, resources = inspect_resources()
     environment = dict(os.environ)
     environment.update(OMP_NUM_THREADS=str(resources.threads), MKL_NUM_THREADS=str(resources.threads),
@@ -298,7 +301,7 @@ def main(argv: list[str] | None = None) -> None:
     plan = asdict(resources)
     plan["constrained_groups"] = [str(p) for p in resources.constrained_groups]
     print(json.dumps({"resources": plan, "backend": backend, "output": str(output),
-                      "log": str(output) + ".log", "dry_run": options.dry_run}, ensure_ascii=False), flush=True)
+                      "log": str(output) + ".log", "stage": options.stage, "dry_run": options.dry_run}, ensure_ascii=False), flush=True)
     print("nice≥10、I/O best-effort 7 是优先级；CPU 亲和范围和内存硬上限单独生效。", flush=True)
     if not resources.reserved_cores:
         print("当前仅有一颗可用物理核，无法另留完整核。", flush=True)
