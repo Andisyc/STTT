@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -16,7 +17,7 @@ from .sequence_data import _contract
 from .reference import SOURCE
 
 FORMAT = "sttt_latent_world_model"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,8 @@ def _save_world_model(path: str | Path, model: LatentWorldModel, contract: Mappi
     canonical = canonical_contract(contract)
     if model.config.obs_dim != canonical["data"]["observation_dim"] or model.config.action_dim != canonical["data"]["action_dim"]:
         raise ValueError("world-model architecture differs from the data contract")
+    if not math.isclose(model.config.ctrl_dt, canonical["data"]["ctrl_dt"], rel_tol=0., abs_tol=1e-9):
+        raise ValueError("world-model motion integration period differs from the data contract")
     _validate_model(model)
     payload = {
         "format": FORMAT, "schema_version": SCHEMA_VERSION, "model_source": dict(SOURCE),
@@ -147,6 +150,8 @@ def load_world_model(path: str | Path, *, device: str | torch.device = "cpu", ex
     config = WorldModelConfig.from_mapping(payload["model_config"])
     if config.obs_dim != contract["data"]["observation_dim"] or config.action_dim != contract["data"]["action_dim"]:
         raise ValueError("loaded model dimensions differ from the data contract")
+    if not math.isclose(config.ctrl_dt, contract["data"]["ctrl_dt"], rel_tol=0., abs_tol=1e-9):
+        raise ValueError("loaded motion integration period differs from the data contract")
     state = payload["state_dict"]
     if not isinstance(state, Mapping) or not state or any(not isinstance(value, torch.Tensor) for value in state.values()):
         raise ValueError("world-model state_dict must contain tensors")

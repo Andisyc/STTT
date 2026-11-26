@@ -20,6 +20,7 @@ model:
   norm_eps: 0.0001
   unimix: 0.01
   action_scale: null
+  ctrl_dt: null  # Resolved from the physical capture contract.
 training:
   max_updates: 200000
   batch_size: 16
@@ -30,8 +31,11 @@ training:
   validation_batches: 16
   checkpoint_every: 1000
   learning_rate: 0.0003
+  motion_learning_rate: 0.00003
+  warmup_updates: 1000
   weight_decay: 0.000001
-  gradient_clip_norm: 100.0
+  gradient_clip_norm: 10.0
+  motion_gradient_clip_norm: 1.0
   resume_checkpoint: null
   initial_checkpoint: null  # Warm start on newly collected data, with a fresh optimizer.
   loss:

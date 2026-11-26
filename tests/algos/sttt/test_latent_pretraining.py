@@ -379,7 +379,7 @@ def test_replay_failure_snapshot_preserves_exact_rejected_input(tmp_path, invali
     collector = object.__new__(BatchedSequenceCollector)
     collector.output, collector.contract = tmp_path / "capture", contract
     collector.stream_offset, collector.condition = 0, "nominal"
-    collector._records = [SimpleNamespace(identity="failed", versions=versions, sequence=lambda: raw)]
+    collector._records = [SimpleNamespace(identity="failed", validation=False, versions=versions, sequence=lambda: raw)]
 
     with pytest.raises(ReplayVersionError) as failure:
         collector._store(replay, 0)
@@ -466,6 +466,106 @@ def test_command_references_keep_their_anchor_and_cover_preview():
     assert program["resampling_control_steps"] == 5
     assert float(start.errors()[0, 0]) == pytest.approx(.2, abs=1e-5)
     assert float(reference.xy[0, 10, 1]) > -.2
+
+
+def test_bounded_commands_survive_imagined_motion_and_path_batching():
+    from unilab.algos.torch.sttt.path_following.command_reference import sample_command_reference
+    from unilab.algos.torch.sttt.path_following.joint_data import select_path
+    bounds = [[0., 1.], [-.4, .4], [-.8, .8]]
+    cfg = TrajectoryConfig(preview_points=4, preview_spacing_m=.15)
+    reference, _ = sample_command_reference(cfg, bounds, episode_steps=600, horizon_steps=20,
+        ctrl_dt=.02, resampling_s=.4, batch_size=2, rng=np.random.default_rng(91))
+    progress = reference.arc[:, :-1].clone()
+    _, tangent, speed = reference.sample(progress)
+    ahead = reference.sample(progress + cfg.preview_spacing_m)[1]
+    turn = torch.atan2(ahead[..., 1], ahead[..., 0]) - torch.atan2(tangent[..., 1], tangent[..., 0])
+    turn = torch.atan2(turn.sin(), turn.cos())
+    assert bool((speed * turn.abs() / cfg.preview_spacing_m <= .80001).all())
+    for index in range(0, progress.shape[1], 7):
+        pose = torch.cat((reference.xy[:, index], torch.full((2, 1), .3)), -1)
+        path = PathState(reference, pose, progress[:, index])
+        for candidate in (path, select_path(path, slice(0, 1)), path.advance(torch.zeros(2, 3))):
+            commands = candidate.command(torch.zeros(candidate.pose.shape[0], 3))
+            assert bool((commands >= torch.tensor(bounds)[:, 0] - 1e-6).all())
+            assert bool((commands <= torch.tensor(bounds)[:, 1] + 1e-6).all())
+
+
+def test_launch_reuses_all_conditions_without_training_on_heldout_prefixes(tmp_path):
+    import json
+    import runpy
+    root = Path(__file__).resolve().parents[3]
+    checkpoint = tmp_path / "policy.pt"
+    checkpoint.touch()
+    rows = [
+        ("capture/nominal/short", "train", "same-episode", 2),
+        ("capture/nominal/full", "train", "same-episode", 8),
+        ("capture/payload/full", "train", "payload-episode", 8),
+        ("capture/friction/heldout", "validation", "heldout-episode", 8),
+        ("validation/full", "validation", "initial-heldout", 8),
+    ]
+    for name, split, episode, count in rows:
+        directory = tmp_path / name
+        directory.mkdir(parents=True)
+        (directory / "metadata.json").write_text(json.dumps({"transition_count": count}))
+        (directory / "capture.json").write_text(json.dumps({"split": split, "episode_ids": [episode]}))
+    command = runpy.run_path(str(root / "scripts/launch_latent_pretraining.py"))["training_command"](
+        tmp_path, checkpoint, tmp_path / "output", "uv")
+    arguments = dict(value.split("=", 1) for value in command if "=" in value)
+    assert set(json.loads(arguments["wm.data.train_dirs"])) == {
+        str(tmp_path / "capture/nominal/full"), str(tmp_path / "capture/payload/full")}
+    assert set(json.loads(arguments["wm.data.validation_dirs"])) == {
+        str(tmp_path / "capture/friction/heldout"), str(tmp_path / "validation/full")}
+
+
+def test_validation_episode_never_enters_training_replay(tmp_path):
+    from types import SimpleNamespace
+    from unilab.algos.torch.sttt.world_model.joint_collection import BatchedSequenceCollector
+    from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay
+    _, contract, _ = physical_inputs(tmp_path)
+    collector = object.__new__(BatchedSequenceCollector)
+    collector.stream_offset, collector.condition = 0, "payload"
+    collector.validation_replay = EpisodeReplay(contract, capacity_transitions=32, rollout_windows=1)
+    training = EpisodeReplay(contract, capacity_transitions=32, rollout_windows=1)
+    raw = _raw_capture(tmp_path / "train")
+    collector._records = [SimpleNamespace(identity="held-out-from-reset", validation=True,
+        sequence=lambda: raw, versions=[[0, 0]] * len(raw["actions"]))]
+    collector._store(training, 0)
+    assert training.transitions == 0
+    assert collector.validation_replay.transitions == len(raw["actions"])
+    longer = _raw_capture(tmp_path / "train")
+    collector._records[0].sequence = lambda: longer
+    collector._store(training, 0)
+    assert training.transitions == 0
+
+
+def test_velocity_readout_integrates_the_saved_physical_period(tmp_path):
+    from unilab.algos.torch.sttt.world_model.model import LatentWorldModel
+    _, contract, _ = physical_inputs(tmp_path)
+    model = LatentWorldModel(replace(model_config(), obs_dim=66, ctrl_dt=.01)).eval()
+    with torch.no_grad():
+        for parameter in model.motion_head.parameters():
+            parameter.zero_()
+        model.motion_head.model[-1].bias.copy_(torch.tensor([.5, -.2, .3]))
+    actual = model.motion(model.initial(1), torch.zeros(1, 29))
+    torch.testing.assert_close(actual, torch.tensor([[.005, -.002, .003]]))
+    with pytest.raises(ValueError, match="integration period"):
+        save_world_model(tmp_path / "wrong-clock.pt", model, contract)
+
+
+def test_terminal_only_validation_reports_missing_motion_and_risk_positives(tmp_path):
+    from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay
+    from unilab.algos.torch.sttt.world_model.training import _validate
+    _, contract, model = physical_inputs(tmp_path)
+    raw = _physical_prefix(_raw_capture(tmp_path / "train"), 1, contract)
+    raw["terminal"][:] = True
+    raw["motion_valid"][:] = False
+    raw["risk"][:] = 1.
+    replay = EpisodeReplay(contract, capacity_transitions=32, rollout_windows=1)
+    replay.update_episode("early-terminal", raw)
+    report = _validate(model, replay, [0], batch_size=1, device=torch.device("cpu"),
+        seed=7, loss_config={}, require_windows=False)
+    assert report["window_xy_rmse_m"] is None and report["selection_score"] is None
+    assert report["risk_positive_count"] == 1 and report["risk_validation_available"]
 
 
 def test_joint_effective_updates_and_paired_resume(tmp_path):

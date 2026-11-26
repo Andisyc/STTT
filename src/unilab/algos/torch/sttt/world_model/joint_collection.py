@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 import pickle
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -53,14 +53,16 @@ class PhysicalWindow:
     timeouts: torch.Tensor
     terminal_start: RolloutStart
     reward_terms: dict[str, float]
+    diagnostics: dict[str, float] = field(default_factory=dict)
 
 
 class _Episode:
     """Preallocated episode storage; snapshots retain reset and terminal evidence."""
 
-    def __init__(self, contract, limit, initial_observation, initial_pose, identity, window_steps, initial_errors):
+    def __init__(self, contract, limit, initial_observation, initial_pose, identity, window_steps, initial_errors, *, validation=False):
         self.identity, self.steps, self.windows = identity, 0, 0
         self.window_steps, self.contract = window_steps, contract
+        self.validation = validation
         self.poses = [initial_pose]
         self.versions: list[list[int]] = []
         self.errors = np.zeros((limit + 1, 2), dtype=np.float32)
@@ -164,7 +166,9 @@ class BatchedSequenceCollector:
         self._query_observation = self._query_command = None
         self._external_residual = None
         self._reward_config = None
-        self._query_nominal = None
+        self._joint_limits = None
+        self.validation_replay = None
+        self.validation_directories = []
         policy_path = Path(str(cfg.training.play_checkpoint_path)).expanduser()
         policy_path = policy_path if policy_path.is_absolute() else Path(root_dir) / policy_path
         playback = RslRlPlaybackConfig(task="G1WalkFlat", load_run="-1", checkpoint=None,
@@ -236,6 +240,7 @@ class BatchedSequenceCollector:
 
     def bind(self, model, actor) -> None:
         self.model, self.actor = model, actor
+        self._residual_limits = actor.residual_limit_rad29.detach().cpu().numpy().copy()
         source = self.contract["source"]
         self.rollout = PlannerTrackerRollout(model, self.policy, self.profile, self.preprocessing,
             target_joint_names=source["target_joint_names"], target_default_joint_angles=source["target_default_joint_angles"],
@@ -282,11 +287,24 @@ class BatchedSequenceCollector:
         if residual.shape != (self.num_envs, 29) or not bool(torch.isfinite(residual).all()):
             raise ValueError("PPO must provide one finite physical residual per stream")
         self._external_residual = residual.detach().clone()
+        self._window_previous_residual = self._residual.detach().cpu().numpy().copy()
+        if self._joint_limits is None:
+            limits = self.session.env.get_joint_position_bounds()
+            if limits is None:
+                raise ValueError("body-limit rewards require backend joint-position bounds")
+            limits = np.asarray(limits, dtype=np.float64)
+            if limits.shape != (29, 2) or not np.isfinite(limits).all() or np.any(limits[:, 0] >= limits[:, 1]):
+                raise ValueError("body-limit rewards require 29 finite target-order joint-position bounds")
+            center = limits.mean(-1)
+            half = (limits[:, 1] - limits[:, 0]) * (.5 * rewards.joint_limit_fraction)
+            self._joint_limits = np.column_stack((center - half, center + half))
         self._reward_config = rewards
         self._window_rewards = np.zeros(self.num_envs, np.float32)
         self._window_done = np.zeros(self.num_envs, bool)
         self._window_timeouts = np.zeros(self.num_envs, bool)
         self._window_terms = {}
+        self._window_diagnostics = {}
+        self._window_live_steps = np.zeros(self.num_envs, np.int64)
         self._terminal_starts = [None] * self.num_envs
         try:
             block = self.advance(self.capture.window_steps, replay, versions=versions)
@@ -299,6 +317,9 @@ class BatchedSequenceCollector:
                 block, torch.as_tensor(self._window_rewards, device=self.device),
                 torch.as_tensor(self._window_done, device=self.device),
                 torch.as_tensor(self._window_timeouts, device=self.device), terminal, self._window_terms,
+                {name: float(np.divide(values, self._window_live_steps, out=np.zeros_like(values),
+                                       where=self._window_live_steps > 0).sum())
+                 for name, values in self._window_diagnostics.items()},
             )
         finally:
             self._external_residual = self._reward_config = None
@@ -322,7 +343,7 @@ class BatchedSequenceCollector:
         else:
             xy, speed = self._path.reference.xy.clone(), self._path.reference.speed.clone()
             xy[indices], speed[indices] = reference.xy, reference.speed
-            reference = ReferenceTrajectory(xy, speed, self.distribution.base)
+            reference = ReferenceTrajectory(xy, speed, self.distribution.base, reference.command_bounds)
             pose, progress = self._path.pose.clone(), self._path.progress.clone()
             pose[indices], progress[indices] = 0., 0.
         projected, _ = reference.project(pose, progress)
@@ -337,7 +358,8 @@ class BatchedSequenceCollector:
                                     for key, value in program.items()}
             identity = f"{self.capture_id}:{self.stream_offset + row}:{self.episode_counter}"
             self.episode_counter += 1
-            record = _Episode(self.contract, self.capture.max_episode_steps, observations[row], poses[row], identity, self.capture.window_steps, initial_errors[row])
+            record = _Episode(self.contract, self.capture.max_episode_steps, observations[row], poses[row], identity,
+                self.capture.window_steps, initial_errors[row], validation=self.rng.random() < self.capture.validation_fraction)
             if len(self._records) < self.num_envs:
                 self._records.append(record)
             else:
@@ -360,8 +382,6 @@ class BatchedSequenceCollector:
     def _transform(self, query):
         self._query_observation = query.observation_history[:, -1].detach().cpu().numpy().copy()
         self._query_command = query.command.detach().cpu().numpy().copy()
-        if self._reward_config is not None:
-            self._query_nominal = query.planner_future[:, 0].detach().cpu().numpy()
         if self._external_residual is not None:
             self._residual.copy_(self._external_residual)
             self._residual_versions[:] = (self.versions.actor, self.versions.world_model)
@@ -412,9 +432,11 @@ class BatchedSequenceCollector:
             writer.append(record.sequence())
         reference = select_path(self._path, slice(row, row + 1)).reference
         np.savez_compressed(directory / "reference.npz", xy=reference.xy[0].detach().cpu().numpy(),
-                            speed=reference.speed[0].detach().cpu().numpy())
+                            speed=reference.speed[0].detach().cpu().numpy(),
+                            **({"command_bounds": np.asarray(reference.command_bounds)} if reference.command_bounds is not None else {}))
         metadata = {"capture_id": record.identity, "episode_ids": [record.identity], "stream_id": self.stream_offset + row,
             "condition": self.condition, "label_source": "simulation", "closed_as_prefix": prefix,
+            "split": "validation" if record.validation else "train",
             "source_config": self.source_config, "reference_program": self._programs[row],
             "trajectory": asdict(self.distribution.base), "versions_actor_wm": record.versions,
             "physical_control_steps": record.steps, "reference_geometry": "reference.npz",
@@ -433,6 +455,10 @@ class BatchedSequenceCollector:
         metadata = {"stream_id": self.stream_offset + row,
                     "condition": self.condition, "versions_actor_wm": record.versions}
         try:
+            if record.validation:
+                if self.validation_replay is None:
+                    raise RuntimeError("held-out episodes require a separate validation replay")
+                replay = self.validation_replay
             replay.update_episode(record.identity, sequence, metadata=metadata)
         except ReplayVersionError as error:
             directory = self.output / "replay_failures"
@@ -460,6 +486,8 @@ class BatchedSequenceCollector:
         failures = []
         for _ in range(steps):
             self._query_observation = self._query_command = None
+            previous_joint_velocity = (np.asarray(self.session.env.get_dof_vel()).copy()
+                                       if self._reward_config is not None else None)
             self.session.step_once()
             after = self.poses.sample()
             self._update_path(after)
@@ -485,15 +513,21 @@ class BatchedSequenceCollector:
             if self._reward_config is not None:
                 live = ~self._window_done
                 motion = np.stack([record.arrays["path_delta"][record.steps - 1] for record in self._records])
-                previous = np.stack([record.arrays["actions"][record.steps - 2]
-                    if record.steps > 1 else np.zeros(29, np.float32) for record in self._records])
+                joint_positions = np.asarray(self.session.env.get_dof_pos())
+                joint_velocities = np.asarray(self.session.env.get_dof_vel())
                 tilt = np.asarray([proprio_tilt_rad(value, observation_contract=self.spec.observation_contract) for value in following])
-                reward, terms = measured_residual_reward(
-                    following=following, nominal=self._query_nominal, command=self._query_command,
-                    motion=motion, errors=errors, tilt=tilt, actions=actions, previous_actions=previous,
-                    terminated=terminated, ctrl_dt=self.profile.ctrl_dt, preprocessing=self.preprocessing,
-                    observation_contract=self.spec.observation_contract, config=self._reward_config,
+                reward, terms, diagnostics = measured_residual_reward(
+                    joint_positions=joint_positions, joint_velocities=joint_velocities,
+                    previous_joint_velocities=previous_joint_velocity, joint_limits=self._joint_limits,
+                    residual=residual, previous_residual=self._window_previous_residual,
+                    residual_dt=self.capture.window_steps * self.profile.ctrl_dt,
+                    command=self._query_command, motion=motion, errors=errors, tilt=tilt,
+                    terminated=terminated, ctrl_dt=self.profile.ctrl_dt, config=self._reward_config,
                 )
+                diagnostics["residual_saturation_fraction"] = np.mean(np.abs(residual) >= .9 * self._residual_limits, axis=-1)
+                self._window_live_steps += live
+                for name, values in diagnostics.items():
+                    self._window_diagnostics[name] = self._window_diagnostics.get(name, np.zeros(self.num_envs)) + np.where(live, values, 0.)
                 self._window_rewards += np.where(live, reward, 0.)
                 for name, values in terms.items():
                     self._window_terms[name] = self._window_terms.get(name, 0.) + float(np.where(live, values, 0.).sum())
@@ -530,7 +564,8 @@ class BatchedSequenceCollector:
                             tensor(np.linalg.norm(arrays["commands"][begin:end, :2], axis=-1)))
                         failures.append((last, measured))
                     self._store(replay, int(row))
-                    completed.append(self._persist(int(row), prefix=False))
+                    directory = self._persist(int(row), prefix=False)
+                    (self.validation_directories if record.validation else completed).append(directory)
                 self.poses.reset(indices)
                 self.session.reset_rows(indices)
                 self._new_rows(indices, self.poses.sample())
@@ -549,7 +584,8 @@ class BatchedSequenceCollector:
         for row, record in enumerate(self._records):
             if record.steps:
                 self._store(replay, row)
-                directories.append(self._persist(row, prefix=True))
+                directory = self._persist(row, prefix=True)
+                (self.validation_directories if record.validation else directories).append(directory)
         return tuple(directories)
 
     def state_dict(self):

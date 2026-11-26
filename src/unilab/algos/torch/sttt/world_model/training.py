@@ -14,7 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from .checkpoint import canonical_contract, load_world_model, save_training_checkpoint
 from .learner import WorldModelLearner
-from .losses import pretraining_loss
+from .losses import PREDICTION_STATISTICS, pretraining_loss
 from .model import LatentWorldModel, WorldModelConfig
 from .pretraining_data import PretrainingSequenceSampler
 from .sequence_data import read_sequence_metadata
@@ -22,7 +22,8 @@ from .sequence_data import read_sequence_metadata
 _TRAINING_DEFAULTS = {
     "max_updates": 200000, "batch_size": 16, "rollout_windows": 2, "cache_size": 2,
     "validation_every": 1000, "validation_batches": 16, "checkpoint_every": 1000,
-    "learning_rate": 3e-4, "weight_decay": 1e-6, "gradient_clip_norm": 100.,
+    "learning_rate": 3e-4, "weight_decay": 1e-6, "gradient_clip_norm": 10.,
+    "motion_learning_rate": 3e-5, "motion_gradient_clip_norm": 1., "warmup_updates": 1000,
     "resume_checkpoint": None, "initial_checkpoint": None, "loss": {},
     "microbatch_size": None,
 }
@@ -111,34 +112,56 @@ def _restore_rng(state: Mapping[str, Any], device: torch.device) -> None:
         torch.mps.set_rng_state(state["mps_rng_state"])
 
 
-def _validate(model: LatentWorldModel, sampler: PretrainingSequenceSampler, indices: list[int], *,
-              batch_size: int, device: torch.device, seed: int, loss_config: dict[str, float]) -> dict[str, float]:
+def _validate(model: LatentWorldModel, sampler, indices: list[int], *,
+              batch_size: int, device: torch.device, seed: int, loss_config: dict[str, float],
+              require_windows: bool = True) -> dict[str, Any]:
     random_state, was_training = _rng_state(device), model.training
     totals: dict[str, float] = {}
-    xy_sum, windows, rows = 0., 0, 0
+    statistics = {key: 0. for key in PREDICTION_STATISTICS}
+    rows = 0
     try:
         torch.manual_seed(seed)
         model.eval()
         with torch.no_grad():
             for offset in range(0, len(indices), batch_size):
                 selected = indices[offset:offset + batch_size]
-                batch = sampler.sample_indices(selected, device=device)
-                losses = pretraining_loss(model, batch, **loss_config)
+                losses = pretraining_loss(model, sampler.sample_indices(selected, device=device), **loss_config)
                 if any(not bool(torch.isfinite(value)) for value in losses.values()):
                     raise ValueError("non-finite validation world-model loss")
-                xy_sum += float(losses["window_xy_squared_error_sum"])
-                windows += int(losses["window_xy_count"])
                 for key, value in losses.items():
-                    if key not in {"window_xy_squared_error_sum", "window_xy_count"}:
+                    if key in statistics:
+                        statistics[key] += float(value)
+                    else:
                         totals[key] = totals.get(key, 0.) + float(value) * len(selected)
                 rows += len(selected)
     finally:
         _restore_rng(random_state, device)
         model.train(was_training)
-    if not windows:
+    windows = int(statistics["window_xy_count"])
+    if not windows and require_windows:
         raise ValueError("validation crops require valid physical window motion labels")
-    return {**{key: value / rows for key, value in totals.items()},
-            "window_xy_rmse_m": math.sqrt(xy_sum / windows), "window_count": windows}
+    result = {**{key: value / rows for key, value in totals.items()},
+              "window_xy_rmse_m": math.sqrt(statistics["window_xy_squared_error_sum"] / windows) if windows else None,
+              "window_yaw_rmse_rad": math.sqrt(statistics["window_yaw_squared_error_sum"] / windows) if windows else None,
+              "window_yaw_bias_rad": statistics["window_yaw_error_sum"] / windows if windows else None,
+              "window_count": windows}
+    motion_count = statistics["motion_count"]
+    result["yaw_rate_bias_rad_s"] = statistics["motion_yaw_rate_error_sum"] / motion_count if motion_count else None
+    result["yaw_rate_rmse_rad_s"] = math.sqrt(statistics["motion_yaw_rate_squared_error_sum"] / motion_count) if motion_count else None
+    for name, unit in (("joint_position", "rad"), ("joint_velocity", "rad_s"), ("gyro", "rad_s"), ("gravity", "")):
+        result[name + "_rmse" + ("_" + unit if unit else "")] = math.sqrt(
+            statistics[name + "_squared_error_sum"] / max(1, statistics["proprio_count"]))
+    positives, low, missed = (int(statistics[key]) for key in ("risk_positive_count", "risk_low_count", "risk_missed_count"))
+    result.update(risk_positive_count=positives, risk_label_count=int(statistics["risk_label_count"]),
+                  risk_false_negative_rate=missed / positives if positives else None,
+                  low_risk_event_fraction=missed / low if low else None,
+                  risk_validation_available=positives > 0)
+    result["selection_score"] = max(
+        result["window_xy_rmse_m"] / loss_config.get("window_xy_tolerance", .01),
+        result["window_yaw_rmse_rad"] / loss_config.get("window_yaw_tolerance", .02),
+        result["joint_position_rmse_rad"] / .01, result["joint_velocity_rmse_rad_s"],
+        result["gyro_rmse_rad_s"] / .1, result["gravity_rmse"] / .05) if windows else None
+    return result
 
 
 def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Path | None = None) -> dict[str, Any]:
@@ -198,9 +221,13 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     model_options = dict(raw.get("model", {}))
     if model_options.get("obs_dim") is None:
         model_options["obs_dim"] = contract["data"]["observation_dim"]
+    if model_options.get("ctrl_dt") is None:
+        model_options["ctrl_dt"] = contract["data"]["ctrl_dt"]
     config = WorldModelConfig.from_mapping(model_options)
     if config.obs_dim != contract["data"]["observation_dim"] or config.action_dim != contract["data"]["action_dim"]:
         raise ValueError("training model dimensions disagree with the captured policy contract")
+    if not math.isclose(config.ctrl_dt, contract["data"]["ctrl_dt"], rel_tol=0., abs_tol=1e-9):
+        raise ValueError("training model control period differs from the data")
     device = torch.device(raw.get("device", "cpu"))
     if device.type not in {"cpu", "cuda", "mps"}:
         raise ValueError("exact pretraining resume supports CPU, CUDA or MPS")
@@ -227,9 +254,10 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
         model, resumed_state = loaded.model, loaded.training_state
         required = {"run_id", "optimizer_state", "optimizer_steps", "rng_state", "history",
                     "sampler_state", "validation_sampler_state", "validation_indices",
-                    "data_sources", "training_signature", "best_state_dict", "best_metric", "best_step"}
-        if resumed_state.get("trainer_version") != 3 or not required <= resumed_state.keys():
-            raise ValueError("exact resume requires version-3 physical-tolerance training state; use initial_checkpoint for old WM weights")
+                    "data_sources", "training_signature", "best_state_dict", "best_metric", "best_step",
+                    "optimizer_started_at"}
+        if resumed_state.get("trainer_version") != 4 or not required <= resumed_state.keys():
+            raise ValueError("exact resume requires version-4 velocity-readout training state")
         if resumed_state["training_signature"] != signature or resumed_state["data_sources"] != sources:
             raise ValueError("resume training configuration or data identity changed")
         if resumed_state["validation_indices"] != validation_indices:
@@ -263,12 +291,16 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     optimizer = learner.optimizer
     if resumed_state:
         optimizer.load_state_dict(resumed_state["optimizer_state"])
+        origin = resumed_state["optimizer_started_at"]
+        if type(origin) is not int or not 0 <= origin <= optimizer_steps:
+            raise ValueError("invalid restored WM optimizer warmup origin")
+        learner.optimizer_started_at = origin
         _restore_rng(resumed_state, device)
 
     def export_best(physical_model: LatentWorldModel) -> None:
         save_training_checkpoint(best_path, physical_model, contract, run_id=run_id, training_state={
-            "trainer_version": 3, "run_id": run_id, "optimizer_steps": best_step,
-            "selection_metric": "window_xy_rmse_m", "best_metric": best_metric, "loss_config": loss_config,
+            "trainer_version": 4, "run_id": run_id, "optimizer_steps": best_step,
+            "selection_metric": "physical_prediction_score", "best_metric": best_metric, "loss_config": loss_config,
         })
 
     if best_state is not None and existing_best_step != best_step:
@@ -293,16 +325,17 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
             train_metrics = {key: value for key, value in losses.items()
                              if key not in {"window_xy_squared_error_sum", "window_xy_count"}}
             history.append({"optimizer_steps": optimizer_steps, "train": train_metrics, "validation": validation})
-            metric = validation["window_xy_rmse_m"]
+            metric = validation["selection_score"]
             if best_metric is None or metric < best_metric:
                 best_metric, best_step = metric, optimizer_steps
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 improved = True
-            print(json.dumps({"optimizer_steps": optimizer_steps, "validation": validation, "best_window_xy_rmse_m": best_metric}), flush=True)
+            print(json.dumps({"optimizer_steps": optimizer_steps, "validation": validation, "best_prediction_score": best_metric}), flush=True)
         if optimizer_steps % integers["checkpoint_every"] == 0 or final:
             optimizer.zero_grad(set_to_none=True)
             state = {
-                "trainer_version": 3, "run_id": run_id, "optimizer_steps": optimizer_steps, "loss_config": loss_config,
+                "trainer_version": 4, "run_id": run_id, "optimizer_steps": optimizer_steps, "loss_config": loss_config,
+                "optimizer_started_at": learner.optimizer_started_at,
                 "optimizer_state": optimizer.state_dict(), "history": history,
                 "sampler_state": sampler.state_dict(), "validation_sampler_state": validation_sampler.state_dict(),
                 "validation_indices": validation_indices, "data_sources": sources,
@@ -315,4 +348,4 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     model.eval()
     return {"checkpoint_path": str(last_path), "best_checkpoint_path": str(best_path),
             "history": history, "optimizer_steps": optimizer_steps, "best_step": best_step,
-            "best_window_xy_rmse_m": best_metric, "validation": history[-1]["validation"], "contract": contract}
+            "best_prediction_score": best_metric, "validation": history[-1]["validation"], "contract": contract}

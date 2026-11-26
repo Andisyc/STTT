@@ -170,23 +170,37 @@ def test_context_update_crosses_real_tracker_and_wm_without_updating_weights(tmp
         assert torch.count_nonzero(resumed.context) == 0 and not resumed.optimizer.state
 
 
-@pytest.mark.parametrize("contract,offset", [("official_compact_64_v1", 3), ("g1_fada_state_v2", 6)])
-def test_measured_dense_reward_penalizes_joint_errors_and_real_failure(contract, offset):
-    width = 64 if offset == 3 else 66
-    actual = np.zeros((3, width), np.float32)
-    actual[1, offset + 17] = .5
-    actual[1, offset + 29 + 17] = 2.
-    nominal = np.zeros_like(actual)
-    reward, terms = measured_residual_reward(following=actual, nominal=nominal,
+def test_measured_dense_reward_uses_physical_limits_acceleration_and_failure():
+    position = np.zeros((3, 29))
+    position[1, 17] = .5
+    velocity = np.zeros_like(position)
+    velocity[1, 17] = 2.
+    reward, terms, diagnostics = measured_residual_reward(
+        joint_positions=position, joint_velocities=velocity, previous_joint_velocities=np.zeros_like(velocity),
+        joint_limits=np.tile([-.2, .2], (29, 1)), residual=np.zeros((3, 29)),
+        previous_residual=np.zeros((3, 29)), residual_dt=.2,
         command=np.zeros((3, 3)), motion=np.zeros((3, 3)), errors=np.zeros((3, 2)), tilt=np.zeros(3),
-        actions=np.zeros((3, 29)), previous_actions=np.zeros((3, 29)), terminated=np.array([False, False, True]),
-        ctrl_dt=.02, preprocessing={"term_scale": {"dof_pos": 2., "dof_vel": .5}},
-        observation_contract=contract, config=ResidualRewardConfig())
+        terminated=np.array([False, False, True]), ctrl_dt=.02, config=ResidualRewardConfig())
     assert reward[0] > reward[1] > reward[2]
-    assert terms["joint_position"][1] < terms["joint_position"][0]
-    assert terms["joint_velocity"][1] < terms["joint_velocity"][0]
+    assert terms["joint_limit"][1] < terms["joint_limit"][0]
+    assert terms["joint_acceleration"][1] < terms["joint_acceleration"][0]
     assert reward[2] - reward[0] == pytest.approx(-200.)
-    assert not np.any(nominal)
+    assert diagnostics["joint_limit_excess_rad"][1] == pytest.approx(.3)
+
+
+def test_constant_nonzero_trim_is_not_penalized_but_changing_trim_is():
+    def evaluate(previous):
+        return measured_residual_reward(
+            joint_positions=np.zeros((1, 29)), joint_velocities=np.zeros((1, 29)),
+            previous_joint_velocities=np.zeros((1, 29)), joint_limits=np.tile([-1., 1.], (29, 1)),
+            residual=np.full((1, 29), .005), previous_residual=previous, residual_dt=.2,
+            command=np.zeros((1, 3)), motion=np.zeros((1, 3)), errors=np.zeros((1, 2)),
+            tilt=np.zeros(1), terminated=np.zeros(1, bool), ctrl_dt=.02, config=ResidualRewardConfig())
+    steady, steady_terms, _ = evaluate(np.full((1, 29), .005))
+    changing, changing_terms, _ = evaluate(np.zeros((1, 29)))
+    assert steady_terms["residual_rate"][0] == 0.
+    assert changing_terms["residual_rate"][0] < 0.
+    assert steady[0] > changing[0]
 
 
 def test_timeout_bootstraps_physical_terminal_not_preaction_or_reset_state(tmp_path):
@@ -245,6 +259,7 @@ def test_two_stage_entry_reaches_native_ppo_context_and_frozen_wm(tmp_path):
     cfg.policy_checkpoint, cfg.output_dir = str(policy), str(tmp_path / "joint")
     cfg.capture.initial = False
     cfg.capture.num_envs = 1
+    cfg.capture.conditions = [{"name": "nominal", "source_overrides": []}]
     cfg.capture.initial_min_transitions = 4
     cfg.capture.max_episode_steps = 4
     cfg.capture.steps_per_iteration = cfg.capture.window_steps = 2
@@ -261,10 +276,18 @@ def test_two_stage_entry_reaches_native_ppo_context_and_frozen_wm(tmp_path):
     for name in cfg.schedule:
         cfg.schedule[name] = 1
     cfg.replay.capacity_transitions = 32
-    cfg.evaluation.enabled = False
+    cfg.evaluation.enabled = True
+    cfg.evaluation.num_steps = 4
+    cfg.evaluation.seeds = [1]
+    cfg.evaluation.trajectories = [{"kind": "straight", "speed_m_s": .35}]
     result = run_joint_pretraining(cfg, root_dir=ROOT, playback_deps=case.deps)
     assert result["training_complete"] and result["base_updates"] == result["film_updates"] == 1
     assert result["wm_updates"] == 2 and result["physical_control_steps"] == 8
+    assert result["physical_timing"]["wm_horizon_s"] == pytest.approx(.04)
+    assert result["latest_pair"]["stage"] == "film"
+    assert set(result["best_pairs"]) == {"base", "film"}
+    assert (tmp_path / "joint/evaluation/base_0000001/summary.json").is_file()
+    assert (tmp_path / "joint/evaluation/film_0000002/summary.json").is_file()
     base = load_world_model(tmp_path / "joint/base_world_model.pt")
     final = load_world_model(result["world_model_checkpoint"])
     for name, value in base.model.state_dict().items():

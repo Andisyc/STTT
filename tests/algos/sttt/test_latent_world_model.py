@@ -363,10 +363,10 @@ def test_public_training_resume_and_whole_capture_split(tmp_path):
                 "validation_indices", "best_metric", "best_step", "best_state_dict"):
         exact(resumed.training_state[key], continuous.training_state[key])
     assert resumed.training_state["optimizer_steps"] == 3
-    assert resumed.training_state["best_metric"] == min(row["validation"]["window_xy_rmse_m"] for row in full["history"])
+    assert resumed.training_state["best_metric"] == min(row["validation"]["selection_score"] for row in full["history"])
     best = load_world_model(second["best_checkpoint_path"])
     exact(best.model.state_dict(), resumed.training_state["best_state_dict"])
-    assert best.training_state["selection_metric"] == "window_xy_rmse_m"
+    assert best.training_state["selection_metric"] == "physical_prediction_score"
     for key, source in (("validation_dirs", "train"), ("validation_dirs", "copied")):
         bad = deepcopy(cfg)
         bad["data"][key] = [str(tmp_path / source)]

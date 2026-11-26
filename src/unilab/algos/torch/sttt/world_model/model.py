@@ -33,6 +33,7 @@ class WorldModelConfig:
     norm_eps: float = 1e-4
     unimix: float = 0.01
     action_scale: tuple[float, ...] | None = None
+    ctrl_dt: float = .02
 
     def __post_init__(self) -> None:
         integer_fields = ("obs_dim", "action_dim", "embed_dim", "hidden_dim", "belief_dim", "stoch_groups", "stoch_classes", "num_blocks", "dynamics_layers", "prior_layers", "posterior_layers", "encoder_layers", "decoder_layers", "head_layers")
@@ -46,6 +47,8 @@ class WorldModelConfig:
             raise ValueError("belief_dim must be divisible by num_blocks")
         if not math.isfinite(self.norm_eps) or self.norm_eps <= 0 or not math.isfinite(self.unimix) or not 0 <= self.unimix < 1:
             raise ValueError("invalid normalization epsilon or categorical unimix")
+        if isinstance(self.ctrl_dt, bool) or not math.isfinite(self.ctrl_dt) or self.ctrl_dt <= 0:
+            raise ValueError("world-model ctrl_dt must be positive and finite")
         if self.action_scale is not None:
             if not isinstance(self.action_scale, Sequence) or len(self.action_scale) != self.action_dim or any(isinstance(x, bool) or not math.isfinite(x) or x <= 0 for x in self.action_scale):
                 raise ValueError("action_scale must contain 29 finite positive fixed scales")
@@ -149,9 +152,9 @@ class LatentWorldModel(nn.Module):
         return self.proprio_decoder(latent.feature())
 
     def motion(self, latent: LatentState, action: torch.Tensor) -> torch.Tensor:
-        """One control interval in its starting horizontal body-heading frame."""
-        raw = self.motion_head(latent.feature(), self.normalize_action(action))
-        return torch.cat((raw[..., :2], torch.atan2(raw[..., 2:].sin(), raw[..., 2:].cos())), -1)
+        """Interval-average local velocity integrated over the checkpoint's control period."""
+        increment = self.motion_head(latent.feature(), self.normalize_action(action)) * self.config.ctrl_dt
+        return torch.cat((increment[..., :2], torch.atan2(increment[..., 2:].sin(), increment[..., 2:].cos())), -1)
 
     def risk(self, latent: LatentState, action: torch.Tensor) -> torch.Tensor:
         return self.risk_head(latent.feature(), self.normalize_action(action))

@@ -13,7 +13,8 @@ from .trajectory import PathState, ReferenceTrajectory
 
 
 def select_path(path: PathState, index) -> PathState:
-    return PathState(ReferenceTrajectory(path.reference.xy[index], path.reference.speed[index], path.reference.config),
+    return PathState(ReferenceTrajectory(path.reference.xy[index], path.reference.speed[index], path.reference.config,
+                                         path.reference.command_bounds),
                      path.pose[index], path.progress[index])
 
 
@@ -30,10 +31,11 @@ def join_rollout_starts(starts: Sequence[RolloutStart]) -> RolloutStart:
         raise ValueError("real-history actor starts require explicit reference states")
     paths = [start.path_state for start in starts if start.path_state is not None]
     config = paths[0].reference.config
-    if any(path.reference.config != config for path in paths):
+    if any(path.reference.config != config or path.reference.command_bounds != paths[0].reference.command_bounds for path in paths):
         raise ValueError("joint actor starts must share the reference preview contract")
     reference = ReferenceTrajectory(torch.cat([path.reference.xy for path in paths]),
-                                    torch.cat([path.reference.speed for path in paths]), config)
+                                    torch.cat([path.reference.speed for path in paths]), config,
+                                    paths[0].reference.command_bounds)
     values: dict[str, Any] = {item.name: torch.cat([getattr(start, item.name) for start in starts])
                              for item in fields(starts[0]) if item.name not in {"latent", "path_state"}}
     values["latent"] = LatentState(torch.cat([start.latent.state for start in starts]),

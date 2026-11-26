@@ -28,6 +28,7 @@ class JointSchedule:
     film_iterations: int
     wm_updates_per_iteration: int
     checkpoint_every: int
+    evaluation_every: int = 125
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -52,6 +53,7 @@ class CaptureSchedule:
     command_ranges: Any
     conditions: tuple[dict[str, Any], ...]
     random_residual_probability: float = .1
+    validation_fraction: float = .1
 
     def __post_init__(self) -> None:
         if type(self.initial) is not bool:
@@ -73,6 +75,8 @@ class CaptureSchedule:
                 raise ValueError("set an explicit finite nonnegative capture residual amplitude")
         if isinstance(self.random_residual_probability, bool) or not math.isfinite(self.random_residual_probability) or not 0 <= self.random_residual_probability <= 1:
             raise ValueError("capture.random_residual_probability must be in [0,1]")
+        if isinstance(self.validation_fraction, bool) or not math.isfinite(self.validation_fraction) or not 0 <= self.validation_fraction < 1:
+            raise ValueError("capture.validation_fraction must be in [0,1)")
         if not self.conditions or len(self.conditions) > self.num_envs:
             raise ValueError("provide at least one physical condition and at least one stream per condition")
         names = set()
@@ -119,6 +123,8 @@ class JointTrainingConfig:
             raise ValueError("WM forecast and collection block must cover the same complete residual windows")
         if positive_count(raw["actor"]["training"]["horizon_windows"], "actor.training.horizon_windows") * capture.window_steps != horizon:
             raise ValueError("actor and WM forecast horizons must agree")
+        if positive_count(raw["context_adaptation"]["horizon_windows"], "context_adaptation.horizon_windows") * capture.window_steps != horizon:
+            raise ValueError("context adaptation and WM forecast horizons must agree")
         if raw["wm"]["training"]["max_updates"] != schedule.pretrain_wm_updates or raw["actor"]["training"]["max_updates"] != schedule.base_iterations:
             raise ValueError("joint execution budgets must be owned by schedule (use YAML interpolation)")
         return cls(cast(dict[str, Any], raw), schedule, capture, capacity)

@@ -188,8 +188,23 @@ def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str,
     if ppo_minibatches is not None and (type(ppo_minibatches) is not int or ppo_minibatches < 1):
         raise ValueError("PPO minibatch count must be a positive integer")
 
-    train = sorted(relative(p.parent) for p in (data_dir / "capture" / "nominal").glob("*/metadata.json"))
-    validation = sorted(relative(p.parent) for p in (data_dir / "validation").rglob("metadata.json"))
+    captures = {}
+    for default_split, manifests in (
+            ("train", (data_dir / "capture").rglob("metadata.json")),
+            ("validation", (data_dir / "validation").rglob("metadata.json"))):
+        for manifest_path in manifests:
+            directory = manifest_path.parent
+            sidecar = directory / "capture.json"
+            identity = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
+            split = identity.get("split", default_split)
+            if split not in ("train", "validation"):
+                raise ValueError(f"unknown capture split: {directory}")
+            key = split, tuple(identity.get("episode_ids") or [relative(directory)])
+            count = json.loads(manifest_path.read_text())["transition_count"]
+            if key not in captures or count > captures[key][0]:
+                captures[key] = count, relative(directory)
+    train = sorted(value[1] for key, value in captures.items() if key[0] == "train")
+    validation = sorted(value[1] for key, value in captures.items() if key[0] == "validation")
     if not train or not validation:
         raise RuntimeError("指定目录中缺少已采集的训练集或验证集；不会重新采集初始数据。")
     if not checkpoint.is_file():

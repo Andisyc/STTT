@@ -52,6 +52,7 @@ class ReferenceTrajectory:
     xy: torch.Tensor
     speed: torch.Tensor
     config: TrajectoryConfig
+    command_bounds: tuple[tuple[float, float], ...] | None = None
     delta: torch.Tensor = field(init=False, repr=False)
     length: torch.Tensor = field(init=False, repr=False)
     arc: torch.Tensor = field(init=False, repr=False)
@@ -63,6 +64,10 @@ class ReferenceTrajectory:
             raise ValueError("reference speeds must match points")
         if not self.xy.is_floating_point() or not bool(torch.isfinite(self.xy).all()) or not bool(torch.isfinite(self.speed).all()) or bool((self.speed < 0).any()):
             raise ValueError("reference points/speeds must be finite with nonnegative speeds")
+        if self.command_bounds is not None:
+            bounds = np.asarray(self.command_bounds)
+            if bounds.shape != (3, 2) or not np.isfinite(bounds).all() or np.any(bounds[:, 0] > bounds[:, 1]):
+                raise ValueError("reference command bounds require finite ordered [vx,vy,yaw_rate] pairs")
         delta = self.xy[:, 1:] - self.xy[:, :-1]
         length = delta.norm(dim=-1)
         if bool((length <= 1e-8).any()):
@@ -102,7 +107,7 @@ class ReferenceTrajectory:
         return cls(xy.unsqueeze(0).expand(batch_size, -1, -1).clone(),
                    xy.new_full((batch_size, config.samples), config.speed_m_s), config)
 
-    def sample(self, progress: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _sample_geometry(self, progress: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if progress.ndim != 2 or progress.shape[0] != self.xy.shape[0]:
             raise ValueError("sample progress requires [batch,queries]")
         progress = progress.clamp_min(0).minimum(self.arc[:, -1:])
@@ -114,6 +119,19 @@ class ReferenceTrajectory:
         delta = self.delta.gather(1, index[..., None].expand(-1, -1, 2))
         a, b = self.speed.gather(1, index), self.speed.gather(1, index + 1)
         return point + fraction * delta, delta / length[..., None], a + fraction[..., 0] * (b - a)
+
+    def sample(self, progress: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        point, tangent, speed = self._sample_geometry(progress)
+        if self.command_bounds is not None:
+            _, ahead, _ = self._sample_geometry(progress + self.config.preview_spacing_m)
+            turn = wrap_to_pi(torch.atan2(ahead[..., 1], ahead[..., 0]) - torch.atan2(tangent[..., 1], tangent[..., 0]))
+            curvature = turn / self.config.preview_spacing_m
+            lower, upper = self.command_bounds[2]
+            limit = torch.where(curvature >= 0, curvature.new_tensor(max(0., upper)),
+                                curvature.new_tensor(max(0., -lower)))
+            cap = torch.where(curvature.abs() > 1e-8, limit / curvature.abs().clamp_min(1e-8), speed)
+            speed = torch.minimum(speed, cap)
+        return point, tangent, speed
 
     def project(self, pose: torch.Tensor, previous_progress: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if pose.shape != (self.xy.shape[0], 3) or previous_progress.shape != (self.xy.shape[0],):
@@ -168,6 +186,17 @@ class PathState:
         curvature = torch.atan2(look[:, 1, 3], look[:, 1, 2]) - torch.atan2(look[:, 0, 3], look[:, 0, 2])
         yaw_rate = speed[:, 0] * wrap_to_pi(curvature) / self.reference.config.preview_spacing_m
         velocity = torch.stack((speed[:, 0] * relative.cos(), speed[:, 0] * relative.sin(), yaw_rate), -1)
+        if self.reference.command_bounds is not None:
+            bounds = velocity.new_tensor(self.reference.command_bounds)
+            # Scale planar velocity together, preserving its path direction.
+            planar = velocity[:, :2]
+            ratios = torch.where(planar > bounds[:2, 1],
+                                 bounds[:2, 1] / planar.clamp_min(1e-8), torch.ones_like(planar))
+            ratios = torch.where(planar < bounds[:2, 0],
+                                 bounds[:2, 0] / planar.clamp_max(-1e-8), ratios)
+            velocity = torch.cat((planar * ratios.amin(-1, keepdim=True).clamp(0., 1.),
+                                  velocity[:, 2:].clamp(bounds[2, 0], bounds[2, 1])), -1)
+            velocity = velocity.clamp(bounds[:, 0], bounds[:, 1])
         return torch.cat((velocity, template[:, 3:]), -1)
 
     def advance(self, motion: torch.Tensor) -> PathState:

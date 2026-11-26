@@ -17,6 +17,7 @@ schedule:
   film_iterations: 1000
   wm_updates_per_iteration: 8
   checkpoint_every: 2500
+  evaluation_every: 125  # PPO iterations; independent of the low-frequency replay checkpoint.
 replay:
   capacity_transitions: 1000000
 capture:
@@ -24,6 +25,7 @@ capture:
   num_envs: 64
   initial_min_transitions: 1000000
   validation_episodes: 10
+  validation_fraction: 0.1  # Assigned at reset, before any prefix enters WM replay.
   steps_per_iteration: 20  # PWM H=16 rounded up to two project residual windows.
   max_episode_steps: 1000
   window_steps: 10
@@ -35,6 +37,18 @@ capture:
   conditions:
     - name: nominal
       source_overrides: []
+    - name: payload
+      source_overrides:
+        - env.domain_rand.randomize_base_mass=true
+        - env.domain_rand.added_mass_range=[0.0,1.5]
+        - env.domain_rand.random_com=true
+        - env.domain_rand.com_offset_x=[0.0,0.0]
+        - env.domain_rand.com_offset_y=[-0.03,0.03]
+        - env.domain_rand.com_offset_z=[0.0,0.0]
+    - name: friction
+      source_overrides:
+        - env.domain_rand.randomize_ground_friction=true
+        - env.domain_rand.ground_friction_multiplier_range=[0.8,1.2]
 wm:
   device: ${device}
   seed: ${seed}
@@ -82,16 +96,17 @@ context_adaptation:
   horizon_windows: ${actor.training.horizon_windows}
   max_grad_norm: ${actor.training.max_grad_norm}
 rewards:
-  joint_position_weight: 0.75
-  joint_velocity_weight: 0.5
+  joint_limit_weight: 1.0
+  joint_acceleration_weight: 0.00000725
   velocity_weight: 1.0
   yaw_rate_weight: 0.5
   posture_weight: 1.0
   path_weight: 1.0
-  action_rate_weight: 0.01
+  residual_rate_weight: 0.01
   termination_cost: 200.0
-  joint_position_tolerance_rad: 0.25
-  joint_velocity_tolerance_rad_s: 2.0
+  joint_limit_fraction: 0.9
+  joint_limit_tolerance_rad: 0.1
+  residual_rate_tolerance_rad_s: 0.025
   velocity_tolerance_m_s: 0.5
   yaw_rate_tolerance_rad_s: 1.0
   lateral_tolerance_m: 0.3

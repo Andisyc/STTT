@@ -50,6 +50,7 @@ class SyntheticEnv:
     def get_base_ang_vel(self): return np.array([[0., 0., 0.5]])
     def get_dof_pos(self): return np.linspace(0.1, 0.3, 29)[None] + self.tick * 0.001
     def get_dof_vel(self): return np.zeros((1, 29))
+    def get_joint_position_bounds(self): return np.tile([-1., 1.], (29, 1))
     def set_autoreset(self, enabled): self.autoreset = enabled
     def close(self): self.closed = True
 

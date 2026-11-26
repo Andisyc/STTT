@@ -40,8 +40,12 @@ def sample_command_reference(config: TrajectoryConfig, bounds: Any, *, episode_s
             raise ValueError("initial reference offsets require ordered finite bounds")
     period = round(resampling_s / ctrl_dt)
     count = episode_steps + horizon_steps
-    sampled = rng.uniform(bounds[:, 0], bounds[:, 1], (batch_size, math.ceil(count / period), 3))
-    velocities = np.repeat(sampled, period, axis=1)[:, :count]
+    sampled = rng.uniform(bounds[:, 0], bounds[:, 1], (batch_size, math.ceil(count / period) + 1, 3))
+    instant = np.arange(count)
+    segment = instant // period
+    fraction = (instant % period) / period
+    blend = (fraction * fraction * (3. - 2. * fraction))[None, :, None]
+    velocities = sampled[:, segment] * (1. - blend) + sampled[:, segment + 1] * blend
     theta = np.concatenate((np.zeros((batch_size, 1)), np.cumsum(velocities[..., 2] * ctrl_dt, axis=1)), axis=1)
     c, s = np.cos(theta[:, :-1]), np.sin(theta[:, :-1])
     delta = ctrl_dt * np.stack((c * velocities[..., 0] - s * velocities[..., 1],
@@ -72,7 +76,9 @@ def sample_command_reference(config: TrajectoryConfig, bounds: Any, *, episode_s
     c, s = np.cos(rotation)[:, None], np.sin(rotation)[:, None]
     xy = np.stack((c * xy[..., 0] + s * xy[..., 1], -s * xy[..., 0] + c * xy[..., 1] - lateral[:, None]), axis=-1)
     reference = ReferenceTrajectory(torch.as_tensor(xy, device=device, dtype=dtype),
-                                    torch.as_tensor(speeds, device=device, dtype=dtype), config)
+                                    torch.as_tensor(speeds, device=device, dtype=dtype), config,
+                                    tuple(tuple(float(value) for value in pair) for pair in bounds))
     return reference, {"resampling_control_steps": period, "desired_commands": sampled.tolist(),
-                       "initial_lateral_m": lateral.tolist(), "initial_heading_rad": heading.tolist(),
-                       "command_ranges": bounds.tolist(), "reference": "fixed_from_desired_commands_at_episode_reset"}
+                       "interpolation": "smoothstep", "initial_lateral_m": lateral.tolist(),
+                       "initial_heading_rad": heading.tolist(), "command_ranges": bounds.tolist(),
+                       "reference": "fixed_from_desired_commands_at_episode_reset"}

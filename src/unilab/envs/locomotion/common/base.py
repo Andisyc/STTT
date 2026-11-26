@@ -124,6 +124,10 @@ class LocomotionBaseEnv(NpEnv):
         dof_pos: np.ndarray = self._backend.get_dof_pos()
         return dof_pos
 
+    def get_joint_position_bounds(self) -> np.ndarray | None:
+        """Cold-path joint limits in the same target order as get_dof_pos()."""
+        return self._backend.get_joint_range()
+
     def get_dof_vel(self) -> np.ndarray:
         dof_vel: np.ndarray = self._backend.get_dof_vel()
         return dof_vel

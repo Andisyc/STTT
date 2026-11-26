@@ -66,9 +66,11 @@ class ResidualControlEnv:
         if self.context_adapter is not None and bool(done.any()):
             self.context_adapter.reset(done)
         observation = self.refresh()
-        terms = {}
+        terms, diagnostics = {}, {}
         for outcome in outcomes:
             for name, value in outcome.reward_terms.items():
                 terms[name] = terms.get(name, 0.) + value / self.num_envs
+            for name, value in outcome.diagnostics.items():
+                diagnostics[name] = diagnostics.get(name, 0.) + value / self.num_envs
         return observation, reward, done, {"time_outs": timeouts, "terminal_observation": terminal_obs,
-            "reward_terms": terms, **self.last_context_metrics}
+            "reward_terms": terms, "body_metrics": diagnostics, **self.last_context_metrics}

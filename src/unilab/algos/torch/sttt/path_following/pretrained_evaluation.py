@@ -36,7 +36,8 @@ def score_capture(directory: Path, trajectory: TrajectoryConfig, requested_steps
             raise ValueError("reference geometry must remain inside its capture directory")
         with np.load(directory / filename, allow_pickle=False) as archive:
             geometry = ReferenceTrajectory(torch.from_numpy(archive["xy"].copy()).double()[None],
-                torch.from_numpy(archive["speed"].copy()).double()[None], trajectory)
+                torch.from_numpy(archive["speed"].copy()).double()[None], trajectory,
+                tuple(map(tuple, archive["command_bounds"].tolist())) if "command_bounds" in archive else None)
     for timestamp, item in sorted(receipts.items()):
         pose = TimedPelvisPose(item["sequence_id"], item["tracking_epoch"], timestamp,
                               np.asarray(item["navigation_from_pelvis"]), True,
@@ -128,7 +129,7 @@ def score_forecasts(directory: Path, *, risk_threshold: float) -> list[dict[str,
 def evaluate_pretrained_actor(cfg: Mapping[str, Any], *, root_dir: str | Path, output_dir: str | Path,
                               policy_checkpoint: str | Path, profile_path: str | None,
                               world_model_checkpoint: str | Path, actor_checkpoint: str | Path,
-                              source_overrides: list[str], device: str = "cpu", conditions=None) -> dict[str, Any]:
+                              source_overrides: list[str], device: str = "cpu", conditions=None, playback_deps=None) -> dict[str, Any]:
     from unilab.algos.torch.sttt.path_following.pretraining import capture_configuration
     from unilab.training import ensure_registries
 
@@ -180,7 +181,7 @@ def evaluate_pretrained_actor(cfg: Mapping[str, Any], *, root_dir: str | Path, o
                         actor_checkpoint=actor_checkpoint if mode != "nominal" else None,
                         world_model_checkpoint=world_model_checkpoint if mode != "nominal" else None,
                         forecast_windows=horizon if mode != "nominal" else None,
-                        adapt_context=mode == "adaptive_context")
+                        adapt_context=mode == "adaptive_context", playback_deps=playback_deps)
                     if result["localization_invalidated"] or result["reset_crossed"]:
                         raise RuntimeError("evaluation crossed a physical/localization boundary")
                     metrics, observation, matrix = score_capture(directory, trajectory, cfg["num_steps"])

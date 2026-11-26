@@ -94,6 +94,8 @@ class PlannerTrackerRollout:
             raise ValueError("latent rollout requires a continuous or command_fixed source clock")
         if any(not math.isfinite(value) or value <= 0 for value in (profile.ctrl_dt, profile.gait_frequency)):
             raise ValueError("latent rollout requires positive finite source timing")
+        if not math.isclose(model.config.ctrl_dt, profile.ctrl_dt, rel_tol=0., abs_tol=1e-9):
+            raise ValueError("WM integration period and Planner–Tracker clock differ")
         if profile.clip_actions is not None and (not math.isfinite(profile.clip_actions) or profile.clip_actions <= 0):
             raise ValueError("invalid source action clip")
         self.preprocessing = validate_execution_preprocessing(preprocessing)

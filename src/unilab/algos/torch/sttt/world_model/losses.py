@@ -17,6 +17,15 @@ if TYPE_CHECKING:
     from .pretraining_data import PretrainingBatch
 
 
+PREDICTION_STATISTICS = (
+    "window_xy_squared_error_sum", "window_xy_count", "window_yaw_squared_error_sum",
+    "window_yaw_error_sum", "motion_yaw_rate_error_sum", "motion_yaw_rate_squared_error_sum", "motion_count",
+    "joint_position_squared_error_sum", "joint_velocity_squared_error_sum",
+    "gyro_squared_error_sum", "gravity_squared_error_sum", "proprio_count",
+    "risk_positive_count", "risk_label_count", "risk_low_count", "risk_missed_count",
+)
+
+
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask = mask.bool()
     while mask.ndim < value.ndim:
@@ -121,13 +130,16 @@ def world_model_loss(
         open_logits.append(logits)
         predicted_observations.append(model.decode(latent))
     motion_prediction = torch.stack(predicted_motion, 1)
-    prior_reconstruction = _masked_mean(((torch.stack(predicted_observations, 1) - observations[:, 1:].detach()) * model.proprio_loss_weight).square().mean(-1), transition_valid)
+    prior_error = (torch.stack(predicted_observations, 1) - observations[:, 1:].detach()) * model.proprio_loss_weight
+    prior_reconstruction = _masked_mean(prior_error.square().mean(-1), transition_valid)
     overshoot = _masked_mean(_categorical_kl(posterior_logits[:, 1:].detach(), torch.stack(open_logits, 1), model.config.unimix).clamp_min(free_nats), transition_valid)
     motion_mask = batch["motion_valid"].bool() & transition_valid
     motion_target = torch.where(motion_mask[..., None], batch["path_delta"], 0.)
     duration = (batch["timestamps_ns"][:, 1:] - batch["timestamps_ns"][:, :-1]).to(actions.dtype) * 1e-9
     if bool((motion_mask & (duration <= 0)).any()):
         raise ValueError("valid motion transitions require advancing physical timestamps")
+    if bool((motion_mask & ~torch.isclose(duration, duration.new_tensor(model.config.ctrl_dt), rtol=0., atol=1e-8)).any()):
+        raise ValueError("motion timestamps differ from the world-model control period")
     duration = torch.where(motion_mask, duration, 1.)
     step_tolerance = duration[..., None] * actions.new_tensor(
         (motion_velocity_tolerance, motion_velocity_tolerance, motion_yaw_rate_tolerance))
@@ -162,10 +174,25 @@ def world_model_loss(
     window_loss = _masked_mean(_motion_error(continuous_prediction, continuous_target, window_tolerance), window_mask)
     window_xy_error = (window_prediction[..., :2] - window_target[..., :2]).square().sum(-1)
     window_xy_sum = torch.where(window_mask, window_xy_error, 0.).sum()
+    window_yaw_error = predicted_turn - target_turn
+    yaw_rate_error = (motion_prediction[..., 2] - motion_target[..., 2]) / duration
     risk_target = batch["risk"].detach().to(observations)
     risk_mask = batch["risk_valid"].bool() & transition_mask
+    risk_logits = torch.stack(predicted_risk, 1)
+    risk_positive = risk_target[..., 0] > .5
+    risk_low = risk_logits[..., 0] < 0.
     # Terminal transitions remain valid risk labels even without usable next proprio.
-    risk_loss = _masked_mean(F.binary_cross_entropy_with_logits(torch.stack(predicted_risk, 1), torch.where(risk_mask[..., None], risk_target, 0.), reduction="none"), risk_mask)
+    risk_loss = _masked_mean(F.binary_cross_entropy_with_logits(risk_logits, torch.where(risk_mask[..., None], risk_target, 0.), reduction="none"), risk_mask)
+    position = slice(3, 32) if model.config.obs_dim == 64 else slice(6, 35)
+    velocity = slice(32, 61) if model.config.obs_dim == 64 else slice(35, 64)
+    gravity = slice(61, 64) if model.config.obs_dim == 64 else slice(3, 6)
+    physical_sums = {
+        name + "_squared_error_sum": torch.where(transition_valid,
+            (prior_error[..., index] * tolerance).square().mean(-1), 0.).sum()
+        for name, index, tolerance in (
+            ("joint_position", position, .01), ("joint_velocity", velocity, 1.),
+            ("gyro", slice(0, 3), .1), ("gravity", gravity, .05))
+    }
     total = reconstruction_scale * reconstruction + kl_scale * kl + prior_reconstruction_scale * prior_reconstruction + overshoot_scale * overshoot + motion_scale * (motion_loss + window_scale * window_loss) + risk_scale * risk_loss
     return {
         "loss": total, "reconstruction_loss": reconstruction, "prior_reconstruction_loss": prior_reconstruction,
@@ -173,6 +200,13 @@ def world_model_loss(
         "representation_kl": _masked_mean(representation_kl, observation_valid), "overshoot_loss": overshoot,
         "motion_loss": motion_loss, "window_loss": window_loss, "risk_loss": risk_loss,
         "window_xy_squared_error_sum": window_xy_sum, "window_xy_count": window_mask.sum(),
+        "window_yaw_squared_error_sum": torch.where(window_mask, window_yaw_error.square(), 0.).sum(),
+        "window_yaw_error_sum": torch.where(window_mask, window_yaw_error, 0.).sum(),
+        "motion_yaw_rate_error_sum": torch.where(motion_mask, yaw_rate_error, 0.).sum(),
+        "motion_yaw_rate_squared_error_sum": torch.where(motion_mask, yaw_rate_error.square(), 0.).sum(),
+        "motion_count": motion_mask.sum(), "proprio_count": transition_valid.sum(), **physical_sums,
+        "risk_positive_count": (risk_positive & risk_mask).sum(), "risk_label_count": risk_mask.sum(),
+        "risk_low_count": (risk_low & risk_mask).sum(), "risk_missed_count": (risk_low & risk_positive & risk_mask).sum(),
     }
 
 

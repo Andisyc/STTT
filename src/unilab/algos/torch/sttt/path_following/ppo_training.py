@@ -85,7 +85,7 @@ class ResidualPPOTrainer:
         self.actor.train_stage(self.stage)
         self.algorithm.train_mode()
         observation = self.env.get_observations()
-        totals = {}
+        totals, body_totals = {}, {}
         reward_sum = 0.
         for _ in range(self.config.rollout_windows):
             # Context adaptation explicitly enables autograd; inference_mode would disable it.
@@ -99,6 +99,8 @@ class ResidualPPOTrainer:
             reward_sum += float(reward.mean())
             for name, value in extras["reward_terms"].items():
                 totals[name] = totals.get(name, 0.) + value
+            for name, value in extras.get("body_metrics", {}).items():
+                body_totals[name] = body_totals.get(name, 0.) + value
             observation = following
         with torch.no_grad():
             self.algorithm.compute_returns(observation)
@@ -108,6 +110,7 @@ class ResidualPPOTrainer:
         return {"loss": losses["surrogate"], "critic_loss": losses["value"], "entropy": losses["entropy"],
                 "mean_reward": reward_sum / self.config.rollout_windows,
                 "reward_terms": {name: value / self.config.rollout_windows for name, value in totals.items()},
+                "body_metrics": {name: value / self.config.rollout_windows for name, value in body_totals.items()},
                 "lateral_error_m": float(self.env.start.errors[:, 0].abs().mean()),
                 **self.env.last_context_metrics}
 

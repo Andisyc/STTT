@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from .losses import pretraining_loss
+from .losses import PREDICTION_STATISTICS, pretraining_loss
 from .pretraining_data import PretrainingBatch, _positive_integer, select_pretraining_batch
 
 
@@ -36,10 +36,31 @@ class WorldModelLearner:
         if type(updates) is not int or updates < 0:
             raise ValueError("WM update count must be nonnegative")
         self.updates = updates
+        self.optimizer_started_at = updates
+        motion_rate = training.get("motion_learning_rate", learning_rate * .1)
+        self.motion_clip = training.get("motion_gradient_clip_norm", 1.)
+        self.warmup_updates = training.get("warmup_updates", 1000)
+        if any(isinstance(value, bool) or not math.isfinite(value) or value <= 0 for value in (motion_rate, self.motion_clip)):
+            raise ValueError("motion-head learning rate and gradient clip must be positive")
+        if type(self.warmup_updates) is not int or self.warmup_updates < 0:
+            raise ValueError("WM warmup_updates must be nonnegative")
         model.requires_grad_(True)
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=decay)
-        self.signature = {"learning_rate": learning_rate, "weight_decay": decay, "gradient_clip_norm": self.clip,
+        motion_parameters = list(model.motion_head.parameters())
+        motion_ids = {id(parameter) for parameter in motion_parameters}
+        self.optimizer = torch.optim.AdamW([
+            {"params": [parameter for parameter in model.parameters() if id(parameter) not in motion_ids],
+             "lr": learning_rate, "base_lr": learning_rate},
+            {"params": motion_parameters, "lr": motion_rate, "base_lr": motion_rate},
+        ], weight_decay=decay)
+        self.signature = {"learning_rate": learning_rate, "motion_learning_rate": motion_rate,
+                          "warmup_updates": self.warmup_updates, "weight_decay": decay,
+                          "gradient_clip_norm": self.clip, "motion_gradient_clip_norm": self.motion_clip,
                           "microbatch_size": self.microbatch_size, "loss": self.loss_config}
+
+    def restart_optimizer(self) -> None:
+        """Start a fresh optimizer after selecting the warmup model; keep total update counts."""
+        self.optimizer.state.clear()
+        self.optimizer_started_at = self.updates
 
     def update(self, batch: PretrainingBatch) -> dict[str, float]:
         self.model.train()
@@ -64,26 +85,36 @@ class WorldModelLearner:
                       for key, group in normalized_by.items()}
             total = losses["loss"] if self.microbatch_size >= batch.previous_action.shape[0] else torch.stack([weights[key] * scaled[key] for key in weights]).sum()
             total.backward()
-            values = {**scaled, "loss": total, "window_xy_squared_error_sum": losses["window_xy_squared_error_sum"],
-                      "window_xy_count": losses["window_xy_count"]}
+            values = {**scaled, "loss": total,
+                      **{key: losses[key] for key in PREDICTION_STATISTICS}}
             for key, value in values.items():
                 totals[key] = totals.get(key, torch.zeros_like(value)) + value.detach()
+        motion_norm = torch.nn.utils.clip_grad_norm_(self.model.motion_head.parameters(), self.motion_clip, error_if_nonfinite=True)
         norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip, error_if_nonfinite=True)
+        factor = min(1., (self.updates - self.optimizer_started_at + 1) / max(1, self.warmup_updates))
+        for group in self.optimizer.param_groups:
+            group["lr"] = group["base_lr"] * factor
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.updates += 1
         totals["gradient_norm"] = norm.detach()
+        totals["motion_gradient_norm"] = motion_norm.detach()
+        totals["learning_rate"] = norm.new_tensor(self.optimizer.param_groups[0]["lr"])
+        totals["motion_learning_rate"] = norm.new_tensor(self.optimizer.param_groups[1]["lr"])
         values = torch.stack([value.float() for value in totals.values()]).cpu().tolist()
         return dict(zip(totals, values))
 
     def state_dict(self) -> dict[str, Any]:
-        return {"version": 1, "signature": self.signature, "optimizer_steps": self.updates,
-                "optimizer_state": self.optimizer.state_dict()}
+        return {"version": 2, "signature": self.signature, "optimizer_steps": self.updates,
+                "optimizer_started_at": self.optimizer_started_at, "optimizer_state": self.optimizer.state_dict()}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        if set(state) != {"version", "signature", "optimizer_steps", "optimizer_state"} or state["version"] != 1 or state["signature"] != self.signature:
+        if set(state) != {"version", "signature", "optimizer_steps", "optimizer_started_at", "optimizer_state"} or state["version"] != 2 or state["signature"] != self.signature:
             raise ValueError("WM learner checkpoint optimizer or loss configuration changed")
         if type(state["optimizer_steps"]) is not int or state["optimizer_steps"] < 0:
             raise ValueError("invalid saved WM optimizer-step count")
+        if type(state["optimizer_started_at"]) is not int or not 0 <= state["optimizer_started_at"] <= state["optimizer_steps"]:
+            raise ValueError("invalid saved WM optimizer warmup origin")
         self.optimizer.load_state_dict(state["optimizer_state"])
         self.updates = state["optimizer_steps"]
+        self.optimizer_started_at = state["optimizer_started_at"]

@@ -174,6 +174,10 @@ class _Collectors:
     def state_dict(self):
         return [collector.state_dict() for collector in self.items]
 
+    def bind_validation_replay(self, replay):
+        for collector in self.items:
+            collector.validation_replay = replay
+
     def close(self):
         self._resources.close()
 
@@ -185,6 +189,8 @@ def _import_datasets(directories, replay):
             raise ValueError("supplied data and physical collector contracts differ")
         sidecar = root / "capture.json"
         identity = json.loads(sidecar.read_text()) if sidecar.exists() else {}
+        if identity.get("split") == "validation":
+            raise ValueError("held-out episode prefixes cannot be imported into training replay")
         episode_ids = identity.get("episode_ids", [])
         if episode_ids and len(episode_ids) != len(manifest["sequences"]):
             raise ValueError("capture episode identities do not match sequence shards")
@@ -204,7 +210,7 @@ def _import_datasets(directories, replay):
 
 def _validation_capture(options, distribution, *, root, policy, profile, output, seed, device, overrides,
                         expected_contract, playback_deps):
-    validation_options = replace(options, num_envs=len(options.conditions))
+    validation_options = replace(options, num_envs=len(options.conditions), validation_fraction=0.)
     collectors = _Collectors(validation_options, distribution, root=root, policy=policy, profile=profile,
         output=output, seed=seed, device=device, source_overrides=overrides, playback_deps=playback_deps)
     try:
@@ -279,9 +285,15 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
             raise ValueError("joint checkpoint belongs to another physical source")
         replay = EpisodeReplay(contract, capacity_transitions=options.replay_capacity,
             rollout_windows=raw["wm"]["training"]["rollout_windows"], seed=seed, device=device)
+        validation_replay = EpisodeReplay(contract,
+            capacity_transitions=max(options.capture.num_envs * options.capture.max_episode_steps,
+                                     int(options.replay_capacity * options.capture.validation_fraction)),
+            rollout_windows=raw["wm"]["training"]["rollout_windows"], seed=seed ^ 0x12345, device=device)
+        collectors.bind_validation_replay(validation_replay)
         training_dirs, validation_dirs, physical_steps = [], [], 0
         if resumed is not None:
             replay.load_state_dict(resumed["replay"])
+            validation_replay.load_state_dict(resumed["state"]["validation_replay"])
             training_dirs, validation_dirs = resumed["state"]["training_dirs"], resumed["state"]["validation_dirs"]
         elif phase == "base" and options.capture.initial:
             if raw["wm"]["data"]["train_dirs"] or raw["wm"]["data"]["validation_dirs"]:
@@ -323,7 +335,10 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                 (raw["wm"]["training"]["batch_size"] * raw["wm"]["training"]["validation_batches"],),
                 generator=torch.Generator().manual_seed(validation_seed)).tolist()
         model_config = WorldModelConfig.from_mapping({**raw["wm"]["model"],
-            "obs_dim": contract["data"]["observation_dim"] if raw["wm"]["model"]["obs_dim"] is None else raw["wm"]["model"]["obs_dim"]})
+            "obs_dim": contract["data"]["observation_dim"] if raw["wm"]["model"]["obs_dim"] is None else raw["wm"]["model"]["obs_dim"],
+            "ctrl_dt": contract["data"]["ctrl_dt"] if raw["wm"]["model"].get("ctrl_dt") is None else raw["wm"]["model"]["ctrl_dt"]})
+        if not math.isclose(model_config.ctrl_dt, contract["data"]["ctrl_dt"], rel_tol=0., abs_tol=1e-9):
+            raise ValueError("joint WM control period differs from the physical source")
         if resumed is not None:
             if resumed["model_config"] != asdict(model_config):
                 raise ValueError("resume changed the world-model architecture")
@@ -375,9 +390,21 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
             if validation_sampler is not None:
                 validation_sampler.load_state_dict(resumed["state"]["validation_sampler_state"])
             _restore_random_state(resumed["state"]["random_state"], device)
-        summary = {"format": "sttt_joint_latent_pretraining", "schema_version": 4, "run_id": run_id,
-            "complete": False, "training_complete": False, "config": raw,
+        warmup_best = None if resumed is None else resumed["state"]["warmup_best"]
+        warmup_selected = False if resumed is None else resumed["state"]["warmup_selected"]
+        best_pairs = {} if resumed is None else dict(resumed["state"]["best_pairs"])
+        timing = {"control_step_s": contract["data"]["ctrl_dt"],
+                  "residual_window_s": options.capture.window_steps * contract["data"]["ctrl_dt"],
+                  "wm_horizon_s": raw["wm"]["training"]["rollout_windows"] * options.capture.window_steps * contract["data"]["ctrl_dt"],
+                  "context_horizon_s": context_config.horizon_windows * options.capture.window_steps * contract["data"]["ctrl_dt"]}
+        summary = {"format": "sttt_joint_latent_pretraining", "schema_version": 5, "run_id": run_id,
+            "complete": False, "training_complete": False, "config": raw, "physical_timing": timing,
+            "residual_limits_rad": list(actor_options.residual_limit_rad), "best_pairs": best_pairs,
             "resume_physics": "new episodes with restored PPO/context/replay state", "validation_dirs": validation_dirs}
+        print(json.dumps({"phase": "training_configuration", **timing,
+                          "residual_limits_rad": list(actor_options.residual_limit_rad),
+                          "physical_conditions": [condition["name"] for condition in options.capture.conditions],
+                          "evaluation_every_ppo_iterations": options.schedule.evaluation_every}), flush=True)
 
         def checkpoint():
             if not engine.at_boundary:
@@ -387,6 +414,8 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                 "validation_dirs": validation_dirs,
                 "validation_sampler_state": None if validation_sampler is None else validation_sampler.state_dict(),
                 "collector_states": collectors.state_dict(), "random_state": _random_state(device)}
+            state.update(validation_replay=validation_replay.state_dict(), warmup_best=warmup_best,
+                         warmup_selected=warmup_selected, best_pairs=best_pairs)
             path = save_joint_checkpoint(output / "last.pt", wm_learner, engine.actor, replay,
                                          run_id=run_id, signature=signature, state=state)
             summary.update(joint_checkpoint=str(path), phase=engine.actor.stage, iteration=engine.iteration,
@@ -400,7 +429,7 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
             wm_path = save_world_model(output / f"{stage}_world_model.pt", model, contract,
                 training_state={"optimizer_steps": wm_learner.updates, "loss_config": wm_learner.loss_config})
             actor_path = save_actor_checkpoint(output / f"{stage}_actor.pt", actor, model, contract, distribution.base,
-                training_state={"optimizer_steps": engine.actor.updates, "stage": stage, "rewards": raw["rewards"]},
+                training_state={"optimizer_steps": engine.actor.updates, "stage": engine.actor.stage, "rewards": raw["rewards"]},
                 learner_state=engine.actor.state_dict())
             return wm_path, actor_path
 
@@ -408,6 +437,62 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
             log.write(json.dumps(row, allow_nan=False) + "\n")
             log.flush()
             print(json.dumps(row, allow_nan=False), flush=True)
+
+        def validate():
+            if validation_sampler is None:
+                return None
+            return _validate(model, validation_sampler, validation_indices,
+                batch_size=raw["wm"]["training"]["microbatch_size"] or raw["wm"]["training"]["batch_size"],
+                device=device, seed=validation_seed, loss_config=raw["wm"]["training"]["loss"])
+
+        def periodic_evaluation(row, *, final):
+            if engine.iteration % options.schedule.evaluation_every and not final:
+                return
+            row["validation"] = validate()
+            row["heldout_replay_transitions"] = validation_replay.transitions
+            if validation_replay.num_starts:
+                indices = torch.randint(validation_replay.num_starts,
+                    (raw["wm"]["training"]["batch_size"] * raw["wm"]["training"]["validation_batches"],),
+                    generator=torch.Generator().manual_seed(validation_seed)).tolist()
+                row["recent_validation"] = _validate(model, validation_replay, indices,
+                    batch_size=raw["wm"]["training"]["microbatch_size"] or raw["wm"]["training"]["batch_size"],
+                    device=device, seed=validation_seed, loss_config=raw["wm"]["training"]["loss"],
+                    require_windows=False)
+            stage = engine.actor.stage
+            prefix = f"checkpoints/{stage}_{engine.iteration:07d}"
+            wm_path, actor_path = export(prefix)
+            pair = {"world_model_checkpoint": str(wm_path), "actor_checkpoint": str(actor_path),
+                    "stage": stage, "iteration": engine.iteration, "wm_updates": wm_learner.updates}
+            summary.update(latest_pair=pair, phase=stage, iteration=engine.iteration,
+                           base_updates=engine.base_updates, film_updates=engine.film_updates,
+                           wm_updates=wm_learner.updates, physical_control_steps=engine.physical_control_steps)
+            if raw["evaluation"]["enabled"]:
+                from .pretrained_evaluation import evaluate_pretrained_actor
+                random_state = _random_state(device)
+                try:
+                    result = evaluate_pretrained_actor(raw["evaluation"], root_dir=root,
+                        output_dir=output / "evaluation" / f"{stage}_{engine.iteration:07d}",
+                        policy_checkpoint=policy, profile_path=profile, world_model_checkpoint=wm_path,
+                        actor_checkpoint=actor_path, source_overrides=raw["source_overrides"],
+                        device=str(device), conditions=options.capture.conditions, playback_deps=playback_deps)
+                finally:
+                    _restore_random_state(random_state, device)
+                row["evaluation"] = result
+                mode = "adaptive_context" if actor.adaptation_dim else "pretrained_actor"
+                failures = sum(int(run[mode]["failure_event"]) for run in result["runs"])
+                tracking = float(np.mean([
+                    run[mode]["lateral_rmse_m"] / max(run["nominal"]["lateral_rmse_m"], 1e-6)
+                    + max(0., 1. - run[mode]["forward_speed_retention"]
+                          / max(run["nominal"]["forward_speed_retention"], 1e-6))
+                    for run in result["runs"]]))
+                prediction = row["validation"] or row.get("recent_validation")
+                if prediction is not None and prediction["selection_score"] is not None:
+                    score = [failures, tracking, prediction["selection_score"]]
+                    if stage not in best_pairs or score < best_pairs[stage]["score"]:
+                        best_pairs[stage] = {**pair, "score": score,
+                            "improves_nominal": failures <= sum(int(run["nominal"]["failure_event"]) for run in result["runs"]) and tracking < 1.}
+                summary["evaluation"] = result
+            _publish(output / "summary.json", summary)
 
         with (output / "training.jsonl").open("x") as log:
             if phase == "base":
@@ -417,20 +502,34 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                     if wm_learner.updates % raw["wm"]["training"]["validation_every"] == 0 or final:
                         row = {"phase": "wm_warmup", "wm_updates": wm_learner.updates,
                                "target_wm_updates": options.schedule.pretrain_wm_updates, "actor_updates": 0, "world_model": metrics}
-                        if validation_sampler is not None:
-                            row["validation"] = _validate(model, validation_sampler, validation_indices,
-                                batch_size=raw["wm"]["training"]["microbatch_size"] or raw["wm"]["training"]["batch_size"],
-                                device=device, seed=validation_seed, loss_config=raw["wm"]["training"]["loss"])
+                        row["validation"] = validate()
+                        if row["validation"] is not None:
+                            score = row["validation"]["selection_score"]
+                            if warmup_best is None or score < warmup_best["score"]:
+                                warmup_best = {"score": score, "wm_updates": wm_learner.updates,
+                                    "state_dict": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}}
                         record(log, row)
-                    if wm_learner.updates % raw["wm"]["training"]["checkpoint_every"] == 0 or final:
+                    if wm_learner.updates % raw["wm"]["training"]["checkpoint_every"] == 0 and not final:
                         checkpoint()
+                if not warmup_selected:
+                    if warmup_best is not None:
+                        model.load_state_dict(warmup_best["state_dict"], strict=True)
+                        wm_learner.restart_optimizer()
+                        summary["selected_warmup_wm_updates"] = warmup_best["wm_updates"]
+                    warmup_selected = True
+                    checkpoint()
                 engine.actor.env.refresh(adapt=False)
                 while engine.base_updates < options.schedule.base_iterations:
                     row = engine.update_iteration()
                     row["target_base_iterations"] = options.schedule.base_iterations
+                    periodic_evaluation(row, final=engine.base_updates == options.schedule.base_iterations)
                     record(log, row)
                     if engine.iteration % options.schedule.checkpoint_every == 0 or engine.base_updates == options.schedule.base_iterations:
                         checkpoint()
+                if summary.get("latest_pair", {}).get("stage") != "base":
+                    row = {"phase": "base_ppo", "iteration": engine.iteration}
+                    periodic_evaluation(row, final=True)
+                    record(log, row)
                 exported_wm, exported_actor = export("base")
                 if raw["stage"] == "all":
                     actor.enable_film(context_config.dimension)
@@ -441,19 +540,22 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                 while engine.film_updates < options.schedule.film_iterations:
                     row = engine.update_iteration()
                     row["target_film_iterations"] = options.schedule.film_iterations
+                    periodic_evaluation(row, final=engine.film_updates == options.schedule.film_iterations)
                     record(log, row)
                     if engine.iteration % options.schedule.checkpoint_every == 0 or engine.film_updates == options.schedule.film_iterations:
                         checkpoint()
+                if summary.get("latest_pair", {}).get("stage") != "film":
+                    row = {"phase": "film_ppo", "iteration": engine.iteration}
+                    periodic_evaluation(row, final=True)
+                    record(log, row)
                 exported_wm, exported_actor = export("film")
         collectors.flush(replay)
         summary.update(training_complete=True, world_model_checkpoint=str(exported_wm), actor_checkpoint=str(exported_actor))
         collectors.close()
         if raw["evaluation"]["enabled"]:
-            from .pretrained_evaluation import evaluate_pretrained_actor
-            summary["evaluation"] = evaluate_pretrained_actor(raw["evaluation"], root_dir=root, output_dir=output / "evaluation",
-                policy_checkpoint=policy, profile_path=profile, world_model_checkpoint=exported_wm,
-                actor_checkpoint=exported_actor, source_overrides=raw["source_overrides"],
-                device=str(device), conditions=options.capture.conditions)
+            # The final iteration was already evaluated as a paired snapshot.
+            summary["evaluation"]["world_model_checkpoint"] = str(exported_wm)
+            summary["evaluation"]["actor_checkpoint"] = str(exported_actor)
         summary["complete"] = not raw["evaluation"]["enabled"] or summary["evaluation"]["complete"]
         _publish(output / "summary.json", summary)
         return summary
