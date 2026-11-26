@@ -171,9 +171,7 @@ def test_measured_delayed_authority_drives_bounded_feedback_both_directions():
             state = PathState(reference, torch.tensor([[step * .02 * .35, y - offset, 0.]]), torch.tensor([step * .02 * .35]))
             observation = torch.zeros(1, 1, 66)
             query = SimpleNamespace(command=torch.tensor([[.35, 0., 0.]]), observation_history=observation)
-            # Sensor position is expressed in the same fixed path frame used by the fitted response.
-            direct_state = replace(state, pose=torch.tensor([[step * .02 * .35, y, 0.]]))
-            decision = SimpleNamespace(query=query, step=step, window_steps=2, previous_residual=previous, path=direct_state)
+            decision = SimpleNamespace(query=query, step=step, window_steps=2, previous_residual=previous, path=state)
             previous = controller(decision)
             assert float(previous.abs().max()) <= .00500001
             actions.append((step, float(previous[0, 0] / .005)))

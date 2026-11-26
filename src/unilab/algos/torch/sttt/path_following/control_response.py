@@ -179,9 +179,10 @@ class MeasuredFeedback:
         count = (model.response.shape[1] - 1) // k
         times = np.arange(1, count + 1) * k
         pose = decision.path.pose[0].detach().cpu().numpy().astype(np.float64)
+        lateral_error = float(decision.path.errors()[0, 0].detach().cpu())
         velocity = np.asarray([self.scales[0], 0.]) if self.last_pose is None else (pose[:2] - self.last_pose[:2]) / (k * model.dt)
         self.last_pose = pose.copy()
-        free = np.stack(((velocity[0] - self.scales[0]) * times * model.dt, pose[1] + velocity[1] * times * model.dt), -1)
+        free = np.stack(((velocity[0] - self.scales[0]) * times * model.dt, lateral_error + velocity[1] * times * model.dt), -1)
         matrix = np.zeros((count, 2, count, 29))
         for future in range(count):
             for row, time in enumerate(times):
@@ -203,7 +204,7 @@ class MeasuredFeedback:
         lateral = matrix[:, 1].reshape(count, -1) / self.scales[1]
         forward = matrix[:, 0].reshape(count, -1) / self.scales[0]
         lateral_rate = np.diff(np.concatenate((np.zeros_like(lateral[:1]), lateral)), axis=0) / (k * model.dt) * self.scales[1] / self.scales[2]
-        free_rate = np.diff(np.r_[pose[1], free[:, 1]]) / (k * model.dt)
+        free_rate = np.diff(np.r_[lateral_error, free[:, 1]]) / (k * model.dt)
         change = np.eye(count) - np.eye(count, k=-1)
         smooth = np.kron(change, np.eye(29)) * np.sqrt(self.smoothness)
         targets = np.r_[-free[:, 1] / self.scales[1], -free_rate / self.scales[2], -free[:, 0] / self.scales[0],
