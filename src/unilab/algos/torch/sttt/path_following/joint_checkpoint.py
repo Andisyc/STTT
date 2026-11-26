@@ -31,7 +31,7 @@ def save_joint_checkpoint(path, world_model_learner, actor_learner, replay, *, r
     actor_state = {key: value.detach().cpu() for key, value in actor.state_dict().items()}
     if any(value.is_floating_point() and not bool(torch.isfinite(value).all()) for value in (*model_state.values(), *actor_state.values())):
         raise ValueError("cannot checkpoint non-finite joint weights")
-    payload = {"format": FORMAT, "schema_version": 2, "model_source": dict(SOURCE), "run_id": run_id,
+    payload = {"format": FORMAT, "schema_version": 3, "model_source": dict(SOURCE), "run_id": run_id,
         "signature": _safe_training_state(signature), "state": _safe_training_state(state),
         "contract": canonical_contract(replay.contract), "model_config": model.model_config,
         "world_model": model_state, "actor": actor_state,
@@ -57,8 +57,8 @@ def load_joint_checkpoint(path) -> dict[str, Any]:
     payload = torch.load(Path(path).expanduser(), map_location="cpu", weights_only=True)
     fields = {"format", "schema_version", "model_source", "run_id", "signature", "state", "contract", "model_config",
               "world_model", "actor", "actor_architecture", "world_model_learner", "actor_learner", "replay"}
-    if not isinstance(payload, dict) or set(payload) != fields or payload["format"] != FORMAT or payload["schema_version"] != 2 or payload["model_source"] != SOURCE:
-        raise ValueError("expected a version-2 WM/Actor/Critic joint checkpoint")
+    if not isinstance(payload, dict) or set(payload) != fields or payload["format"] != FORMAT or payload["schema_version"] != 3 or payload["model_source"] != SOURCE:
+        raise ValueError("expected a version-3 stochastic WM/Actor/Critic joint checkpoint")
     canonical_contract(payload["contract"])
     if not isinstance(payload["run_id"], str) or not payload["run_id"]:
         raise ValueError("paired checkpoint has no run identity")

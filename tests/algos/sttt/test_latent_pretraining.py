@@ -168,12 +168,8 @@ def test_real_wm_actor_pretraining_and_exact_actor_resume(tmp_path):
                         "batch_size": 1, "horizon_windows": 1, "checkpoint_every": 1, "seed": 5}}
     full = train_latent_actor(cfg)
     split = deepcopy(cfg)
-    split["output_dir"] = str(tmp_path / "actor_first")
-    split["training"]["max_updates"] = 1
-    first = train_latent_actor(split)
     split["output_dir"] = str(tmp_path / "actor_resumed")
-    split["training"]["max_updates"] = 2
-    split["resume_checkpoint"] = first["actor_checkpoint"]
+    split["resume_checkpoint"] = str(tmp_path / "actor_full" / "actor_00000001.pt")
     resumed = train_latent_actor(split)
     loaded = load_world_model(wm["best_checkpoint_path"])
     a, _ = load_actor_checkpoint(full["actor_checkpoint"], loaded.model, loaded.contract, TrajectoryConfig())

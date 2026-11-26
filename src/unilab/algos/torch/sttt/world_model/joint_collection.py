@@ -312,8 +312,11 @@ class BatchedSequenceCollector:
                     self._latest_starts[int(row)] = select_rollout_start(start, slice(output, output + 1))
                     if self._roots[int(row)] is None:
                         self._roots[int(row)] = select_rollout_start(start, slice(output, output + 1))
-                proposed = self.actor(start.latent.feature(), start.errors, start.command, path.preview(), start.previous_residual) + noise
-                self._residual[index] = proposed.clamp(-self.actor.residual_limit_rad29, self.actor.residual_limit_rad29)
+                proposed = self.actor.sample(start.latent.feature(), start.errors, start.command, path.preview(), start.previous_residual)
+                independent = torch.as_tensor(
+                    self.rng.random((len(indices), 1)) < self.capture.random_residual_probability,
+                    device=self.device)
+                self._residual[index] = torch.where(independent, noise, proposed)
             else:
                 self._residual[index] = noise
         scales = query.preprocessing["term_scale"]

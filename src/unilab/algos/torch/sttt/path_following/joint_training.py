@@ -348,7 +348,8 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                 distribution.base, require_model_identity=False, residual_limits=actor_options.residual_limit_rad)
         model.configure_observation_loss(contract["source"]["preprocessing"])
         wm_learner = WorldModelLearner(model, raw["wm"]["training"], raw["wm"]["training"]["loss"])
-        actor_learner = ActorLearner(actor, rollout, {**asdict(actor_options), "window_steps": options.capture.window_steps}, calibration["costs"])
+        actor_learner = ActorLearner(actor, rollout, {**asdict(actor_options), "window_steps": options.capture.window_steps,
+            "max_updates": options.schedule.online_iterations * options.schedule.actor_updates_per_iteration}, calibration["costs"])
         engine = JointTrainer(wm_learner, actor_learner, replay, options.schedule, wm_batch_size=raw["wm"]["training"]["batch_size"], physical_control_steps=physical_steps)
         if resumed is not None:
             wm_learner.load_state_dict(resumed["world_model_learner"])

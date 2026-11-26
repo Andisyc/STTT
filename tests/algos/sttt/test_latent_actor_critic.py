@@ -177,3 +177,126 @@ def test_control_keeps_advancing_while_learning_worker_is_paused(tmp_path, monke
     finally:
         release.set()
         session.close()
+
+
+def test_stochastic_actor_keeps_deterministic_deployment_and_bounded_exploration():
+    with torch.random.fork_rng():
+        torch.manual_seed(19)
+        actor = LatentResidualActor(4, (8,), (.005,) * 29, command_dim=3, preview_points=2)
+        inputs = (torch.zeros(128, 4), torch.zeros(128, 2), torch.zeros(128, 3),
+                  torch.zeros(128, 2, 5), torch.zeros(128, 29))
+        assert torch.equal(actor(*inputs), torch.zeros(128, 29))
+        samples = actor.sample(*inputs)
+        assert bool((samples.abs() <= .005).all())
+        assert bool((samples > 0).any(0).all()) and bool((samples < 0).any(0).all())
+        samples.square().sum().backward()
+        assert actor.log_std.grad is not None and bool((actor.log_std.grad > 0).all())
+        actor.eval()
+        assert torch.equal(actor(*inputs), actor(*inputs))
+
+
+def test_actor_and_critic_learn_from_the_same_sampled_trajectory(tmp_path, monkeypatch):
+    import unilab.algos.torch.sttt.path_following.actor_learner as owner
+    from unilab.algos.torch.sttt.path_following.latent_objectives import latent_window_costs, weighted_window_costs
+
+    with torch.random.fork_rng():
+        torch.manual_seed(23)
+        policy, contract, model = physical_inputs(tmp_path)
+        rollout = load_rollout(LoadedWorldModel(model, contract, {}), policy)
+        actor = LatentResidualActor(model.feature_dim, (8,), (.02,) * 29, command_dim=3)
+        learner = ActorLearner(actor, rollout, {"batch_size": 1, "microbatch_size": 1,
+            "window_steps": 2, "horizon_windows": 2, "learning_rate": .0005, "max_grad_norm": 1.,
+            "max_updates": 4, "critic": {"hidden_dims": (8,), "epochs": 1, "minibatches": 1}},
+            LatentCostConfig())
+        sampler = PretrainingSequenceSampler(tmp_path / "train", rollout_windows=1)
+        start = actor_training_start(sampler.sample_indices([0]), rollout,
+                                     TrajectoryConfig(initial_lateral_m=.2), seed=1)
+        captured = {}
+        loss_function = owner.latent_actor_loss
+        fit = learner.critic_learner.update
+        sample = actor.sample
+        initial_weights = actor.net[-1].weight.detach().clone()
+
+        def actor_loss(result, part, **kwargs):
+            captured["contexts"] = result.decision_contexts.detach().clone()
+            with torch.no_grad():
+                windows = latent_window_costs(result, part, ctrl_dt=rollout.profile.ctrl_dt,
+                    window_steps=2, config=learner.costs, residual_limits=actor.residual_limit_rad29)
+                captured["costs"] = weighted_window_costs(windows, learner.costs)
+                captured["targets"] = lambda_cost_targets(captured["costs"],
+                    learner.critic_learner.target(captured["contexts"]),
+                    discount=learner.critic_learner.discount, lambda_return=.95,
+                    terminal=torch.zeros_like(captured["costs"], dtype=torch.bool),
+                    failure_value=learner.critic_learner.failure_value)
+            return loss_function(result, part, **kwargs)
+
+        def fit_critic(contexts, costs, terminal, **kwargs):
+            torch.testing.assert_close(contexts, captured["contexts"], rtol=0., atol=0.)
+            torch.testing.assert_close(costs, captured["costs"], rtol=0., atol=0.)
+            assert not torch.equal(actor.net[-1].weight, initial_weights)
+            return fit(contexts, costs, terminal, **kwargs)
+
+        def sample_policy(*inputs):
+            assert all(not value.requires_grad for value in inputs)
+            return sample(*inputs)
+
+        monkeypatch.setattr(owner, "latent_actor_loss", actor_loss)
+        monkeypatch.setattr(learner.critic_learner, "update", fit_critic)
+        monkeypatch.setattr(actor, "sample", sample_policy)
+        result = learner.update(start)
+        assert result["value_target_mean"] == pytest.approx(float(captured["targets"].mean()), rel=1e-6)
+        assert result["gradient_norm"] > 0.
+        assert all(parameter.grad is None for parameter in (*model.parameters(), *rollout.policy.parameters()))
+        saved = learner.state_dict()
+        restored = ActorLearner(actor, rollout, {"batch_size": 1, "microbatch_size": 1,
+            "window_steps": 2, "horizon_windows": 2, "learning_rate": .0005, "max_grad_norm": 1.,
+            "critic": {"hidden_dims": (8,), "epochs": 1, "minibatches": 1}}, learner.costs)
+        restored.load_state_dict(saved)
+        torch.testing.assert_close(restored.return_moments, learner.return_moments, rtol=0., atol=0.)
+        assert restored.schedule_updates == 4
+
+
+def test_independent_joint_exploration_survives_a_saturated_policy(tmp_path):
+    import numpy as np
+    from types import SimpleNamespace
+    from test_control_diagnostics import paired_run
+    from unilab.algos.torch.sttt.path_following.joint_config import CaptureSchedule, TrainingVersions
+    from unilab.algos.torch.sttt.path_following.pretraining import TrajectoryDistribution
+    from unilab.algos.torch.sttt.world_model.checkpoint import load_world_model
+    from unilab.algos.torch.sttt.world_model.joint_collection import BatchedSequenceCollector
+    from unilab.algos.torch.sttt.world_model.replay import EpisodeReplay
+
+    with torch.random.fork_rng():
+        case, cfg, trajectory, _ = paired_run(tmp_path)
+        create_env = case.deps["create_env"]
+
+        def clean_environment(*args, **kwargs):
+            env = create_env(*args, **kwargs)
+            env.cfg.noise_config = SimpleNamespace(level=0.)
+            env.get_sim_times_ns = lambda: np.array([env.get_sim_time_ns()], dtype=np.int64)
+            return env
+
+        case.deps["create_env"] = clean_environment
+        capture = CaptureSchedule(initial=True, num_envs=1, initial_min_transitions=32,
+            validation_episodes=1, steps_per_iteration=32, max_episode_steps=128, window_steps=2,
+            residual_amplitude_rad=.001, risk_tilt_limit_rad=.8, command_resampling_s=1.,
+            command_ranges=[[.2, .4], [-.1, .1], [-.2, .2]],
+            conditions=({"name": "nominal", "source_overrides": []},), random_residual_probability=1.)
+        collector = BatchedSequenceCollector(case.cfg, root_dir=ROOT, output_dir=tmp_path / "capture",
+            capture=capture, trajectory=TrajectoryDistribution(base=trajectory), num_envs=1,
+            stream_offset=0, seed=7, condition="nominal", device="cpu", playback_deps=case.deps)
+        try:
+            model = load_world_model(tmp_path / "trained/world_model.pt").model
+            actor = LatentResidualActor(model.feature_dim, (8,), (.001,) * 29, command_dim=3,
+                                        preview_points=trajectory.preview_points)
+            with torch.no_grad():
+                actor.net[-1].bias.fill_(20.)
+            collector.bind(model, actor)
+            replay = EpisodeReplay(collector.contract, capacity_transitions=128, rollout_windows=1, seed=3)
+            collector.advance(32, replay, versions=TrainingVersions())
+            residuals = collector._records[0].sequence()["residuals"]
+            assert np.all(np.abs(residuals) <= .00100001)
+            assert np.any(residuals < 0) and np.any(residuals > 0)
+            np.testing.assert_array_equal(residuals[::2], residuals[1::2])
+        finally:
+            collector.close()

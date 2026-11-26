@@ -246,6 +246,7 @@ class PlannerTrackerRollout:
         window_steps: int,
         horizon_windows: int,
         update_reference_commands: bool = True,
+        stochastic_policy: bool = False,
     ) -> RolloutResult:
         """Replan every tick; hold each actor residual for ``window_steps`` ticks."""
         for name, value in (("window_steps", window_steps), ("horizon_windows", horizon_windows)):
@@ -288,8 +289,10 @@ class PlannerTrackerRollout:
                         command = path.command(command)
                 if step % window_steps == 0:
                     preview = path.preview()
-                    decision_contexts.append(actor.context(latent.feature(), errors, command, preview, previous_residual))
-                    held_residual = actor(latent.feature(), errors, command, preview, previous_residual)
+                    inputs = (latent.feature(), errors, command, preview, previous_residual)
+                    decision_contexts.append(actor.context(*inputs))
+                    policy_inputs = tuple(value.detach() for value in inputs)
+                    held_residual = actor.sample(*policy_inputs) if stochastic_policy else actor(*policy_inputs)
                     residuals.append(held_residual)
                     previous_residual = held_residual
                 assert held_residual is not None

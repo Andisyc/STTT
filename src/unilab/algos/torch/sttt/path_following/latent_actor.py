@@ -10,9 +10,10 @@ from torch import nn
 
 
 class LatentResidualActor(nn.Module):
-    """Emit bounded radians in source joint order, initially exactly zero."""
+    """Bounded source-order radians: zero initial mean, reparameterized training samples."""
 
     residual_limit_rad29: torch.Tensor
+    min_log_std = -1.427
 
     def __init__(
         self,
@@ -39,6 +40,7 @@ class LatentResidualActor(nn.Module):
         self.preview_points = preview_points
         if isinstance(hidden_init_std, bool) or not math.isfinite(hidden_init_std) or hidden_init_std <= 0:
             raise ValueError("hidden_init_std must be positive and finite")
+        self.log_std = nn.Parameter(torch.full((29,), -1.))
         limits = torch.as_tensor(residual_limit_rad29, dtype=torch.float32).detach().clone()
         if limits.shape != (29,) or not bool(torch.isfinite(limits).all()) or bool((limits <= 0).any()):
             raise ValueError("latent actor requires 29 positive finite physical residual limits")
@@ -52,7 +54,7 @@ class LatentResidualActor(nn.Module):
             layer = nn.Linear(previous, width)
             nn.init.normal_(layer.weight, std=hidden_init_std)
             nn.init.zeros_(layer.bias)
-            layers.extend((layer, nn.SiLU()))
+            layers.extend((layer, nn.ELU(), nn.LayerNorm(width)))
             previous = width
         output = nn.Linear(previous, 29)
         nn.init.zeros_(output.weight)
@@ -81,3 +83,10 @@ class LatentResidualActor(nn.Module):
                 preview: torch.Tensor, previous_residual: torch.Tensor) -> torch.Tensor:
         context = self.context(features, errors, command, preview, previous_residual)
         return torch.tanh(self.net(context)) * self.residual_limit_rad29
+
+    def sample(self, features: torch.Tensor, errors: torch.Tensor, command: torch.Tensor,
+               preview: torch.Tensor, previous_residual: torch.Tensor) -> torch.Tensor:
+        context = self.context(features, errors, command, preview, previous_residual)
+        mean = self.net(context)
+        std = self.log_std.clamp_min(self.min_log_std).exp()
+        return torch.tanh(mean + torch.randn_like(mean) * std) * self.residual_limit_rad29

@@ -60,7 +60,7 @@ class LatentOnlineConfig:
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_weight_decay: float = 0.0
-    max_grad_norm: float = 10.0
+    max_grad_norm: float = 1.0
     adapt_world_model: bool = True
     risk_threshold: float = 0.5
     trajectory: TrajectoryConfig = field(default_factory=TrajectoryConfig)
@@ -231,6 +231,8 @@ class LatentPathFollowingUpdater:
         learner = self.actor_learner.critic_learner
         learner.critic.load_state_dict(saved["critic"], strict=True)
         learner.target.load_state_dict(saved["target"], strict=True)
+        self.actor_learner.return_moments.copy_(
+            torch.as_tensor(state["return_moments"]).to(self.actor_learner.return_moments))
         self.stage_publication()
         self.publish()
 
@@ -401,7 +403,7 @@ class LatentPathFollowingUpdater:
                     name = target + "." + name[len(target + ".base."):]
                     break
             base_state[name] = value.detach().cpu()
-        payload = {"format": "sttt_latent_path_following_online", "schema_version": 3,
+        payload = {"format": "sttt_latent_path_following_online", "schema_version": 4,
                    "model_config": asdict(self.model.config), "contract": self.contract,
                    "base_state": base_state, "adapters": adapters, "adapter_targets": list(self.adapter_targets),
                    "actor": self.actor.state_dict(), "config": asdict(self.config), "costs": asdict(self.costs),
@@ -416,8 +418,8 @@ class LatentPathFollowingUpdater:
     @classmethod
     def restore(cls, path: str | Path, rollout_factory: Any, *, device: str = "cpu", expected_contract: Mapping[str, Any] | None = None) -> LatentPathFollowingUpdater:
         payload = torch.load(path, map_location=device, weights_only=True)
-        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 3:
-            raise ValueError("expected a version-3 latent WM/Actor/Critic online checkpoint")
+        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 4:
+            raise ValueError("expected a version-4 stochastic WM/Actor/Critic online checkpoint")
         if expected_contract is not None and payload["contract"] != dict(expected_contract):
             raise ValueError("online checkpoint control contract differs from deployment")
         model = LatentWorldModel(WorldModelConfig.from_mapping(payload["model_config"])).to(device)

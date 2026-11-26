@@ -27,6 +27,7 @@ capture:
   max_episode_steps: 1000
   window_steps: 10
   residual_amplitude_rad: null  # Explicit physical-radian exploration bound.
+  random_residual_probability: 0.1  # Independent joint-vector exploration; remaining windows use A samples.
   risk_tilt_limit_rad: null
   command_resampling_s: 10.0
   command_ranges: null  # [vx, vy, yaw_rate] lower/upper pairs; otherwise use source-profile ranges.
@@ -35,7 +36,7 @@ capture:
       source_overrides: []
 calibration:
   response_probe_result: null
-  require_response_probe: true
+  require_response_probe: false  # Hand-designed feedback is not a pretraining admission gate.
 wm:
   device: ${device}
   seed: ${seed}
@@ -55,7 +56,9 @@ actor:
     microbatch_size: 8
     horizon_windows: 2
     learning_rate: 0.0005
-    max_grad_norm: 10.0
+    max_grad_norm: 1.0
+    optimizer_betas: [0.7, 0.95]
+    final_learning_rate: 0.00001
     checkpoint_every: ${schedule.checkpoint_every}
     seed: ${seed}
     critic:
@@ -65,7 +68,8 @@ actor:
       minibatches: 4
       lambda_return: 0.95
       target_tau: 0.01
-      max_grad_norm: 10.0
+      max_grad_norm: 100.0
+      optimizer_betas: [0.7, 0.95]
   trajectories:
     base:
       preview_points: 8

@@ -12,7 +12,7 @@ online:
   lora_rank: 8
   lora_alpha: 16.0
   lora_weight_decay: 0.0
-  max_grad_norm: 10.0
+  max_grad_norm: 1.0
   adapt_world_model: true
   risk_threshold: 0.5
   adapt_actor: true
@@ -23,7 +23,8 @@ online:
     minibatches: 1
     lambda_return: 0.95
     target_tau: 0.01
-    max_grad_norm: 10.0
+    max_grad_norm: 100.0
+    optimizer_betas: [0.7, 0.95]
   trajectory:
     kind: straight
     length_m: 30.0

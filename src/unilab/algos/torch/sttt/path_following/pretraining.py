@@ -76,11 +76,13 @@ class ActorTrainingConfig:
     batch_size: int = 16
     horizon_windows: int = 2
     learning_rate: float = 1e-4
-    max_grad_norm: float = 10.
+    max_grad_norm: float = 1.
     checkpoint_every: int = 1000
     seed: int = 0
     microbatch_size: int | None = None
     critic: CriticConfig = field(default_factory=CriticConfig)
+    optimizer_betas: tuple[float, float] = (.7, .95)
+    final_learning_rate: float = 1e-5
 
     def __post_init__(self) -> None:
         if len(self.residual_limit_rad) != 29 or any(not math.isfinite(x) or x <= 0 for x in self.residual_limit_rad):
@@ -102,7 +104,7 @@ class ActorTrainingConfig:
     @classmethod
     def from_mapping(cls, values: Mapping[str, Any]) -> ActorTrainingConfig:
         raw = dict(values)
-        for name in ("residual_limit_rad", "hidden_dims"):
+        for name in ("residual_limit_rad", "hidden_dims", "optimizer_betas"):
             if name in raw and raw[name] is not None:
                 raw[name] = tuple(raw[name])
         if raw.get("residual_limit_rad") is None:

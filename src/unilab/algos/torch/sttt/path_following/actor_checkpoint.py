@@ -45,9 +45,9 @@ def save_actor_checkpoint(path: str | Path, actor: LatentResidualActor, model: L
     state = {name: value.detach().cpu().clone() for name, value in actor.state_dict().items()}
     if any(not bool(torch.isfinite(value).all()) for value in state.values()):
         raise ValueError("pretrained actor contains non-finite parameters")
-    if learner_state.get("version") != 2 or "critic_learner" not in learner_state:
+    if learner_state.get("version") != 3 or "critic_learner" not in learner_state:
         raise ValueError("deployment requires the paired Actor/Critic learner state")
-    payload = {"format": FORMAT, "schema_version": 2,
+    payload = {"format": FORMAT, "schema_version": 3,
                "physical_model_identity": physical_model_identity(model, contract),
                "contract": canonical_contract(contract),
                "architecture": {"feature_dim": actor.feature_dim, "hidden_dims": actor.hidden_dims,
@@ -69,8 +69,8 @@ def load_actor_checkpoint(path: str | Path, model: LatentWorldModel, contract: M
                           residual_limits: tuple[float, ...] | None = None) -> tuple[LatentResidualActor, dict[str, Any]]:
     parameter = next(model.parameters())
     payload = torch.load(path, map_location=parameter.device, weights_only=True)
-    if not isinstance(payload, dict) or payload.get("format") != FORMAT or payload.get("schema_version") != 2:
-        raise ValueError("expected a version-2 Actor/Critic artifact; retrain legacy A under the new objective")
+    if not isinstance(payload, dict) or payload.get("format") != FORMAT or payload.get("schema_version") != 3:
+        raise ValueError("expected a version-3 stochastic Actor/Critic artifact; retrain legacy A")
     if payload["contract"] != canonical_contract(contract):
         raise ValueError("pretrained actor belongs to another physical control contract")
     if require_model_identity and payload["physical_model_identity"] != physical_model_identity(model, contract):
@@ -88,7 +88,7 @@ def load_actor_checkpoint(path: str | Path, model: LatentWorldModel, contract: M
         if not bool(torch.isfinite(value).all()):
             raise ValueError("pretrained actor contains non-finite tensors")
     learner_state = payload["learner_state"]
-    if learner_state.get("version") != 2 or "critic_learner" not in learner_state:
+    if learner_state.get("version") != 3 or "critic_learner" not in learner_state:
         raise ValueError("pretrained actor has no paired cost Critic")
     for group in ("critic", "target"):
         if any(not bool(torch.isfinite(value).all()) for value in learner_state["critic_learner"][group].values()):

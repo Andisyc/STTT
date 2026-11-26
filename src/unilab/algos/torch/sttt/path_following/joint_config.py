@@ -48,6 +48,7 @@ class CaptureSchedule:
     command_resampling_s: float
     command_ranges: Any
     conditions: tuple[dict[str, Any], ...]
+    random_residual_probability: float = .1
 
     def __post_init__(self) -> None:
         if type(self.initial) is not bool:
@@ -67,6 +68,8 @@ class CaptureSchedule:
         for entry in values:
             if isinstance(entry, bool) or not isinstance(entry, (int, float)) or not math.isfinite(entry) or entry < 0:
                 raise ValueError("set an explicit finite nonnegative capture residual amplitude")
+        if isinstance(self.random_residual_probability, bool) or not math.isfinite(self.random_residual_probability) or not 0 <= self.random_residual_probability <= 1:
+            raise ValueError("capture.random_residual_probability must be in [0,1]")
         if not self.conditions or len(self.conditions) > self.num_envs:
             raise ValueError("provide at least one physical condition and at least one stream per condition")
         names = set()

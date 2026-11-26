@@ -19,7 +19,8 @@ class CriticConfig:
     minibatches: int = 4
     lambda_return: float = .95
     target_tau: float = .01
-    max_grad_norm: float = 10.
+    max_grad_norm: float = 100.
+    optimizer_betas: tuple[float, float] = (.7, .95)
 
     def __post_init__(self) -> None:
         if not self.hidden_dims or any(type(width) is not int or width < 1 for width in self.hidden_dims):
@@ -33,12 +34,16 @@ class CriticConfig:
                 raise ValueError(f"critic {name} must be positive and finite")
         if self.lambda_return > 1 or self.target_tau > 1:
             raise ValueError("critic lambda and target_tau must be in (0,1]")
+        if len(self.optimizer_betas) != 2 or any(isinstance(value, bool) or not math.isfinite(value) or not 0 <= value < 1 for value in self.optimizer_betas):
+            raise ValueError("critic optimizer betas must contain two values in [0,1)")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> CriticConfig:
         raw = dict(value)
         if "hidden_dims" in raw:
             raw["hidden_dims"] = tuple(raw["hidden_dims"])
+        if "optimizer_betas" in raw:
+            raw["optimizer_betas"] = tuple(raw["optimizer_betas"])
         return cls(**raw)
 
 
@@ -49,7 +54,7 @@ class CostCritic(nn.Module):
         layers: list[nn.Module] = []
         previous = context_dim
         for width in config.hidden_dims:
-            layers.extend((nn.Linear(previous, width), nn.SiLU()))
+            layers.extend((nn.Linear(previous, width), nn.ELU(), nn.LayerNorm(width)))
             previous = width
         head = nn.Linear(previous, 1)
         nn.init.zeros_(head.weight)
@@ -88,7 +93,7 @@ class CriticLearner:
         self.failure_value = failure_cost_rate * ctrl_dt / (1 - discount)
         self.critic = CostCritic(context_dim, config, self.failure_value).to(parameter)
         self.target = deepcopy(self.critic).eval().requires_grad_(False)
-        self.optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.learning_rate)
+        self.optimizer = torch.optim.Adam(self.critic.parameters(), lr=config.learning_rate, betas=config.optimizer_betas)
         self.updates = 0
         self.signature = {"config": asdict(config), "context_dim": context_dim,
                           "discount": self.discount, "failure_value": self.failure_value}
@@ -133,12 +138,12 @@ class CriticLearner:
                 "value_target_mean": float(targets.mean())}
 
     def state_dict(self) -> dict[str, Any]:
-        return {"version": 1, "signature": self.signature, "critic": self.critic.state_dict(),
+        return {"version": 2, "signature": self.signature, "critic": self.critic.state_dict(),
                 "target": self.target.state_dict(), "optimizer": self.optimizer.state_dict(),
                 "optimizer_steps": self.updates}
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        if state.get("version") != 1 or state.get("signature") != self.signature:
+        if state.get("version") != 2 or state.get("signature") != self.signature:
             raise ValueError("cost critic configuration or temporal meaning changed")
         self.critic.load_state_dict(state["critic"], strict=True)
         self.target.load_state_dict(state["target"], strict=True)

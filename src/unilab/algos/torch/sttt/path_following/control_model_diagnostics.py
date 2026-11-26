@@ -50,7 +50,7 @@ class DiagnosticModels:
         policy_actor, metadata = load_actor_checkpoint(actor, loaded.model, loaded.contract, trajectory)
         state = metadata["learner_state"]
         signature = state["signature"]
-        training = {key: signature[key] for key in ("learning_rate", "max_grad_norm", "microbatch_size", "window_steps", "horizon_windows")}
+        training = {key: signature[key] for key in ("learning_rate", "max_grad_norm", "microbatch_size", "window_steps", "horizon_windows", "optimizer_betas", "final_learning_rate")}
         training.update(batch_size=1, critic=state["critic_learner"]["signature"]["config"])
         learner = ActorLearner(policy_actor, rollout, training, signature["costs"])
         learner.load_state_dict(state)
@@ -58,7 +58,7 @@ class DiagnosticModels:
 
     def shadow_learner(self):
         signature = self.learner.signature
-        training = {key: signature[key] for key in ("learning_rate", "max_grad_norm", "microbatch_size", "window_steps", "horizon_windows")}
+        training = {key: signature[key] for key in ("learning_rate", "max_grad_norm", "microbatch_size", "window_steps", "horizon_windows", "optimizer_betas", "final_learning_rate")}
         training.update(batch_size=1, critic=self.actor_metadata["learner_state"]["critic_learner"]["signature"]["config"])
         learner = ActorLearner(copy.deepcopy(self.actor), self.rollout, training, signature["costs"])
         learner.load_state_dict(copy.deepcopy(self.actor_metadata["learner_state"]))
