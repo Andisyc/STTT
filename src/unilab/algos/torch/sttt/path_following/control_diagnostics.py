@@ -29,8 +29,8 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
         path = Path(value).expanduser()
         return (root / path).resolve() if not path.is_absolute() else path.resolve()
     mode = raw["mode"]
-    if mode not in {"all", "physical", "analyze"}:
-        raise ValueError("mode must be all, physical or analyze")
+    if mode not in {"all", "physical", "analyze", "feedback"}:
+        raise ValueError("mode must be all, physical, analyze or feedback")
     run = resolve(raw["run_dir"]) if raw["run_dir"] else None
     training = json.loads((run / "summary.json").read_text())["config"] if run is not None else None
     if mode in {"all", "analyze"} and training is None:
@@ -67,7 +67,7 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
     if output.exists():
         raise FileExistsError(output)
     output.mkdir(parents=True)
-    data_root = resolve(raw["data_dir"]) if mode == "analyze" else output
+    data_root = resolve(raw["data_dir"]) if mode in {"analyze", "feedback"} else output
     report = {"format": "sttt_control_diagnostics", "version": 1, "complete": False, "mode": mode,
         "policy_identity": _identity(policy), "configuration": raw, "stages": {}, "error": None}
     _publish(output / "summary.json", report)
@@ -89,8 +89,9 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
     def branch(name, program, *, trajectory=base, phase=0., seed=raw["seed"], warmup=None,
                steps=None, canonical=None, reference_commands=False, capture_steps=(0,)):
         nonlocal playback_cfg
-        directory = data_root / name
-        if mode == "analyze":
+        reuse = mode == "analyze" or (mode == "feedback" and (name.startswith("pulses/") or name.endswith("_nominal")))
+        directory = (data_root if reuse else output) / name
+        if reuse:
             trace = PhysicalTrace.load(directory)
             if trace.metadata["policy_identity"] != report["policy_identity"]:
                 raise ValueError("analysis data belong to another policy")
@@ -147,7 +148,7 @@ def run_control_diagnostics(cfg, *, root_dir: str | Path = ".", playback_deps=No
                 "lateral_integral_improvement_m_s": improvement, "forward_retained": progress_ok,
                 "recovery_benefit": bool(improvement > 0 and progress_ok and not after["risk_event"])}
         stage("measured_feedback", {"status": "compared", "cases": feedback})
-        if mode == "physical":
+        if mode in {"physical", "feedback"}:
             report["complete"] = True
             _publish(output / "summary.json", report)
             return report

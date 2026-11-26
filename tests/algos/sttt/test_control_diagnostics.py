@@ -183,3 +183,38 @@ def test_measured_delayed_authority_drives_bounded_feedback_both_directions():
     with pytest.raises(ValueError, match="applied residual"):
         fit_response_map(branches, [0.], [.5, 1.], minimum_effect_m=1e-5, minimum_effect_rad=1e-5,
             replay_position_tolerance_m=1e-7, replay_heading_tolerance_rad=1e-7)
+
+
+def test_feedback_rerun_reuses_measurements_without_learned_checkpoints(tmp_path, monkeypatch):
+    from unilab.algos.torch.sttt.path_following import control_diagnostics
+
+    case, cfg, _, _ = paired_run(tmp_path)
+    cfg.mode = "physical"
+    original = run_control_diagnostics(cfg, root_dir=ROOT, playback_deps=case.deps)
+    assert original["complete"], original["error"]
+    source = tmp_path / "diagnostics"
+    preserved = {path: path.read_bytes() for path in source.rglob("*") if path.is_file()}
+    for name in ("world_model.pt", "actor.pt"):
+        (tmp_path / "trained" / name).unlink()
+
+    executed = []
+    native_branch = control_diagnostics.run_physical_branch
+
+    def record_branch(*args, **kwargs):
+        executed.append(kwargs["name"])
+        return native_branch(*args, **kwargs)
+
+    monkeypatch.setattr(control_diagnostics, "run_physical_branch", record_branch)
+    cfg.mode = "feedback"
+    cfg.data_dir = str(source)
+    cfg.output_dir = str(tmp_path / "feedback_rerun")
+    rerun = run_control_diagnostics(cfg, root_dir=ROOT, playback_deps=case.deps)
+
+    assert rerun["complete"], rerun["error"]
+    assert executed == ["feedback/o0_corrected", "feedback/o1_corrected"]
+    assert set(rerun["stages"]) == {"physical_authority", "measured_feedback"}
+    assert rerun["stages"]["measured_feedback"] == original["stages"]["measured_feedback"]
+    assert (tmp_path / "feedback_rerun/feedback/o0_corrected/trace.npz").is_file()
+    assert not (tmp_path / "feedback_rerun/pulses").exists()
+    for path, content in preserved.items():
+        assert path.read_bytes() == content

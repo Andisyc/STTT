@@ -1,5 +1,5 @@
 # Native Planner–Tracker diagnostics. Training artifacts are read-only.
-mode: all  # all, physical (no WM required), analyze (existing data_dir)
+mode: all  # all, physical (no WM required), analyze (replay), feedback (reuse pulses/nominal; rerun feedback)
 run_dir: null
 policy_checkpoint: null  # Inherited from run_dir/summary.json when omitted.
 profile_path: null

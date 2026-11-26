@@ -14,23 +14,23 @@ from launch_latent_pretraining import ROOT, choose_backend, inspect_resources, l
 
 
 def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(description="后台执行完整五步诊断，保留 checkpoint，日志写入独立文件。")
+    parser = argparse.ArgumentParser(description="后台执行控制诊断或复用扫描重跑反馈，日志写入独立文件。")
     parser.add_argument("--run-dir", type=Path, required=True, help="包含 summary.json、world_model.pt 和 actor.pt 的训练目录")
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--mode", choices=("all", "physical", "analyze"), default="all")
-    parser.add_argument("--data-dir", type=Path, help="analyze 模式使用的既有诊断目录")
+    parser.add_argument("--mode", choices=("all", "physical", "analyze", "feedback"), default="all")
+    parser.add_argument("--data-dir", type=Path, help="analyze/feedback 模式使用的既有诊断目录")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--dry-run", action="store_true", help="只打印资源预算和实际命令，不启动进程")
     options = parser.parse_args(argv)
     run = options.run_dir.resolve()
     if not (run / "summary.json").is_file():
         raise FileNotFoundError(run / "summary.json")
-    if options.mode != "physical":
+    if options.mode not in {"physical", "feedback"}:
         for name in ("world_model.pt", "actor.pt"):
             if not (run / name).is_file():
                 raise FileNotFoundError(run / name)
-    if options.mode == "analyze" and (options.data_dir is None or not options.data_dir.is_dir()):
-        raise ValueError("analyze 模式需要 --data-dir 指向既有完整诊断数据")
+    if options.mode in {"analyze", "feedback"} and (options.data_dir is None or not options.data_dir.is_dir()):
+        raise ValueError("analyze/feedback 模式需要 --data-dir 指向既有诊断数据")
     output = (options.output_dir or ROOT / f"outputs/latent_control_diagnostics_{datetime.now():%Y%m%d_%H%M%S_%f}").resolve()
     uv, ionice = shutil.which("uv"), shutil.which("ionice")
     if uv is None or ionice is None:
