@@ -5,6 +5,7 @@ import copy
 import json
 import subprocess
 from dataclasses import replace
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -18,9 +19,12 @@ from test_path_following_runtime import ROOT, create_session
 from unilab.algos.torch.distill.fada.runtime_policy import FADAFutureQuery, invoke_fada_idm, invoke_fada_planner
 from unilab.algos.torch.sttt.path_following.latent_rollout import PlannerTrackerRollout
 from unilab.algos.torch.sttt.path_following.planner_lora import adapter_parameters, adapter_state
-from unilab.algos.torch.sttt.path_following.planner_losses import planner_trajectory_loss, timed_reference
+from unilab.algos.torch.sttt.path_following.planner_losses import (
+    planner_parameter_change, planner_trajectory_loss, predicted_poses, timed_reference,
+)
 from unilab.algos.torch.sttt.path_following.trajectory import PathState, ReferenceTrajectory, TrajectoryConfig
 from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel, save_world_model
+from unilab.algos.torch.sttt.world_model.planner_diagnostics import capture_rng, replay_rng
 from unilab.algos.torch.sttt.world_model.planner_online import PlannerLoRAUpdater, PlannerOnlineConfig
 
 
@@ -108,8 +112,32 @@ def test_task_time_penalizes_standing_and_pose_composition_preserves_heading():
     assert float(planner_trajectory_loss(aligned, walking, poses, position_tolerance_m=.3, heading_tolerance_rad=.3)) < 1e-20
 
 
+def test_parameter_penalty_restores_fixed_anchor_instead_of_rezeroing():
+    parameter = torch.tensor([1., -2.], dtype=torch.float64, requires_grad=True)
+    anchor = torch.zeros_like(parameter)
+    loss = .001 * planner_parameter_change([parameter], [anchor])
+    assert float(loss.detach()) == pytest.approx(.0025)
+    torch.testing.assert_close(torch.autograd.grad(loss, parameter)[0],
+                               torch.tensor([.001, -.002], dtype=torch.float64))
+    with torch.no_grad():
+        parameter.mul_(2)
+    assert float(planner_parameter_change([parameter], [anchor]).detach()) == pytest.approx(10.)
+    torch.testing.assert_close(anchor, torch.zeros_like(anchor), atol=0, rtol=0)
+
+
+def test_matched_diagnostic_draws_preserve_learner_random_stream():
+    model = torch.nn.Linear(1, 1)
+    state = capture_rng(model)
+    expected = torch.randn(5)
+    current = torch.get_rng_state()
+    with replay_rng(model, state):
+        torch.testing.assert_close(torch.randn(5), expected, atol=0, rtol=0)
+    torch.testing.assert_close(torch.get_rng_state(), current, atol=0, rtol=0)
+
+
 def configure_session(case, checkpoint):
     node = OmegaConf.load(ROOT / "conf/distill/path_following/planner_wm_lora.yaml")
+    node.save_checkpoint_path = str(checkpoint.with_suffix(".online.pt"))
     node.checkpoint_path = str(checkpoint)
     node.pose.odometry_source = "simulation"
     node.update_interval_steps = 2
@@ -153,7 +181,7 @@ def test_session_reencodes_after_wm_update_and_publishes_only_completed_pairs(tm
         session.step_once()
         assert entered.wait(10)
         assert updater.wm_updates == 1 and updater.planner_updates == 0
-        assert encoded_at == [0, 1]
+        assert encoded_at[0] == 0 and 1 in encoded_at and all(version == 1 for version in encoded_at[1:])
         for name, value in live_before.items():
             torch.testing.assert_close(adapter_state(updater.live_policy)[name], value, atol=0, rtol=0)
         for name, value in wm_before.items():
@@ -169,6 +197,38 @@ def test_session_reencodes_after_wm_update_and_publishes_only_completed_pairs(tm
             torch.testing.assert_close(dict(updater.model.named_parameters())[name], value, atol=0, rtol=0)
         for name, value in tracker.items():
             torch.testing.assert_close(updater.policy.idm.state_dict()[name], value, atol=0, rtol=0)
+        first_diagnostics = controller.last_update.diagnostics
+        json.dumps(first_diagnostics, allow_nan=False)
+        snapshot = torch.load(first_diagnostics["snapshot_path"], map_location="cpu", weights_only=True)
+        wm_record = first_diagnostics["wm"]
+        assert wm_record["unseen_before_update"] == [True]
+        assert wm_record["before_fit"]["unseen_window_motion"]["count"] == 1
+        for phase in ("before", "after"):
+            measured = snapshot["wm_batch"]["window_delta"]
+            predicted = snapshot[f"wm_prediction_{phase}"]["motion_prediction"]
+            valid = snapshot[f"wm_prediction_{phase}"]["motion_valid"]
+            expected = (predicted - measured)[valid].square().mean(0).sqrt()
+            torch.testing.assert_close(torch.tensor(wm_record[f"{phase}_fit"]["motion"]["rmse_m_m_rad"]),
+                                       expected, atol=1e-8, rtol=1e-6)
+            poses = predicted_poses(snapshot["planner_start"]["pose"],
+                                    snapshot[f"planner_prediction_{phase}"]["body_delta"])
+            label = "before_update" if phase == "before" else "after_update"
+            torch.testing.assert_close(torch.tensor(first_diagnostics["planner"][label]["predicted_poses_m_m_rad"]),
+                                       poses, atol=0, rtol=0)
+        assert first_diagnostics["planner"]["parameter_change_before"] == 0.
+        assert first_diagnostics["planner"]["parameter_change_after"] > 0.
+        anchor = {name: value.clone() for name, value in updater.planner_anchor.items()}
+        session.step_once()
+        session.step_once()
+        controller._finish_learning(wait=True)
+        second = controller.last_update.diagnostics
+        assert second["planner"]["parameter_change_before"] == pytest.approx(
+            first_diagnostics["planner"]["parameter_change_after"])
+        assert second["planner"]["penalty_gradient_l2_before"] > 0.
+        assert second["wm"]["unseen_before_update"] == [True]
+        assert Path(second["snapshot_path"]).is_file()
+        for name, value in anchor.items():
+            torch.testing.assert_close(updater.planner_anchor[name], value, atol=0, rtol=0)
         path = tmp_path / "online.pt"
         updater.save(path)
 
@@ -179,6 +239,8 @@ def test_session_reencodes_after_wm_update_and_publishes_only_completed_pairs(tm
 
         restored = PlannerLoRAUpdater.restore(path, resume_factory, expected_contract=contract)
         assert restored.update_counters() == updater.update_counters()
+        for name, value in anchor.items():
+            torch.testing.assert_close(restored.planner_anchor[name], value, atol=0, rtol=0)
         for target, original in ((restored.model, updater.model), (restored.policy, updater.policy)):
             for name, value in adapter_state(original).items():
                 torch.testing.assert_close(adapter_state(target)[name], value, atol=0, rtol=0)

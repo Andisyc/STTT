@@ -51,11 +51,14 @@ class PlannerRuntimeSetup:
                                          target_action_scale=actual["target_action_scale"])
 
         if self.resume_checkpoint_path is None:
-            return PlannerLoRAUpdater(self.loaded, rollout_factory(self.loaded.model), self.learning)
-        updater = PlannerLoRAUpdater.restore(self.resume_checkpoint_path, rollout_factory,
-            device=str(next(self.loaded.model.parameters()).device), expected_contract=self.loaded.contract)
-        if updater.config != self.learning:
-            raise ValueError("online resume changed the dual LoRA learning configuration")
+            updater = PlannerLoRAUpdater(self.loaded, rollout_factory(self.loaded.model), self.learning)
+        else:
+            updater = PlannerLoRAUpdater.restore(self.resume_checkpoint_path, rollout_factory,
+                device=str(next(self.loaded.model.parameters()).device), expected_contract=self.loaded.contract)
+            if updater.config != self.learning:
+                raise ValueError("online resume changed the dual LoRA learning configuration")
+        if self.save_checkpoint_path is not None:
+            updater.configure_diagnostics(self.save_checkpoint_path)
         return updater
 
 
@@ -155,7 +158,8 @@ class PlannerPathFollowingController(PathFollowingController):
         self.trace.append({"event": "learning_complete", "step": self._steps,
             **self.updater.update_counters(), "wm_loss": self.last_update.wm_loss,
             "planner_loss": self.last_update.planner_loss, "body_loss": self.last_update.body_loss,
-            "motion_loss": self.last_update.motion_loss, "elapsed_s": self.last_update.elapsed_s})
+            "motion_loss": self.last_update.motion_loss, "elapsed_s": self.last_update.elapsed_s,
+            "decision_timestamp_ns": self._submitted_timestamp, "diagnostics": self.last_update.diagnostics})
 
     def _learning_ready(self) -> bool:
         return self._learning_future is None

@@ -10,6 +10,7 @@ online:
   lora_rank: 8
   lora_alpha: 16.0
   max_grad_norm: 1.0
+  # Fixed at adaptation start and persisted on resume; penalizes cumulative LoRA drift.
   parameter_change_scale: 0.001
   position_tolerance_m: 0.3
   heading_tolerance_rad: 0.3

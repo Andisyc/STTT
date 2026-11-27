@@ -1,7 +1,7 @@
 """Physical identification and task-time trajectory losses for dual online LoRA."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import torch
 
@@ -51,6 +51,15 @@ def planner_trajectory_loss(origin: torch.Tensor, motion: torch.Tensor, referenc
     return torch.cat((position, heading.unsqueeze(-1)), -1).square().mean()
 
 
+def planner_parameter_change(parameters: Sequence[torch.Tensor],
+                             baseline: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Mean squared distance from a fixed adaptation-start parameter anchor."""
+    if not parameters or len(parameters) != len(baseline):
+        raise ValueError("Planner parameter penalty requires a matching nonempty anchor")
+    return sum((parameter - reference).square().sum()
+               for parameter, reference in zip(parameters, baseline)) / sum(parameter.numel() for parameter in parameters)
+
+
 def identification_loss(model: LatentWorldModel, initial: LatentState,
                         batch: Mapping[str, torch.Tensor], *, xy_tolerance_m: float,
                         yaw_tolerance_rad: float) -> dict[str, torch.Tensor]:
@@ -77,4 +86,7 @@ def identification_loss(model: LatentWorldModel, initial: LatentState,
     scale = motion.new_tensor((xy_tolerance_m, xy_tolerance_m, yaw_tolerance_rad))
     error = ((displacement - target) / scale).square().mean(-1)
     motion_loss = torch.where(mask, error, 0.).sum() / mask.sum().clamp_min(1)
-    return {"loss": body_loss + motion_loss, "body_loss": body_loss, "motion_loss": motion_loss}
+    return {"loss": body_loss + motion_loss, "body_loss": body_loss, "motion_loss": motion_loss,
+            "body_prediction": prediction, "body_target": batch["observations"][:, 1:].detach(),
+            "body_valid": valid, "motion_prediction": displacement, "motion_target": target,
+            "motion_valid": mask}

@@ -20,11 +20,15 @@ from unilab.algos.torch.sttt.path_following.planner_lora import (
     adapter_parameters, adapter_state, inject_planner_lora, inject_wm_lora, load_adapter_state,
 )
 from unilab.algos.torch.sttt.path_following.planner_losses import (
-    identification_loss, planner_trajectory_loss, timed_reference,
+    identification_loss, planner_parameter_change, planner_trajectory_loss, timed_reference,
 )
 from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory, TrajectoryConfig
 from unilab.algos.torch.sttt.world_model.checkpoint import LoadedWorldModel, _safe_training_state, canonical_contract
 from unilab.algos.torch.sttt.world_model.model import LatentWorldModel, WorldModelConfig
+from unilab.algos.torch.sttt.world_model.planner_diagnostics import (
+    capture_rng, identification_metrics, input_evidence, parameter_metrics,
+    planner_metrics, prediction_evidence, replay_rng,
+)
 from unilab.algos.torch.sttt.world_model.online import _join_windows
 from unilab.algos.torch.sttt.world_model.sequence_collection import window_sequence
 from unilab.algos.torch.sttt.world_model.sequence_data import batch_sequences
@@ -100,6 +104,7 @@ class PlannerUpdateResult:
     body_loss: float | None
     motion_loss: float | None
     elapsed_s: float
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class PlannerLoRAUpdater:
@@ -124,6 +129,8 @@ class PlannerLoRAUpdater:
         self.live_policy.requires_grad_(False)
         self.wm_parameters = list(adapter_parameters(self.model).values())
         self.planner_parameters = list(adapter_parameters(self.policy).values())
+        self.planner_anchor = {name: parameter.detach().clone()
+                               for name, parameter in adapter_parameters(self.policy).items()}
         motion_ids = {id(p) for name, p in adapter_parameters(self.model).items() if name.startswith("motion_head.")}
         self.model_optimizer = torch.optim.AdamW([
             {"params": [p for p in self.wm_parameters if id(p) not in motion_ids], "lr": config.wm_learning_rate},
@@ -139,6 +146,25 @@ class PlannerLoRAUpdater:
         self._reference: MeasuredTrajectory | None = None
         self._last_window_id = -1
         self._publication: Any = None
+        self._last_wm_trained_window_id = -1
+        self._diagnostic_checkpoint: Path | None = None
+
+    def configure_diagnostics(self, checkpoint_path: str | Path) -> None:
+        """Keep per-update evidence beside the checkpoint, off the control thread."""
+        self._diagnostic_checkpoint = Path(checkpoint_path).resolve()
+
+    def _write_diagnostics(self, diagnostics: dict[str, Any], evidence: dict[str, Any]) -> None:
+        if self._diagnostic_checkpoint is None:
+            return
+        directory = self._diagnostic_checkpoint.with_suffix(".updates")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"wm_{self.wm_updates:06d}_planner_{self.planner_updates:06d}.pt"
+        diagnostics["snapshot_path"] = str(path)
+        payload = {"format": "sttt_planner_wm_diagnostic", "schema_version": 1,
+                   "base_checkpoint": str(self._diagnostic_checkpoint), "contract": self.contract,
+                   "config": asdict(self.config), "diagnostics": diagnostics, **evidence}
+        with path.open("xb") as handle:
+            torch.save(_safe_training_state(payload), handle)
 
     @property
     def calibration_complete(self) -> bool:
@@ -154,6 +180,7 @@ class PlannerLoRAUpdater:
             raise ValueError("a new episode must advance localization identity")
         self.replay.clear()
         self._last_window_id = -1
+        self._last_wm_trained_window_id = -1
         self._reference = reference
 
     def discard_pending(self) -> None:
@@ -215,6 +242,8 @@ class PlannerLoRAUpdater:
             raise ValueError("dual LoRA learning must run outside inference_mode")
         started = time.perf_counter()
         wm_value = planner_value = body_value = motion_value = None
+        diagnostics: dict[str, Any] = {"counters_before": self.update_counters()}
+        evidence: dict[str, Any] = {}
         for sample, sequence, seed in prepared.entries:
             if sample.reference is not self._reference or sample.window_id <= self._last_window_id:
                 raise ValueError("WM windows must be new and from the bound localization episode")
@@ -226,17 +255,39 @@ class PlannerLoRAUpdater:
         contiguous = len(recent) == count and all(
             left[0].reference is right[0].reference and left[0].controls[-1].end_ns == right[0].controls[0].start_ns
             for left, right in zip(recent, recent[1:]))
+        wm_before = adapter_state(self.model)
+        planner_before = adapter_state(self.policy)
         if contiguous and self.config.adapt_world_model:
             batch = batch_sequences([_join_windows([row[1] for row in recent])],
                                     device=next(self.model.parameters()).device, contract=self.contract)
-            for _ in range(self.config.wm_updates_per_cycle):
+            fresh = [row[0].window_id > self._last_wm_trained_window_id for row in recent]
+            wm_rng = capture_rng(self.model)
+            wm_diagnostics = {
+                "window_ids": [row[0].window_id for row in recent],
+                "unseen_before_update": fresh,
+                "start_ns": recent[0][0].controls[0].start_ns,
+                "end_ns": recent[-1][0].controls[-1].end_ns,
+                "comparison": "same executed actions and measurements; matched random draws",
+            }
+            for index in range(self.config.wm_updates_per_cycle):
                 self.model_optimizer.zero_grad(set_to_none=True)
                 initial = self._encode(recent[0][2]).latent
                 losses = identification_loss(self.model, initial, batch,
                     xy_tolerance_m=self.config.motion_xy_tolerance_m, yaw_tolerance_rad=self.config.motion_yaw_tolerance_rad)
-                self._step(losses["loss"], self.wm_parameters, self.model_optimizer)
+                if index == 0:
+                    wm_diagnostics["before_fit"] = identification_metrics(losses, fresh)
+                    evidence["wm_prediction_before"] = prediction_evidence(losses)
+                wm_diagnostics["gradient_norm_before_clip"] = self._step(losses["loss"], self.wm_parameters, self.model_optimizer)
                 wm_value, body_value, motion_value = (float(losses[key].detach()) for key in ("loss", "body_loss", "motion_loss"))
                 self.wm_updates += 1
+            with replay_rng(self.model, wm_rng), torch.no_grad():
+                fitted = identification_loss(self.model, self._encode(recent[0][2]).latent, batch,
+                    xy_tolerance_m=self.config.motion_xy_tolerance_m, yaw_tolerance_rad=self.config.motion_yaw_tolerance_rad)
+            wm_diagnostics["after_fit"] = identification_metrics(fitted, fresh)
+            diagnostics["wm"] = wm_diagnostics
+            evidence.update(wm_batch=batch, wm_start=input_evidence(recent[0][2]), wm_rng=wm_rng,
+                            wm_prediction_after=prediction_evidence(fitted))
+            self._last_wm_trained_window_id = recent[-1][0].window_id
         if self.calibration_complete and prepared.decision is not None and self.config.adapt_planner:
             decision = prepared.decision.decision
             if decision.reference is not self._reference or decision.path_state is None:
@@ -244,35 +295,83 @@ class PlannerLoRAUpdater:
             horizon = self.window_steps * self.config.horizon_windows
             target, commands = timed_reference(decision.path_state.reference,
                 (decision.timestamp_ns - decision.reference.timestamp_ns) / 1e9, horizon, self.ctrl_dt)
-            before = [parameter.detach().clone() for parameter in self.planner_parameters]
-            for _ in range(self.config.planner_updates_per_cycle):
+            anchor = tuple(self.planner_anchor.values())
+            planner_rng = capture_rng(self.model)
+            planner_diagnostics = {
+                "decision_timestamp_ns": decision.timestamp_ns,
+                "wm_updates_used": self.wm_updates,
+                "horizon_s": horizon * self.ctrl_dt,
+                "parameter_change_scale": self.config.parameter_change_scale,
+                "anchor": "adaptation_start",
+                "origin_pose_m_m_rad": decision.path_state.pose.cpu().tolist(),
+                "path_errors_m_rad": decision.errors.cpu().tolist(),
+            }
+            for index in range(self.config.planner_updates_per_cycle):
                 self.planner_optimizer.zero_grad(set_to_none=True)
                 # Re-encode raw history AFTER WM identification; never reuse the old latent.
                 start = self._encode(prepared.decision)
                 prediction = self.rollout.run(start, None, window_steps=self.window_steps,
                     horizon_windows=self.config.horizon_windows, update_reference_commands=False,
                     velocity_commands=commands)
-                loss = planner_trajectory_loss(decision.path_state.pose, prediction.body_delta, target,
+                trajectory_loss = planner_trajectory_loss(decision.path_state.pose, prediction.body_delta, target,
                     position_tolerance_m=self.config.position_tolerance_m, heading_tolerance_rad=self.config.heading_tolerance_rad)
-                change = sum((parameter - previous).square().sum() for parameter, previous in zip(self.planner_parameters, before))
-                change = change / sum(parameter.numel() for parameter in self.planner_parameters)
-                loss = loss + self.config.parameter_change_scale * change
-                self._step(loss, self.planner_parameters, self.planner_optimizer)
+                change = planner_parameter_change(self.planner_parameters, anchor)
+                loss = trajectory_loss + self.config.parameter_change_scale * change
+                if index == 0:
+                    planner_diagnostics["before_update"] = planner_metrics(decision.path_state.pose, prediction, target,
+                        ctrl_dt=self.ctrl_dt, position_tolerance_m=self.config.position_tolerance_m,
+                        heading_tolerance_rad=self.config.heading_tolerance_rad)
+                    planner_diagnostics["trajectory_loss_before"] = float(trajectory_loss.detach())
+                    planner_diagnostics["parameter_change_before"] = float(change.detach())
+                    planner_diagnostics["penalty_loss_before"] = float((self.config.parameter_change_scale * change).detach())
+                    n = sum(parameter.numel() for parameter in self.planner_parameters)
+                    planner_diagnostics["penalty_gradient_l2_before"] = 2 * self.config.parameter_change_scale * math.sqrt(float(change.detach()) / n)
+                    evidence["planner_prediction_before"] = {
+                        "body_delta": prediction.body_delta.detach(), "actions": prediction.actions.detach(),
+                        "source_actions": prediction.source_actions.detach()}
+                planner_diagnostics["gradient_norm_before_clip"] = self._step(loss, self.planner_parameters, self.planner_optimizer)
                 planner_value = float(loss.detach())
                 self.planner_updates += 1
+            with replay_rng(self.model, planner_rng), torch.no_grad():
+                updated = self.rollout.run(self._encode(prepared.decision), None, window_steps=self.window_steps,
+                    horizon_windows=self.config.horizon_windows, update_reference_commands=False, velocity_commands=commands)
+                after_change = planner_parameter_change(self.planner_parameters, anchor)
+                after_loss = planner_trajectory_loss(decision.path_state.pose, updated.body_delta, target,
+                    position_tolerance_m=self.config.position_tolerance_m, heading_tolerance_rad=self.config.heading_tolerance_rad)
+            planner_diagnostics.update(
+                after_update=planner_metrics(decision.path_state.pose, updated, target,
+                    ctrl_dt=self.ctrl_dt, position_tolerance_m=self.config.position_tolerance_m,
+                    heading_tolerance_rad=self.config.heading_tolerance_rad),
+                trajectory_loss_after=float(after_loss), parameter_change_after=float(after_change),
+                penalty_loss_after=float(self.config.parameter_change_scale * after_change))
+            diagnostics["planner"] = planner_diagnostics
+            evidence.update(planner_start=input_evidence(prepared.decision), planner_rng=planner_rng,
+                            reference_poses=target, velocity_commands=commands,
+                            planner_prediction_after={"body_delta": updated.body_delta, "actions": updated.actions,
+                                                      "source_actions": updated.source_actions})
         if wm_value is not None or planner_value is not None:
-            self._publication = adapter_state(self.model), adapter_state(self.policy)
-        return PlannerUpdateResult(wm_value, planner_value, body_value, motion_value, time.perf_counter() - started)
+            wm_after, planner_after = adapter_state(self.model), adapter_state(self.policy)
+            diagnostics.update(counters_after=self.update_counters(),
+                               wm_parameter_step=parameter_metrics(wm_before, wm_after),
+                               planner_parameter_step=parameter_metrics(planner_before, planner_after))
+            evidence.update(wm_adapters_before=wm_before, wm_adapters_after=wm_after,
+                            planner_adapters_before=planner_before, planner_adapters_after=planner_after,
+                            planner_anchor=self.planner_anchor)
+            self._write_diagnostics(diagnostics, evidence)
+            self._publication = wm_after, planner_after
+        return PlannerUpdateResult(wm_value, planner_value, body_value, motion_value,
+                                   time.perf_counter() - started, diagnostics)
 
-    def _step(self, loss: torch.Tensor, parameters: list[torch.nn.Parameter], optimizer: torch.optim.Optimizer) -> None:
+    def _step(self, loss: torch.Tensor, parameters: list[torch.nn.Parameter], optimizer: torch.optim.Optimizer) -> float:
         try:
             if not bool(torch.isfinite(loss)):
                 raise ValueError("non-finite online adaptation loss")
             loss.backward()
             if any(parameter.grad is None for parameter in parameters):
                 raise RuntimeError("an owned LoRA parameter received no gradient")
-            torch.nn.utils.clip_grad_norm_(parameters, self.config.max_grad_norm, error_if_nonfinite=True)
+            norm = torch.nn.utils.clip_grad_norm_(parameters, self.config.max_grad_norm, error_if_nonfinite=True)
             optimizer.step()
+            return float(norm)
         finally:
             optimizer.zero_grad(set_to_none=True)
 
@@ -298,10 +397,11 @@ class PlannerLoRAUpdater:
                     name = target + "." + name[len(target + ".base."):]
                     break
             base_state[name] = value.detach().cpu().clone()
-        payload = {"format": "sttt_planner_wm_lora", "schema_version": 1, "contract": self.contract,
+        payload = {"format": "sttt_planner_wm_lora", "schema_version": 2, "contract": self.contract,
             "model_config": asdict(self.model.config), "base_state": base_state,
             "wm_targets": list(self.wm_targets), "planner_targets": list(self.planner_targets),
             "wm_adapters": adapter_state(self.model), "planner_adapters": adapter_state(self.policy),
+            "planner_anchor": _safe_training_state(self.planner_anchor),
             "config": asdict(self.config), "wm_optimizer": _safe_training_state(self.model_optimizer.state_dict()),
             "planner_optimizer": _safe_training_state(self.planner_optimizer.state_dict()),
             "counters": {**self.update_counters(), "observed_windows": self.observed_windows}}
@@ -316,8 +416,8 @@ class PlannerLoRAUpdater:
     def restore(cls, path: str | Path, rollout_factory: Any, *, device: str = "cpu",
                 expected_contract: Mapping[str, Any] | None = None) -> PlannerLoRAUpdater:
         payload = torch.load(path, map_location=device, weights_only=True)
-        if not isinstance(payload, dict) or payload.get("format") != "sttt_planner_wm_lora" or payload.get("schema_version") != 1:
-            raise ValueError("expected a dual Planner/WM LoRA checkpoint; A/FiLM artifacts are incompatible")
+        if not isinstance(payload, dict) or payload.get("format") != "sttt_planner_wm_lora" or payload.get("schema_version") != 2:
+            raise ValueError("expected a version-2 dual Planner/WM LoRA checkpoint with a fixed parameter anchor")
         contract = canonical_contract(payload["contract"])
         if expected_contract is not None and contract != canonical_contract(expected_contract):
             raise ValueError("saved dual LoRA control contract differs from deployment")
@@ -328,6 +428,14 @@ class PlannerLoRAUpdater:
             raise ValueError("dual LoRA manifests differ from their architecture")
         load_adapter_state(updater.model, payload["wm_adapters"])
         load_adapter_state(updater.policy, payload["planner_adapters"])
+        anchor = payload.get("planner_anchor")
+        if not isinstance(anchor, dict) or set(anchor) != set(updater.planner_anchor):
+            raise ValueError("saved Planner penalty anchor differs from its parameter manifest")
+        for name, reference in updater.planner_anchor.items():
+            value = anchor[name]
+            if not isinstance(value, torch.Tensor) or value.shape != reference.shape or not bool(torch.isfinite(value).all()):
+                raise ValueError(f"invalid Planner penalty anchor: {name}")
+            reference.copy_(value)
         updater.model_optimizer.load_state_dict(payload["wm_optimizer"])
         updater.planner_optimizer.load_state_dict(payload["planner_optimizer"])
         for name in ("wm_updates", "planner_updates", "observed_windows"):
