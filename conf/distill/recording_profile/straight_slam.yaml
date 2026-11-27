@@ -3,6 +3,10 @@ defaults:
   - straight_payload
   - _self_
 
+env:
+  runtime_payload:
+    added_mass_kg: 1.0
+
 # Pair with path_following=planner_wm_lora; never select the OAT IDM updater.
 online_adaptation:
   enabled: false
