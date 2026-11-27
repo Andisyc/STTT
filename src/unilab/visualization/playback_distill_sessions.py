@@ -361,8 +361,9 @@ def create_fada_playback_session(
     path_enabled = bool(getattr(path_node, "enabled", False))
     path_setup = None
     latent_setup = None
+    planner_setup = None
     path_mode = getattr(path_node, "mode", "response")
-    if path_enabled and path_mode not in {"response", "latent_wm"}:
+    if path_enabled and path_mode not in {"response", "latent_wm", "planner_wm_lora"}:
         raise ValueError(f"unknown path_following mode: {path_mode}")
     official_playback = None
     if path_enabled and (future_transform is not None or prepare_rollout_branch):
@@ -424,7 +425,7 @@ def create_fada_playback_session(
             )
         else:
             architecture = loaded.policy.config
-            if future_transform is not None or (path_enabled and path_mode == "latent_wm") or OmegaConf.select(cfg, "training.play_use_checkpoint_profile", default=False):
+            if future_transform is not None or (path_enabled and path_mode in {"latent_wm", "planner_wm_lora"}) or OmegaConf.select(cfg, "training.play_use_checkpoint_profile", default=False):
                 from unilab.algos.torch.distill.fada.legacy_deployment import legacy_profile_from_checkpoint
                 from unilab.algos.torch.distill.fada.runtime_policy import get_fada_runtime_spec
                 legacy_profile = legacy_profile_from_checkpoint(loaded.checkpoint)
@@ -432,12 +433,21 @@ def create_fada_playback_session(
                 architecture = get_fada_runtime_spec(loaded.policy)
 
         if path_enabled:
-            if official_profile is None and (legacy_profile is None or path_mode != "latent_wm"):
-                raise ValueError("response path following requires official playback; latent mode also admits bound g1_fada_state_v2")
+            if official_profile is None and (legacy_profile is None or path_mode not in {"latent_wm", "planner_wm_lora"}):
+                raise ValueError("response path following requires official playback; WM modes also admit bound g1_fada_state_v2")
             if path_mode == "latent_wm":
                 from unilab.algos.torch.sttt.path_following.latent_runtime import prepare_latent_path_following
 
                 latent_setup = prepare_latent_path_following(
+                    path_node, cfg=cfg, playback_cfg=playback_cfg, root_dir=root_dir,
+                    checkpoint_path=checkpoint_path, policy=loaded.policy,
+                    profile=official_profile if official_profile is not None else legacy_profile,
+                    spec=architecture, device=device_name,
+                )
+            elif path_mode == "planner_wm_lora":
+                from unilab.algos.torch.sttt.path_following.planner_runtime import prepare_planner_path_following
+
+                planner_setup = prepare_planner_path_following(
                     path_node, cfg=cfg, playback_cfg=playback_cfg, root_dir=root_dir,
                     checkpoint_path=checkpoint_path, policy=loaded.policy,
                     profile=official_profile if official_profile is not None else legacy_profile,
@@ -473,7 +483,7 @@ def create_fada_playback_session(
             f"horizon={architecture.prediction_horizon}"
         )
 
-    if path_enabled and path_setup is None and latent_setup is None:
+    if path_enabled and path_setup is None and latent_setup is None and planner_setup is None:
         raise ValueError("path following requires official policy action mode")
 
     # B2: 通过 distill task config 构造环境, 键盘模式先收敛为静止零速 reset, 再核对 policy IO.
@@ -616,7 +626,20 @@ def create_fada_playback_session(
                 f"lora_alpha={lora_config.alpha}, lora_dropout={lora_config.dropout}"
             )
 
-        if latent_setup is not None:
+        if planner_setup is not None:
+            from unilab.algos.torch.sttt.path_following.planner_runtime import PlannerPathFollowingController
+
+            path_updater = planner_setup.bind(official_playback, env)
+            path_config = planner_setup.runtime
+            pose_factory = resolved_deps.get("create_pose_runtime")
+            controller = PlannerPathFollowingController(
+                controller, official_playback, env, path_updater, path_config,
+                pose_runtime=(pose_factory(env, path_config.pose) if pose_factory is not None else None),
+                save_checkpoint_path=planner_setup.save_checkpoint_path,
+            )
+            log(f"Planner/WM LoRA enabled: source={path_config.pose.odometry_source}, "
+                f"window_steps={path_updater.window_steps}, horizon_windows={path_updater.config.horizon_windows}")
+        elif latent_setup is not None:
             from unilab.algos.torch.sttt.path_following.latent_runtime import LatentPathFollowingController
 
             path_updater = latent_setup.bind(official_playback, env)

@@ -392,7 +392,7 @@ class LatentPathFollowingUpdater:
                     name = target + "." + name[len(target + ".base."):]
                     break
             base_state[name] = value.detach().cpu()
-        payload = {"format": "sttt_latent_path_following_online", "schema_version": 6,
+        payload = {"format": "sttt_latent_path_following_online", "schema_version": 7,
                    "model_config": asdict(self.model.config), "contract": self.contract,
                    "base_state": base_state, "adapters": adapters, "adapter_targets": list(self.adapter_targets),
                    "actor": self.actor.state_dict(), "config": asdict(self.config),
@@ -407,8 +407,8 @@ class LatentPathFollowingUpdater:
     @classmethod
     def restore(cls, path: str | Path, rollout_factory: Any, *, device: str = "cpu", expected_contract: Mapping[str, Any] | None = None) -> LatentPathFollowingUpdater:
         payload = torch.load(path, map_location=device, weights_only=True)
-        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 6:
-            raise ValueError("expected a version-6 velocity-readout/FiLM/context online checkpoint")
+        if not isinstance(payload, dict) or payload.get("format") != "sttt_latent_path_following_online" or payload.get("schema_version") != 7:
+            raise ValueError("expected a version-7 persistent-position-offset online checkpoint; reset pulsed-residual adaptation state")
         if expected_contract is not None and payload["contract"] != dict(expected_contract):
             raise ValueError("online checkpoint control contract differs from deployment")
         model = LatentWorldModel(WorldModelConfig.from_mapping(payload["model_config"])).to(device)

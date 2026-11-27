@@ -1,0 +1,9 @@
+defaults:
+  - path_following_evaluate
+  - planner_wm_online@planner_learning
+  - _self_
+
+world_model_checkpoint: null
+# Both modes execute the identical timed reference and Planner–Tracker.
+# frozen: no updates; wm_only: physical identification; online: WM then Planner.
+modes: []  # Explicit subset of [planner_wm_frozen, planner_wm_only, planner_wm_online].

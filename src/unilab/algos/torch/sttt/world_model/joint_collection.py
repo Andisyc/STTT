@@ -137,7 +137,7 @@ class BatchedSequenceCollector:
 
     def __init__(self, cfg, *, root_dir, output_dir, capture: CaptureSchedule, trajectory,
                  num_envs: int, stream_offset: int, seed: int, condition: str,
-                 device: str, playback_deps=None, resume_state=None):
+                 device: str, playback_deps=None, resume_state=None, validation_only: bool = False):
         from unilab.visualization.playback_distill_sessions import create_fada_playback_session
 
         if str(cfg.training.task_name) != "G1WalkFlat" or str(cfg.training.sim_backend) != "mujoco":
@@ -147,6 +147,7 @@ class BatchedSequenceCollector:
         if OmegaConf.select(cfg, "online_adaptation.enabled", default=False) or OmegaConf.select(cfg, "path_following.enabled", default=False):
             raise ValueError("joint collection must not start a deployment learner")
         self.capture, self.distribution = capture, trajectory
+        self.validation_only = validation_only
         self.num_envs, self.stream_offset, self.condition = num_envs, stream_offset, condition
         self.rng = np.random.default_rng(seed)
         self.output = Path(output_dir).resolve()
@@ -359,7 +360,8 @@ class BatchedSequenceCollector:
             identity = f"{self.capture_id}:{self.stream_offset + row}:{self.episode_counter}"
             self.episode_counter += 1
             record = _Episode(self.contract, self.capture.max_episode_steps, observations[row], poses[row], identity,
-                self.capture.window_steps, initial_errors[row], validation=self.rng.random() < self.capture.validation_fraction)
+                self.capture.window_steps, initial_errors[row],
+                validation=self.validation_only or self.rng.random() < self.capture.validation_fraction)
             if len(self._records) < self.num_envs:
                 self._records.append(record)
             else:

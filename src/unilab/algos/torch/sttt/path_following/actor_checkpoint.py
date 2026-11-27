@@ -48,7 +48,7 @@ def save_actor_checkpoint(path: str | Path, actor: LatentResidualActor, model: L
     stage = "film" if actor.adaptation_dim else "base"
     if learner_state.get("algorithm") != "rsl_rl_ppo" or learner_state.get("stage") != stage:
         raise ValueError("actor artifacts require matching base/FiLM PPO learner state")
-    payload = {"format": FORMAT, "schema_version": 4, "stage": stage,
+    payload = {"format": FORMAT, "schema_version": 5, "stage": stage,
                "physical_model_identity": physical_model_identity(model, contract),
                "contract": canonical_contract(contract),
                "architecture": {"feature_dim": actor.feature_dim, "hidden_dims": actor.hidden_dims,
@@ -71,8 +71,8 @@ def load_actor_checkpoint(path: str | Path, model: LatentWorldModel, contract: M
                           residual_limits: tuple[float, ...] | None = None) -> tuple[LatentResidualActor, dict[str, Any]]:
     parameter = next(model.parameters())
     payload = torch.load(path, map_location=parameter.device, weights_only=True)
-    if not isinstance(payload, dict) or payload.get("format") != FORMAT or payload.get("schema_version") != 4:
-        raise ValueError("expected a version-4 base/FiLM PPO artifact; legacy Actor/Critic state is not a PPO resume")
+    if not isinstance(payload, dict) or payload.get("format") != FORMAT or payload.get("schema_version") != 5:
+        raise ValueError("expected a version-5 persistent-position-offset PPO artifact; retrain A/FiLM from pulsed-residual artifacts")
     if payload["contract"] != canonical_contract(contract):
         raise ValueError("pretrained actor belongs to another physical control contract")
     if require_model_identity and payload["physical_model_identity"] != physical_model_identity(model, contract):

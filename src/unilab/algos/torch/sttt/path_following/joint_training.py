@@ -127,7 +127,7 @@ class JointTrainer:
 
 class _Collectors:
     def __init__(self, options, distribution, *, root, policy, profile, output, seed, device, source_overrides,
-                 resume_states=None, playback_deps=None):
+                 resume_states=None, playback_deps=None, validation_only=False):
         self.items: list[BatchedSequenceCollector] = []
         self._resources = ExitStack()
         if resume_states is not None and len(resume_states) != len(options.conditions):
@@ -142,7 +142,8 @@ class _Collectors:
                                                seed=physical_seed, profile_path=profile)
                 collector = BatchedSequenceCollector(source, root_dir=root, output_dir=output / condition["name"],
                     capture=options, trajectory=distribution, num_envs=count, stream_offset=offset, seed=physical_seed,
-                    condition=condition["name"], device=device, playback_deps=playback_deps, resume_state=saved)
+                    condition=condition["name"], device=device, playback_deps=playback_deps, resume_state=saved,
+                    validation_only=validation_only)
                 self.items.append(collector)
                 self._resources.callback(collector.close)
                 if collector.contract != self.items[0].contract:
@@ -212,20 +213,23 @@ def _validation_capture(options, distribution, *, root, policy, profile, output,
                         expected_contract, playback_deps):
     validation_options = replace(options, num_envs=len(options.conditions), validation_fraction=0.)
     collectors = _Collectors(validation_options, distribution, root=root, policy=policy, profile=profile,
-        output=output, seed=seed, device=device, source_overrides=overrides, playback_deps=playback_deps)
+        output=output, seed=seed, device=device, source_overrides=overrides, playback_deps=playback_deps,
+        validation_only=True)
     try:
         if collectors.contract != expected_contract:
             raise ValueError("held-out physical capture changed source execution contract")
         replay = EpisodeReplay(expected_contract, capacity_transitions=max(options.max_episode_steps * (options.validation_episodes + len(options.conditions)), options.max_episode_steps),
                                rollout_windows=1, seed=seed)
+        collectors.bind_validation_replay(replay)
         quota = math.ceil(options.validation_episodes / len(options.conditions))
         selected = {condition["name"]: [] for condition in options.conditions}
         while any(len(paths) < quota for paths in selected.values()):
-            block = collectors.advance(options.steps_per_iteration, replay, versions=TrainingVersions())
-            for directory in block.completed_directories:
-                condition = json.loads((Path(directory) / "capture.json").read_text())["condition"]
-                if len(selected[condition]) < quota:
-                    selected[condition].append(directory)
+            collectors.advance(options.steps_per_iteration, replay, versions=TrainingVersions())
+            for collector in collectors.items:
+                paths = selected[collector.condition]
+                for directory in collector.validation_directories:
+                    if len(paths) < quota and directory not in paths:
+                        paths.append(directory)
         return [path for paths in selected.values() for path in paths]
     finally:
         collectors.close()
@@ -397,7 +401,7 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                   "residual_window_s": options.capture.window_steps * contract["data"]["ctrl_dt"],
                   "wm_horizon_s": raw["wm"]["training"]["rollout_windows"] * options.capture.window_steps * contract["data"]["ctrl_dt"],
                   "context_horizon_s": context_config.horizon_windows * options.capture.window_steps * contract["data"]["ctrl_dt"]}
-        summary = {"format": "sttt_joint_latent_pretraining", "schema_version": 5, "run_id": run_id,
+        summary = {"format": "sttt_joint_latent_pretraining", "schema_version": 6, "run_id": run_id,
             "complete": False, "training_complete": False, "config": raw, "physical_timing": timing,
             "residual_limits_rad": list(actor_options.residual_limit_rad), "best_pairs": best_pairs,
             "resume_physics": "new episodes with restored PPO/context/replay state", "validation_dirs": validation_dirs}
@@ -468,15 +472,24 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                            wm_updates=wm_learner.updates, physical_control_steps=engine.physical_control_steps)
             if raw["evaluation"]["enabled"]:
                 from .pretrained_evaluation import evaluate_pretrained_actor
-                random_state = _random_state(device)
-                try:
-                    result = evaluate_pretrained_actor(raw["evaluation"], root_dir=root,
-                        output_dir=output / "evaluation" / f"{stage}_{engine.iteration:07d}",
-                        policy_checkpoint=policy, profile_path=profile, world_model_checkpoint=wm_path,
-                        actor_checkpoint=actor_path, source_overrides=raw["source_overrides"],
-                        device=str(device), conditions=options.capture.conditions, playback_deps=playback_deps)
-                finally:
-                    _restore_random_state(random_state, device)
+                full_config = dict(raw["evaluation"])
+                periodic_config = full_config.pop("periodic", {})
+                brief_config = {**full_config, **periodic_config}
+                brief_config["num_steps"] = min(brief_config["num_steps"], full_config["num_steps"])
+                brief_config["seeds"] = full_config["seeds"][:1]
+
+                def evaluate(config, suffix=""):
+                    random_state = _random_state(device)
+                    try:
+                        return evaluate_pretrained_actor(config, root_dir=root,
+                            output_dir=output / "evaluation" / f"{stage}_{engine.iteration:07d}{suffix}",
+                            policy_checkpoint=policy, profile_path=profile, world_model_checkpoint=wm_path,
+                            actor_checkpoint=actor_path, source_overrides=raw["source_overrides"],
+                            device=str(device), conditions=options.capture.conditions, playback_deps=playback_deps)
+                    finally:
+                        _restore_random_state(random_state, device)
+
+                result = evaluate(brief_config)
                 row["evaluation"] = result
                 mode = "adaptive_context" if actor.adaptation_dim else "pretrained_actor"
                 failures = sum(int(run[mode]["failure_event"]) for run in result["runs"])
@@ -492,6 +505,9 @@ def run_joint_pretraining(cfg, *, root_dir=".", playback_deps=None):
                         best_pairs[stage] = {**pair, "score": score,
                             "improves_nominal": failures <= sum(int(run["nominal"]["failure_event"]) for run in result["runs"]) and tracking < 1.}
                 summary["evaluation"] = result
+                if final and brief_config != full_config:
+                    row["final_evaluation"] = evaluate(full_config, "_final")
+                    summary["evaluation"] = row["final_evaluation"]
             _publish(output / "summary.json", summary)
 
         with (output / "training.jsonl").open("x") as log:

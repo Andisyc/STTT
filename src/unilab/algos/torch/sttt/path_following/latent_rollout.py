@@ -22,6 +22,17 @@ from unilab.algos.torch.sttt.world_model.types import LatentState, RolloutStart
 
 
 @dataclass(frozen=True)
+class PlannerRolloutResult:
+    """Physical predictions without an external residual actor."""
+
+    actions: torch.Tensor
+    source_actions: torch.Tensor
+    commands: torch.Tensor
+    final_latent: LatentState
+    body_delta: torch.Tensor
+
+
+@dataclass(frozen=True)
 class RolloutResult:
     """Every transition uses ENV actions; Tracker histories use SOURCE actions.
 
@@ -258,21 +269,28 @@ class PlannerTrackerRollout:
     def run(
         self,
         start: RolloutStart,
-        actor: nn.Module,
+        actor: nn.Module | None,
         *,
         window_steps: int,
         horizon_windows: int,
         update_reference_commands: bool = True,
         stochastic_policy: bool = False,
         adaptation_context: torch.Tensor | None = None,
-    ) -> RolloutResult:
-        """Replan every tick; hold each actor residual for ``window_steps`` ticks."""
+        velocity_commands: torch.Tensor | None = None,
+    ) -> RolloutResult | PlannerRolloutResult:
+        """Replan every tick; an optional actor supplies window-held reference offsets."""
         for name, value in (("window_steps", window_steps), ("horizon_windows", horizon_windows)):
             if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         observations, history_actions, valid = start.observation_history, start.action_history, start.history_valid_mask
         self._validate_history(observations, history_actions, valid)
         self._validate_context(observations.shape[0], start.errors, start.command, start.previous_residual)
+        steps = int(window_steps * horizon_windows)
+        if velocity_commands is not None:
+            if update_reference_commands or velocity_commands.shape != (observations.shape[0], steps, 3):
+                raise ValueError("timed commands require [batch,steps,3] and no geometric feedback")
+            if velocity_commands.device != start.command.device or velocity_commands.dtype != start.command.dtype or not bool(torch.isfinite(velocity_commands).all()):
+                raise ValueError("timed commands must be finite and match the policy")
         latent, errors, command = start.latent, start.errors, start.command
         path = start.path_state
         if path is None:
@@ -285,7 +303,7 @@ class PlannerTrackerRollout:
         previous_residual = start.previous_residual
         decision_contexts = []
         with _frozen_model(self.model):
-            for step in range(int(window_steps * horizon_windows)):
+            for step in range(steps):
                 # Step zero already contains the current real observation.
                 # At future ticks, decode the just-advanced prior and pair it
                 # with the preceding clipped SOURCE command, never ENV action.
@@ -305,7 +323,9 @@ class PlannerTrackerRollout:
                     command = self._advance_command(command)
                     if update_reference_commands:
                         command = path.command(command)
-                if step % window_steps == 0:
+                if velocity_commands is not None:
+                    command = torch.cat((velocity_commands[:, step], command[:, 3:]), -1)
+                if actor is not None and step % window_steps == 0:
                     preview = path.preview()
                     inputs = (latent.feature(), errors, command, preview, previous_residual)
                     decision_contexts.append(actor.context(*inputs))
@@ -318,14 +338,17 @@ class PlannerTrackerRollout:
                         held_residual = actor(*inputs, adaptation_context=adaptation_context)
                     residuals.append(held_residual)
                     previous_residual = held_residual
-                assert held_residual is not None
                 nominal = invoke_fada_planner(self.policy, self.spec,
                     observations, history_actions, command, history_valid_mask=valid)
-                adapted = compose_joint_position_residual(
-                    nominal, held_residual, ctrl_dt=self.profile.ctrl_dt,
-                    position_scale=self.position_scale, velocity_scale=self.velocity_scale,
-                    observation_contract=self.spec.observation_contract,
-                )
+                if actor is None:
+                    adapted = nominal
+                else:
+                    assert held_residual is not None
+                    adapted = compose_joint_position_residual(
+                        nominal, held_residual, ctrl_dt=self.profile.ctrl_dt,
+                        position_scale=self.position_scale, velocity_scale=self.velocity_scale,
+                        observation_contract=self.spec.observation_contract,
+                    )
                 chunk = invoke_fada_idm(
                     self.policy.idm, self.spec, observations, history_actions,
                     command, adapted, history_valid_mask=valid,
@@ -336,23 +359,29 @@ class PlannerTrackerRollout:
                 action = self.source_to_env(source_action)
                 motion = self.model.motion(latent, action)
                 body_deltas.append(motion)
-                risk = self.model.risk(latent, action).sigmoid()
-                _, _, target = path.reference.sample(path.progress[:, None])
-                target_speeds.append(target[:, 0])
-                following = path.advance(motion)
-                next_errors = following.errors()
-                forward = errors[:, 1].cos() * motion[:, 0] - errors[:, 1].sin() * motion[:, 1]
-                delta = torch.stack((forward,
-                                     next_errors[:, 0] - errors[:, 0],
-                                     wrap_to_pi(next_errors[:, 1] - errors[:, 1])), -1)
-                path, errors = following, next_errors
+                if actor is not None:
+                    risks.append(self.model.risk(latent, action).sigmoid())
+                    _, _, target = path.reference.sample(path.progress[:, None])
+                    target_speeds.append(target[:, 0])
+                    following = path.advance(motion)
+                    next_errors = following.errors()
+                    forward = errors[:, 1].cos() * motion[:, 0] - errors[:, 1].sin() * motion[:, 1]
+                    delta = torch.stack((forward,
+                                         next_errors[:, 0] - errors[:, 0],
+                                         wrap_to_pi(next_errors[:, 1] - errors[:, 1])), -1)
+                    path, errors = following, next_errors
+                    all_errors.append(errors)
+                    deltas.append(delta)
                 latent, _ = self.model.prior(latent, action)
-                all_errors.append(errors)
-                deltas.append(delta)
                 actions.append(action)
                 source_actions.append(source_action)
-                risks.append(risk)
                 commands.append(command)
+        if actor is None:
+            return PlannerRolloutResult(
+                actions=torch.stack(actions, 1), source_actions=torch.stack(source_actions, 1),
+                commands=torch.stack(commands, 1), final_latent=latent,
+                body_delta=torch.stack(body_deltas, 1),
+            )
         final_command = self._advance_command(command)
         if update_reference_commands:
             final_command = path.command(final_command)

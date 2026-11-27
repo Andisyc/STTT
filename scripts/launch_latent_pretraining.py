@@ -183,8 +183,8 @@ def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str,
                      *, ppo_minibatches: int | None = None, stage: str = "all") -> list[str]:
     def relative(path: Path) -> str:
         return str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
-    if stage not in ("all", "base"):
-        raise ValueError("stage must be all or base")
+    if stage not in ("all", "base", "wm"):
+        raise ValueError("stage must be all, base or wm")
     if ppo_minibatches is not None and (type(ppo_minibatches) is not int or ppo_minibatches < 1):
         raise ValueError("PPO minibatch count must be a positive integer")
 
@@ -199,6 +199,10 @@ def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str,
             split = identity.get("split", default_split)
             if split not in ("train", "validation"):
                 raise ValueError(f"unknown capture split: {directory}")
+            # This directory is the dedicated held-out capture owner. Older
+            # versions incorrectly wrote split=train here; never train on it.
+            if default_split == "validation":
+                split = "validation"
             key = split, tuple(identity.get("episode_ids") or [relative(directory)])
             count = json.loads(manifest_path.read_text())["transition_count"]
             if key not in captures or count > captures[key][0]:
@@ -209,6 +213,13 @@ def training_command(data_dir: Path, checkpoint: Path, output: Path, uv: str,
         raise RuntimeError("指定目录中缺少已采集的训练集或验证集；不会重新采集初始数据。")
     if not checkpoint.is_file():
         raise RuntimeError(f"策略 checkpoint 不存在：{checkpoint}")
+    if stage == "wm":
+        if ppo_minibatches is not None:
+            raise ValueError("WM-only pretraining has no PPO minibatches")
+        return [uv, "run", "--no-sync", "scripts/train_latent_world_model.py",
+                "--config-name=planner_wm_pretraining", f"output_dir={json.dumps(str(output))}",
+                "data.train_dirs=" + json.dumps(train, separators=(",", ":")),
+                "data.validation_dirs=" + json.dumps(validation, separators=(",", ":"))]
     # All model/environment/schedule settings remain owned by latent_pretraining.yaml.
     return [uv, "run", "--no-sync", "scripts/pretrain_latent_path_following.py",
             f"policy_checkpoint={json.dumps(relative(checkpoint))}",
@@ -297,8 +308,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--data-dir", type=Path, required=True, help="包含 capture/nominal 和 validation 的旧运行目录")
     parser.add_argument("--policy-checkpoint", type=Path, default=Path("model/mixup_0kg/student_iter_0031.pt"))
     parser.add_argument("--output-dir", type=Path, help="新运行目录；默认自动生成时间戳")
-    parser.add_argument("--stage", choices=("all", "base"), default="all",
-                        help="base 仅执行阶段1；all 依次执行阶段1和阶段2")
+    parser.add_argument("--stage", choices=("all", "base", "wm"), default="wm",
+                        help="wm 仅预训练世界模型；base/all 保留原有 A／FiLM 训练入口")
     parser.add_argument("--ppo-minibatches", type=int, help="每个 PPO epoch 的 minibatch 数；默认由训练 YAML 指定")
     parser.add_argument("--dry-run", action="store_true", help="仅显示资源分配，不创建输出文件或启动进程")
     options = parser.parse_args(argv)

@@ -1,0 +1,10 @@
+defaults:
+  - latent_world_model
+  - _self_
+
+# Offline physical-model fitting only: no environment, A, FiLM, PPO or Planner updates.
+device: cuda
+training:
+  max_updates: 10000
+  batch_size: 1024
+  microbatch_size: 256

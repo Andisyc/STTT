@@ -322,6 +322,11 @@ def test_online_lora_and_context_ownership_and_resume(tmp_path):
     assert not updater.replay and not updater.records
     assert updater.calibration_complete
     torch.testing.assert_close(updater.context_adapter.context, restored.context_adapter.context, rtol=0, atol=0)
+    old_payload = torch.load(checkpoint, weights_only=True)
+    old_payload["schema_version"] = 6
+    torch.save(old_payload, tmp_path / "old-online.pt")
+    with pytest.raises(ValueError, match="persistent-position-offset"):
+        LatentPathFollowingUpdater.restore(tmp_path / "old-online.pt", factory, expected_contract=contract)
 
 
 def test_public_training_resume_and_whole_capture_split(tmp_path):
@@ -700,8 +705,8 @@ def test_legacy_native_zero_residual_history_and_multistep_credit(tmp_path):
     residual = torch.full((1, 29), .02)
     adapted = compose_joint_position_residual(torch.zeros(1, 3, 66), residual, ctrl_dt=.02,
         position_scale=1., velocity_scale=.05, observation_contract="g1_fada_state_v2")
-    torch.testing.assert_close(adapted[:, 0, 6:35], residual)
-    torch.testing.assert_close(adapted[:, 0, 35:64], residual * 2.5)
+    torch.testing.assert_close(adapted[:, :, 6:35], residual[:, None, :].expand(-1, 3, -1))
+    assert torch.count_nonzero(adapted[:, :, 35:64]) == 0
     assert not bool(adapted[:, :, 3:6].any()) and not bool(adapted[:, :, 64:66].any())
     assert proprio_tilt_rad(query.observation_history[0, -1].numpy(), observation_contract="g1_fada_state_v2") < .01
 

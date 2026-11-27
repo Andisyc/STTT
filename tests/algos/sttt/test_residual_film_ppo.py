@@ -231,15 +231,19 @@ def test_timeout_bootstraps_physical_terminal_not_preaction_or_reset_state(tmp_p
 
 def test_two_stage_entry_reaches_native_ppo_context_and_frozen_wm(tmp_path):
     from dataclasses import asdict
+    import json
+    from pathlib import Path
     from hydra import compose, initialize_config_dir
     from test_latent_pretraining import physical_inputs
     from test_latent_world_model import ROOT, legacy_case
     from unilab.algos.torch.sttt.path_following.actor_checkpoint import load_actor_checkpoint
-    from unilab.algos.torch.sttt.path_following.joint_training import run_joint_pretraining
+    from unilab.algos.torch.sttt.path_following.joint_training import _validation_capture, run_joint_pretraining
+    from unilab.algos.torch.sttt.path_following.joint_config import JointTrainingConfig
+    from unilab.algos.torch.sttt.path_following.pretraining import TrajectoryDistribution
     from unilab.algos.torch.sttt.path_following.trajectory import TrajectoryConfig
-    from unilab.algos.torch.sttt.world_model.checkpoint import load_world_model
+    from unilab.algos.torch.sttt.world_model.checkpoint import canonical_contract, load_world_model
     case, profile = legacy_case(tmp_path / "source")
-    policy, _, model = physical_inputs(tmp_path, source=(case, profile))
+    policy, contract, model = physical_inputs(tmp_path, source=(case, profile))
     wrapped = case.deps["wrapper_cls"]
     def refreshable(env, **kwargs):
         wrapper = wrapped(env, **kwargs)
@@ -262,6 +266,7 @@ def test_two_stage_entry_reaches_native_ppo_context_and_frozen_wm(tmp_path):
     cfg.capture.conditions = [{"name": "nominal", "source_overrides": []}]
     cfg.capture.initial_min_transitions = 4
     cfg.capture.max_episode_steps = 4
+    cfg.capture.validation_episodes = 1
     cfg.capture.steps_per_iteration = cfg.capture.window_steps = 2
     cfg.capture.residual_amplitude_rad, cfg.capture.risk_tilt_limit_rad = .005, .8
     cfg.capture.command_ranges = [[-.4, .6], [-.2, .2], [-.4, .4]]
@@ -280,14 +285,27 @@ def test_two_stage_entry_reaches_native_ppo_context_and_frozen_wm(tmp_path):
     cfg.evaluation.num_steps = 4
     cfg.evaluation.seeds = [1]
     cfg.evaluation.trajectories = [{"kind": "straight", "speed_m_s": .35}]
+    cfg.evaluation.periodic.num_steps = 2
+    cfg.evaluation.periodic.forecast_enabled = False
+    options = JointTrainingConfig.from_mapping(cfg)
+    heldout = _validation_capture(options.capture, TrajectoryDistribution.from_mapping(cfg.actor.trajectories),
+        root=ROOT, policy=policy, profile=None, output=tmp_path / "heldout-capture", seed=99,
+        device="cpu", overrides=[], expected_contract=canonical_contract(contract), playback_deps=case.deps)
+    assert len(heldout) == 1
+    assert json.loads((Path(heldout[0]) / "capture.json").read_text())["split"] == "validation"
     result = run_joint_pretraining(cfg, root_dir=ROOT, playback_deps=case.deps)
     assert result["training_complete"] and result["base_updates"] == result["film_updates"] == 1
     assert result["wm_updates"] == 2 and result["physical_control_steps"] == 8
     assert result["physical_timing"]["wm_horizon_s"] == pytest.approx(.04)
     assert result["latest_pair"]["stage"] == "film"
     assert set(result["best_pairs"]) == {"base", "film"}
-    assert (tmp_path / "joint/evaluation/base_0000001/summary.json").is_file()
-    assert (tmp_path / "joint/evaluation/film_0000002/summary.json").is_file()
+    for stage, iteration, mode in (("base", 1, "pretrained_actor"), ("film", 2, "adaptive_context")):
+        brief = json.loads((tmp_path / f"joint/evaluation/{stage}_{iteration:07d}/summary.json").read_text())
+        full = json.loads((tmp_path / f"joint/evaluation/{stage}_{iteration:07d}_final/summary.json").read_text())
+        assert brief["runs"][0][mode]["executed_steps"] == 2
+        assert brief["runs"][0][mode]["forecast_diagnostics"] == []
+        assert full["runs"][0][mode]["executed_steps"] == 4
+        assert full["runs"][0][mode]["forecast_diagnostics"]
     base = load_world_model(tmp_path / "joint/base_world_model.pt")
     final = load_world_model(result["world_model_checkpoint"])
     for name, value in base.model.state_dict().items():

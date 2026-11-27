@@ -179,6 +179,11 @@ def test_native_ppo_actor_artifact_preserves_weights_and_model_binding(tmp_path)
         next(model.parameters()).add_(.01)
     with pytest.raises(ValueError, match="another WM base"):
         load_actor_checkpoint(checkpoint, model, contract, TrajectoryConfig())
+    old_payload = torch.load(checkpoint, weights_only=True)
+    old_payload["schema_version"] = 4
+    torch.save(old_payload, tmp_path / "old-actor.pt")
+    with pytest.raises(ValueError, match="persistent-position-offset"):
+        load_actor_checkpoint(tmp_path / "old-actor.pt", model, contract, TrajectoryConfig())
 
 
 
@@ -501,7 +506,7 @@ def test_launch_reuses_all_conditions_without_training_on_heldout_prefixes(tmp_p
         ("capture/nominal/full", "train", "same-episode", 8),
         ("capture/payload/full", "train", "payload-episode", 8),
         ("capture/friction/heldout", "validation", "heldout-episode", 8),
-        ("validation/full", "validation", "initial-heldout", 8),
+        ("validation/full", "train", "initial-heldout", 8),  # Legacy incorrect sidecar.
     ]
     for name, split, episode, count in rows:
         directory = tmp_path / name
@@ -608,6 +613,10 @@ def test_joint_effective_updates_and_paired_resume(tmp_path):
         path = save_joint_checkpoint(tmp_path / "joint.pt", engine.world_model, engine.actor, engine.replay,
             run_id="paired-test", signature={"schedule": asdict(schedule)}, state=saved_state)
         payload = load_joint_checkpoint(path)
+        old_payload = {**payload, "schema_version": 5}
+        torch.save(old_payload, tmp_path / "old-joint.pt")
+        with pytest.raises(ValueError, match="persistent-position-offset"):
+            load_joint_checkpoint(tmp_path / "old-joint.pt")
         engine.update_iteration()
         restored, _ = build(LatentWorldModel(initial_model.config))
         restored.world_model.model.load_state_dict(payload["world_model"])

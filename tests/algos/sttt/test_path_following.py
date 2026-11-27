@@ -1,4 +1,4 @@
-"""Consumer-visible compact64 intervention invariants."""
+"""Consumer-visible persistent joint-position intervention invariants."""
 
 from __future__ import annotations
 
@@ -9,29 +9,28 @@ from unilab.algos.torch.sttt.path_following import compose_joint_position_residu
 
 
 @pytest.mark.parametrize("horizon", [1, 4])
-def test_physical_residual_uses_first_frame_and_scaled_velocity_difference(horizon):
-    future = torch.arange(2 * horizon * 64, dtype=torch.float64).reshape(2, horizon, 64) / 100
+@pytest.mark.parametrize("contract,width,position,velocity", [
+    ("official_compact_64_v1", 64, slice(3, 32), slice(32, 61)),
+    ("g1_fada_state_v2", 66, slice(6, 35), slice(35, 64)),
+])
+def test_physical_residual_offsets_entire_future_without_velocity_pulses(horizon, contract, width, position, velocity):
+    future = torch.arange(2 * horizon * width, dtype=torch.float64).reshape(2, horizon, width) / 100
     original = future.clone()
     residual = torch.linspace(-0.03, 0.04, 58, dtype=torch.float64).reshape(2, 29).requires_grad_()
-    dt, sq, sv = 0.02, 2.5, 0.15
+    sq = 2.5
     adapted = compose_joint_position_residual(
-        future, residual, ctrl_dt=dt, position_scale=sq, velocity_scale=sv,
+        future, residual, ctrl_dt=.02, position_scale=sq, velocity_scale=.15,
+        observation_contract=contract,
     )
-    offsets = torch.cat((residual[:, None], torch.zeros(2, horizon - 1, 29, dtype=torch.float64)), dim=1)
     expected = original.clone()
-    expected[:, :, 3:32] += sq * offsets
-    expected[:, :, 32:61] += sv * torch.diff(offsets, dim=1, prepend=torch.zeros(2, 1, 29)) / dt
+    expected[:, :, position] += sq * residual[:, None, :]
     torch.testing.assert_close(adapted, expected, rtol=1e-14, atol=1e-14)
     assert torch.equal(future, original)
-    assert torch.equal(adapted[:, :, :3], original[:, :, :3])
-    assert torch.equal(adapted[:, :, 61:], original[:, :, 61:])
-    objective = 2 * adapted[:, 0, 3].sum() + 3 * adapted[:, 0, 32].sum()
-    if horizon > 1:
-        objective = objective + 5 * adapted[:, 1, 32].sum()
+    assert torch.equal(adapted[:, :, velocity], original[:, :, velocity])
+    weights = torch.arange(1, horizon + 1, dtype=torch.float64)[None, :, None]
+    objective = (adapted[:, :, position] * weights).sum() + adapted[:, :, velocity].sum()
     gradient, = torch.autograd.grad(objective, residual)
-    expected_gradient = torch.zeros_like(residual)
-    expected_gradient[:, 0] = 2 * sq + (3 - (5 if horizon > 1 else 0)) * sv / dt
-    torch.testing.assert_close(gradient, expected_gradient, rtol=1e-14, atol=0)
+    torch.testing.assert_close(gradient, torch.full_like(residual, sq * horizon * (horizon + 1) / 2), rtol=1e-14, atol=0)
 
 
 def test_zero_residual_preserves_arbitrary_planner_velocity_exactly():

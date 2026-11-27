@@ -26,7 +26,9 @@ from unilab.visualization.playback_distill_sessions import create_fada_playback_
 from unilab.visualization.playback_sessions import RslRlPlaybackConfig
 
 _LATENT_MODES = {"latent_wm", "latent_wm_frozen"}
-_MODES = {"nominal", "oat", "oat_path"} | _LATENT_MODES
+_PLANNER_MODES = {"planner_wm_frozen", "planner_wm_only", "planner_wm_online"}
+_WM_MODES = _LATENT_MODES | _PLANNER_MODES
+_MODES = {"nominal", "oat", "oat_path"} | _WM_MODES
 _CONDITIONS = {"clean", "delayed_payload"}
 _HEADER = (
     "timestamp_ns", "elapsed_s", "completed_step", "valid", "x_m", "y_m", "z_m",
@@ -136,7 +138,7 @@ class _RuntimeEvidence:
                     self.saturation_sum += saturation
                     self.saturation_max = max(self.saturation_max, saturation)
             elif record["event"] == "learning_complete":
-                self.latest.update({key: record[key] for key in ("a_updates", "context_updates", "b_updates") if key in record})
+                self.latest.update({key: record[key] for key in ("a_updates", "context_updates", "b_updates", "wm_updates", "planner_updates") if key in record})
             row["new_measurement"] = new_measurement
             self.handle.write(json.dumps(_plain(row), allow_nan=False) + "\n")
             self.records += 1
@@ -150,6 +152,7 @@ class _RuntimeEvidence:
             "unique_max_age_s": self.age_max / 1e9 if self.unique else None,
             "a_updates": self.latest.get("a_updates"), "b_updates": self.latest.get("b_updates"),
             "context_updates": self.latest.get("context_updates"),
+            "wm_updates": self.latest.get("wm_updates"), "planner_updates": self.latest.get("planner_updates"),
             "dropped_windows": self.latest.get("dropped_windows", {}),
             "expired_queries": self.latest.get("expired_queries"),
         }
@@ -182,7 +185,7 @@ def _run_episode(
         "profile": (_file_identity(playback_cfg.official_playback.profile_path)
                     if playback_cfg.official_playback.profile_path else {"source": "checkpoint.runtime_config.source_profile"}),
         "response": _file_identity(playback_cfg.path_following.checkpoint_path) if mode == "oat_path" else None,
-        "world_model": _file_identity(playback_cfg.path_following.checkpoint_path) if mode in _LATENT_MODES else None,
+        "world_model": _file_identity(playback_cfg.path_following.checkpoint_path) if mode in _WM_MODES else None,
         "actor_critic": (_file_identity(playback_cfg.path_following.pretrained_actor_checkpoint)
                          if mode in _LATENT_MODES and playback_cfg.path_following.pretrained_actor_checkpoint else None),
     }
@@ -334,7 +337,7 @@ def _run_episode(
         "actual_payload_event_start_ns": attach_time_ns,
         "condition_observed": condition_observed,
         "tracking_success": complete and condition_observed and tracking_ok and metric_summary["progress_pass"],
-        "runtime": evidence.summary(mode == "oat_path" or mode in _LATENT_MODES),
+        "runtime": evidence.summary(mode == "oat_path" or mode in _WM_MODES),
     }
     if mode in _LATENT_MODES:
         summary["risk_diagnostics"] = session.controller.risk_diagnostics() if session is not None else None
@@ -350,8 +353,9 @@ def run_path_following_evaluation(
         raise TypeError("evaluation requires the independent Hydra configuration")
     expected = {"output_dir", "policy_checkpoint", "profile_path", "response_checkpoint", "pose_source", "device", "modes", "conditions", "seeds", "duration_s", "source_overrides", "thresholds"}
     latent_keys = {"world_model_checkpoint", "pretrained_actor_checkpoint", "latent_learning"}
-    if set(cfg) != expected and set(cfg) != expected | latent_keys:
-        raise ValueError("use conf/sttt/path_following_evaluate.yaml or conf/sttt/latent_path_following_evaluate.yaml")
+    planner_keys = {"world_model_checkpoint", "planner_learning"}
+    if set(cfg) not in (expected, expected | latent_keys, expected | planner_keys, expected | latent_keys | planner_keys):
+        raise ValueError("use an explicit response, latent or planner_wm evaluation configuration")
     raw_thresholds = OmegaConf.to_container(cfg.thresholds, resolve=True)
     if not isinstance(raw_thresholds, dict) or set(raw_thresholds) != set(PathFollowingThresholds.__dataclass_fields__):
         raise ValueError("provide all five explicit physical evaluation thresholds")
@@ -375,6 +379,17 @@ def run_path_following_evaluation(
             raise ValueError("latent_learning requires online WM/context overrides")
         from unilab.algos.torch.sttt.world_model.online import LatentOnlineConfig
         LatentOnlineConfig.from_mapping(latent_learning["online"])
+    planner_learning = None
+    if set(modes) & _PLANNER_MODES:
+        if not planner_keys <= set(cfg):
+            raise ValueError("Planner modes require world_model_checkpoint and planner_learning")
+        planner_learning = _plain(cfg.planner_learning)
+        if not isinstance(planner_learning, dict) or set(planner_learning) != {"online"}:
+            raise ValueError("planner_learning requires online dual LoRA overrides")
+        from unilab.algos.torch.sttt.world_model.planner_online import PlannerOnlineConfig
+        planner_config = PlannerOnlineConfig.from_mapping(planner_learning["online"])
+        if planner_config.trajectory.kind != "straight":
+            raise ValueError("this evaluator scores a straight path; select a straight timed reference")
     for seed in seeds:
         if _integer(seed, "seed") >= 2**32:
             raise ValueError("evaluation seed must be less than 2**32")
@@ -399,7 +414,7 @@ def run_path_following_evaluation(
     response = resolve(cfg.response_checkpoint) if "oat_path" in modes else None
     if response is not None:
         _file_identity(response)
-    world_model = resolve(cfg.world_model_checkpoint) if set(modes) & _LATENT_MODES else None
+    world_model = resolve(cfg.world_model_checkpoint) if set(modes) & _WM_MODES else None
     if world_model is not None:
         _file_identity(world_model)
     pretrained_actor = resolve(cfg.pretrained_actor_checkpoint) if set(modes) & _LATENT_MODES and cfg.pretrained_actor_checkpoint else None
@@ -413,7 +428,9 @@ def run_path_following_evaluation(
         for condition in conditions:
             for mode in modes:
                 overrides = ["task=g1_walk_flat/mujoco", "recording_profile=straight_payload", *list(cfg.source_overrides)]
-                if mode in _LATENT_MODES:
+                if mode in _PLANNER_MODES:
+                    overrides.append("path_following=planner_wm_lora")
+                elif mode in _LATENT_MODES:
                     overrides.append("path_following=latent_wm")
                 else:
                     overrides.append("path_following=online" if mode == "oat_path" else "~path_following")
@@ -434,6 +451,14 @@ def run_path_following_evaluation(
                     OmegaConf.update(playback_cfg, "path_following.pose.odometry_source", cfg.pose_source)
                     if mode == "latent_wm_frozen":
                         OmegaConf.update(playback_cfg, "path_following.learning.online.adapt_world_model", False, force_add=True)
+                elif mode in _PLANNER_MODES:
+                    OmegaConf.update(playback_cfg, "path_following.checkpoint_path", str(world_model))
+                    OmegaConf.update(playback_cfg, "path_following.learning", planner_learning, merge=True, force_add=True)
+                    OmegaConf.update(playback_cfg, "path_following.pose.odometry_source", cfg.pose_source)
+                    OmegaConf.update(playback_cfg, "path_following.learning.online.adapt_world_model",
+                                     mode != "planner_wm_frozen", force_add=True)
+                    OmegaConf.update(playback_cfg, "path_following.learning.online.adapt_planner",
+                                     mode == "planner_wm_online", force_add=True)
                 if playback_cfg.training.task_name != "G1WalkFlat" or playback_cfg.training.sim_backend != "mujoco":
                     raise ValueError("evaluation is limited to g1_walk_flat/mujoco")
                 if OmegaConf.select(playback_cfg, "interactive.keyboard") or OmegaConf.select(playback_cfg, "demo.figure_eight.enabled") or OmegaConf.select(playback_cfg, "env.commands.heading_command") or OmegaConf.select(playback_cfg, "env.commands.resampling_time") != 0:

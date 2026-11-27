@@ -180,7 +180,7 @@ def evaluate_pretrained_actor(cfg: Mapping[str, Any], *, root_dir: str | Path, o
                         risk_tilt_limit_rad=contract["source"]["risk_tilt_limit_rad"], device=device, trajectory=trajectory,
                         actor_checkpoint=actor_checkpoint if mode != "nominal" else None,
                         world_model_checkpoint=world_model_checkpoint if mode != "nominal" else None,
-                        forecast_windows=horizon if mode != "nominal" else None,
+                        forecast_windows=horizon if mode != "nominal" and cfg.get("forecast_enabled", True) else None,
                         adapt_context=mode == "adaptive_context", playback_deps=playback_deps)
                     if result["localization_invalidated"] or result["reset_crossed"]:
                         raise RuntimeError("evaluation crossed a physical/localization boundary")

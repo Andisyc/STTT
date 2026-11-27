@@ -19,17 +19,17 @@ def compose_joint_position_residual(
     """Return an owned, differentiable Planner future in its declared layout.
 
     Inputs are [B,K,D] and [B,29], in source joint order. Positions are
-    checkpoint-scaled relative angles; residuals are physical radians. For
-    r[-1]=0, r[0]=residual, r[k>=1]=0, add s_q*r[k] to position and
-    s_v*(r[k]-r[k-1])/ctrl_dt to velocity. Original Planner velocities are
-    retained underneath this increment, so zero residual is an exact identity.
-    Gyro and gravity are never derived from joint positions. No clamp is applied.
+    checkpoint-scaled relative angles; residuals are physical radians.
+    Apply the same position offset to every future frame. Preserve the
+    Planner's velocity, gyro, gravity and phase targets exactly; a held
+    position offset introduces no additional velocity target.
+    Zero residual is an exact identity. No clamp is applied.
     """
     _validate_scales(ctrl_dt, position_scale, velocity_scale)
     if observation_contract == "official_compact_64_v1":
-        width, position, velocity = 64, slice(3, 32), slice(32, 61)
+        width, position = 64, slice(3, 32)
     elif observation_contract == "g1_fada_state_v2":
-        width, position, velocity = 66, slice(6, 35), slice(35, 64)
+        width, position = 66, slice(6, 35)
     else:
         raise ValueError("unsupported joint intervention observation contract")
     if (
@@ -47,11 +47,7 @@ def compose_joint_position_residual(
     if not bool(torch.isfinite(nominal_future).all()) or not bool(torch.isfinite(residual_rad).all()):
         raise ValueError("joint intervention requires finite future and residual")
     adapted = nominal_future.clone()
-    adapted[:, 0, position] += position_scale * residual_rad
-    velocity_increment = (velocity_scale / ctrl_dt) * residual_rad
-    adapted[:, 0, velocity] += velocity_increment
-    if adapted.shape[1] > 1:
-        adapted[:, 1, velocity] -= velocity_increment
+    adapted[:, :, position] += position_scale * residual_rad[:, None, :]
     if not bool(torch.isfinite(adapted).all()):
         raise ValueError("joint intervention produced a non-finite future")
     return adapted
