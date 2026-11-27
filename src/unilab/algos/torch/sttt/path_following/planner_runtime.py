@@ -129,6 +129,7 @@ class PlannerPathFollowingController(PathFollowingController):
                  save_checkpoint_path: Path | None = None) -> None:
         self.ego_history = CausalEgoHistory(max_records=config.max_cached_queries)
         self.save_checkpoint_path = save_checkpoint_path
+        self.last_pose_update = None
         parameter = next(updater.model.parameters())
         self.reference_geometry = ReferenceTrajectory.generate(updater.config.trajectory,
                                                                device=parameter.device, dtype=parameter.dtype)
@@ -180,6 +181,7 @@ class PlannerPathFollowingController(PathFollowingController):
             return torch.cat((velocity[:, 0], template[:, 3:]), -1)
 
     def _receive_poses(self, update: Any, now_ns: int) -> None:
+        self.last_pose_update = update
         self.ego_history.add(update.received_poses)
         record = self.updater.records.get(self._steps)
         if record is not None:
@@ -218,6 +220,7 @@ class PlannerPathFollowingController(PathFollowingController):
             return
         self._finish_learning(wait=True)
         self.ego_history.clear()
+        self.last_pose_update = None
         self.updater.discard_pending()
         super().reset(done)
 

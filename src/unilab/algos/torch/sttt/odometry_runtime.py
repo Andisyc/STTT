@@ -360,6 +360,7 @@ class _CuvslamPoseRuntime(_TimelineEvidence):
         self._env = env
         self._sensor_config = spatial.sensor
         self._visual_mode = spatial.visual_mode
+        self._slam_enabled = spatial.slam_enabled
         self._imu_noise = None if spatial.imu_noise is None else dict(spatial.imu_noise)
         self._converter = PelvisPoseConverter()
         self._stream: BackendSensorStream | None = None
@@ -552,6 +553,7 @@ class _CuvslamPoseRuntime(_TimelineEvidence):
                 stream.calibration,
                 mode=self._visual_mode,
                 imu_noise=self._imu_noise,
+                slam_enabled=self._slam_enabled,
             )
         except BaseException:
             # Free the half-opened stream, but keep the original failure visible.

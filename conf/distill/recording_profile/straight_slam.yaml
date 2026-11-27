@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - straight_payload
+  - _self_
+
+# Pair with path_following=planner_wm_lora; never select the OAT IDM updater.
+online_adaptation:
+  enabled: false
+demo:
+  rendering:
+    enabled: true
+interactive:
+  camera_distance: 4.0
+  camera_elevation: -40.0

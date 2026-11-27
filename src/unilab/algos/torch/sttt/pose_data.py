@@ -21,6 +21,7 @@ class PoseRuntimeConfig:
     sensor: StereoSensorConfig = field(default_factory=StereoSensorConfig)
     visual_mode: str = "stereo"
     imu_noise: dict[str, float] | None = None
+    slam_enabled: bool = False
     max_pose_gap_s: float = 0.1
     max_alignment_age_s: float = 0.2
     max_pose_samples: int = 512
@@ -33,6 +34,8 @@ class PoseRuntimeConfig:
                 raise ValueError(f"{name} must be positive and finite")
         if self.odometry_source not in {"simulation", "cuvslam"}:
             raise ValueError("odometry_source must be simulation or cuvslam")
+        if not isinstance(self.slam_enabled, bool):
+            raise ValueError("slam_enabled must be boolean")
         if isinstance(self.sensor, Mapping):
             object.__setattr__(self, "sensor", StereoSensorConfig(**self.sensor))
         if not isinstance(self.sensor, StereoSensorConfig):

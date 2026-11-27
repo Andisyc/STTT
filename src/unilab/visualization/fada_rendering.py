@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
@@ -85,6 +86,33 @@ class FADAPlaybackRendering:
         self.origin_xy = data.xpos[self.focus_body_id, :2].copy()
         self.origin_yaw = float(np_yaw_from_quat(data.xquat[self.focus_body_id:self.focus_body_id + 1])[0])
         self.reference_route: np.ndarray | None = None
+        controller = getattr(session, "controller", None)
+        self.path_controller = (
+            controller if hasattr(controller, "last_pose_update") else None
+        )
+        self.measured_path: deque[np.ndarray] = deque(maxlen=2048)
+        self._pose_origin: np.ndarray | None = None
+        self._pose_rotation: np.ndarray | None = None
+        self._pose_identity: tuple | None = None
+        self._pose_timestamp_ns: int | None = None
+        self.pose_samples = 0
+        self.pose_status = "waiting"
+        self.path_errors: np.ndarray | None = None
+        self.pose_label: str | None = None
+        if self.path_controller is not None:
+            pose_config = self.path_controller.config.pose
+            self.pose_label = (
+                "cuVSLAM SLAM" if pose_config.slam_enabled else "cuVSLAM VO"
+            ) if pose_config.odometry_source == "cuvslam" else "SIMULATION TRUTH (not SLAM)"
+            # One-time registration is display-only; it never reaches the estimator.
+            base = session.env.get_base_pos()[0]
+            yaw = float(np_yaw_from_quat(session.env.get_base_quat())[0])
+            self._display_origin = np.asarray(base[:2], dtype=np.float64).copy()
+            self._display_rotation = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
+            xy = self.path_controller.reference_geometry.xy[0].detach().cpu().numpy()
+            xy = xy @ self._display_rotation.T + self._display_origin
+            ground_z = float(np.min(session.env.get_foot_pos()[0, :, 2]))
+            self.reference_route = np.column_stack((xy, np.full(len(xy), ground_z + 0.015)))
         program = getattr(session, "command_program", None)
         if self.config.enabled and program is not None:
             # The command program starts along the robot's initial forward axis.
@@ -157,6 +185,32 @@ class FADAPlaybackRendering:
             self.last_reset_time = self.elapsed_s
         if bool(np.asarray(self.session.info.get("runtime_payload_attached_this_step", [False])).reshape(-1)[0]):
             self.last_attach_time = self.elapsed_s
+        controller = self.path_controller
+        if controller is not None and controller.last_pose_update is not None:
+            update = controller.last_pose_update
+            self.pose_status = update.status
+            for received in update.received_poses:
+                pose = received.pose
+                if not pose.valid or pose.navigation_from_pelvis is None:
+                    continue
+                identity = (pose.sequence_id, pose.tracking_epoch, pose.frame_id)
+                if identity != self._pose_identity:
+                    self.measured_path.clear()
+                    self._pose_identity, self._pose_timestamp_ns = identity, None
+                    matrix = pose.navigation_from_pelvis
+                    self._pose_origin = matrix[:2, 3].copy()
+                    yaw = math.atan2(matrix[1, 0], matrix[0, 0])
+                    self._pose_rotation = np.array([[math.cos(yaw), -math.sin(yaw)], [math.sin(yaw), math.cos(yaw)]])
+                if self._pose_timestamp_ns is not None and pose.timestamp_ns <= self._pose_timestamp_ns:
+                    continue
+                local = (pose.navigation_from_pelvis[:2, 3] - self._pose_origin) @ self._pose_rotation
+                world = local @ self._display_rotation.T + self._display_origin
+                self.measured_path.append(np.array([*world, self.reference_route[0, 2] + 0.015]))
+                self._pose_timestamp_ns = pose.timestamp_ns
+                self.pose_samples += 1
+            reference = controller.collector.reference
+            if reference is not None:
+                self.path_errors = reference.current_state.errors()[0].detach().cpu().numpy()
 
     def _payload_active(self) -> bool:
         return bool(np.asarray(self.session.info.get("runtime_payload_active", [False])).reshape(-1)[0])
@@ -184,19 +238,26 @@ class FADAPlaybackRendering:
         available = max(0, scene.maxgeom - scene.ngeom)
         # Prefer the newest real footprints when the scene is unusually small.
         records = records[-available:] if available else ()
-        route = self.reference_route if self.config.show_reference_route else None
-        route_count = min(len(route) - 1, available - len(records)) if route is not None else 0
-        if route_count >= 4:
-            indices = np.linspace(0, len(route) - 1, route_count + 1, dtype=int)
+        paths = []
+        if self.config.show_reference_route and self.reference_route is not None:
+            paths.append((self.reference_route, [0.55, 0.6, 0.65, 0.85]))
+        if len(self.measured_path) > 1:
+            paths.append((np.asarray(self.measured_path), [0.1, 0.9, 0.35, 1.0]))
+        per_path = max(0, available - len(records)) // max(1, len(paths))
+        for points, color in paths:
+            count = min(len(points) - 1, per_path, 512)
+            if count < 1:
+                continue
+            indices = np.linspace(0, len(points) - 1, count + 1, dtype=int)
             for start, end in zip(indices[:-1], indices[1:]):
                 geom = scene.geoms[scene.ngeom]
                 mujoco.mjv_initGeom(
                     geom, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3),
-                    np.eye(3).reshape(9), np.array([0.55, 0.6, 0.65, 0.65], dtype=np.float32),
+                    np.eye(3).reshape(9), np.asarray(color, dtype=np.float32),
                 )
                 mujoco.mjv_connector(
                     geom, mujoco.mjtGeom.mjGEOM_CAPSULE, self.config.route_width_m,
-                    route[start], route[end],
+                    points[start], points[end],
                 )
                 scene.ngeom += 1
         for record in records:
@@ -233,6 +294,12 @@ class FADAPlaybackRendering:
             f"yaw error={yaw_error:+.1f}deg resets={self.reset_count}",
             updates,
         ]
+        if self.pose_label is not None:
+            details[0] = f"Pose: {self.pose_label} | {self.pose_status} | measurements={self.pose_samples}"
+            details[1] = (
+                f"Measured lateral={self.path_errors[0]:+.3f}m yaw={math.degrees(self.path_errors[1]):+.2f}deg"
+                if self.path_errors is not None else "Measured path error: waiting for paired poses"
+            )
         if self.config.enabled:
             program = getattr(self.session, "command_program", None)
             if program is not None:
@@ -241,7 +308,11 @@ class FADAPlaybackRendering:
                 command = np.asarray(self.session.info["commands"])[0, :3]
                 details.append(f"segment={segment}/{len(program.commands)} command=[{command[0]:+.2f}, {command[1]:+.2f}, {command[2]:+.2f}]")
             if self.config.show_reference_route and self.reference_route is not None:
-                details.append("Gray: reference route | Blue: left touchdown | Orange: right touchdown")
+                details.append(
+                    "Gray: task reference | Green: measured trajectory"
+                    if self.path_controller is not None
+                    else "Gray: reference route | Blue: left touchdown | Orange: right touchdown"
+                )
         alert = None
         if self.last_attach_time is not None and self.elapsed_s - self.last_attach_time < 2.0:
             alert = f"PAYLOAD ATTACHED +{added_mass:g} kg"

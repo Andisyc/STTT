@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -159,7 +161,25 @@ def record_fada_playback(
         )
 
     report_progress(0, started)
-    with mujoco.Renderer(model, height=config.height, width=config.width) as renderer:
+    with ExitStack() as resources:
+        renderer = resources.enter_context(mujoco.Renderer(model, height=config.height, width=config.width))
+        controller = rendering.path_controller
+        evidence = (
+            resources.enter_context(output.with_suffix(".poses.jsonl").open("w", encoding="utf-8", buffering=1))
+            if controller is not None else None
+        )
+        if evidence is not None:
+            evidence.write(json.dumps({
+                "event": "source", "pose_source": rendering.pose_label,
+                "reference_task_xy_m": controller.reference_geometry.xy[0].detach().cpu().tolist(),
+                "clock": "backend_physical_nanoseconds", "truth_fallback": False,
+            }) + "\n")
+            log(f"Pose source: {rendering.pose_label}; measured trajectory: {output.with_suffix('.poses.jsonl')}")
+            resources.callback(lambda: evidence.write(json.dumps({
+                "event": "end",
+                "status": None if controller.last_pose_update is None else controller.last_pose_update.status,
+                "runtime": controller.drain_trace(),
+            }, allow_nan=False) + "\n"))
         with media.VideoWriter(str(output), shape=(config.height, config.width), fps=config.fps) as writer:
             for step_index in range(num_steps + 1):
                 if step_index:
@@ -167,6 +187,26 @@ def record_fada_playback(
                     rendering.observe_step()
                     if session.last_update_stats is not None:
                         log(f"sim_time={step_index * ctrl_dt:.3f}s Update: {session.last_update_stats}")
+                    if evidence is not None and controller.last_pose_update is not None:
+                        update = controller.last_pose_update
+                        evidence.write(json.dumps({
+                            "event": "poses", "control_step": step_index,
+                            "timestamp_ns": controller.poses.clock.timestamp_ns,
+                            "sequence_id": update.sequence_id, "tracking_epoch": update.tracking_epoch,
+                            "status": update.status, "dropped_intervals": update.dropped_intervals,
+                            "updates": session.last_update_stats,
+                            "poses": [{
+                                "timestamp_ns": item.pose.timestamp_ns,
+                                "available_at_ns": item.available_at_ns, "valid": item.pose.valid,
+                                "frame_id": item.pose.frame_id,
+                                "source_timestamps_ns": item.pose.source_timestamps_ns,
+                                "navigation_from_pelvis": (
+                                    item.pose.navigation_from_pelvis.tolist()
+                                    if item.pose.navigation_from_pelvis is not None else None
+                                ),
+                            } for item in update.received_poses],
+                            "runtime": controller.drain_trace(),
+                        }, allow_nan=False) + "\n")
                     if np.any(session.info.get("runtime_payload_attached_this_step", False)):
                         log(f"sim_time={step_index * ctrl_dt:.3f}s Payload attached: {session.info['runtime_payload_added_mass_kg']} kg")
 

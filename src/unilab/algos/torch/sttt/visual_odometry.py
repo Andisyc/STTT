@@ -1,13 +1,13 @@
-"""cuVSLAM stereo / stereo-inertial odometry over the backend stereo stream.
+"""cuVSLAM stereo / stereo-inertial odometry and optional synchronous SLAM.
 
 The adapter owns no clock: every frame is submitted with the backend's physics
 ``timestamp_ns`` unchanged, so the estimate timeline stays on simulation time.
 It never reads ground truth; ``RigReferencePose`` is only compared afterwards by
 the evaluation, never injected here.
 
-The returned estimate is ``world_from_rig`` in the library's odometry world,
-not the MuJoCo world. The rig is the left optical frame (X-right, Y-down,
-Z-forward). Quaternions are converted from ``(x, y, z, w)`` to ``wxyz``.
+The returned estimate is in the library's navigation world, not the MuJoCo
+world. With SLAM enabled, only the SLAM output is accepted. The rig is the left
+optical frame (X-right, Y-down, Z-forward); quaternions are converted to wxyz.
 
 PyCuVSLAM is imported lazily and, when missing, fails with an install hint: no
 fallback estimator exists, so a missing wheel must surface as a hard error.
@@ -87,9 +87,13 @@ class CuvslamOdometry:
         *,
         mode: str = "stereo",
         imu_noise: Mapping[str, float] | None = None,
+        slam_enabled: bool = False,
     ) -> None:
         if mode not in {"stereo", "inertial"}:
             raise ValueError(f"mode must be 'stereo' or 'inertial', got {mode!r}")
+        if not isinstance(slam_enabled, bool):
+            raise ValueError("slam_enabled must be boolean")
+        self._slam_enabled = slam_enabled
         self._mode = mode
         self._inertial = mode == "inertial"
         self._calibration = _validated_calibration(calibration, inertial=self._inertial)
@@ -103,12 +107,16 @@ class CuvslamOdometry:
         self._rig = _build_rig(self._cuvslam, self._calibration, imu_noise=self._imu_noise)
         self._odometry_config = self._cuvslam.Tracker.OdometryConfig(
             odometry_mode=(
-                self._cuvslam.Tracker.OdometryMode.Inertial
+                self._cuvslam.pycuvslam.Odometry.OdometryMode.Inertial
                 if self._inertial
-                else self._cuvslam.Tracker.OdometryMode.Multicamera
+                else self._cuvslam.pycuvslam.Odometry.OdometryMode.Multicamera
             ),
             async_sba=False,
             rectified_stereo_camera=True,
+        )
+        self._slam_config = (
+            self._cuvslam.Tracker.SlamConfig(sync_mode=True, gt_align_mode=False)
+            if slam_enabled else None
         )
         # Building a Tracker initialises CUDA state, so it happens on the first
         # frame rather than in the constructor of a possibly unused object.
@@ -144,13 +152,15 @@ class CuvslamOdometry:
             _as_uint8_image(frame.left_rgb, name="left", calibration=self._calibration),
             _as_uint8_image(frame.right_rgb, name="right", calibration=self._calibration),
         ]
-        estimate = self._tracker.track(timestamp_ns, images)[0]
+        estimate, slam_pose = self._tracker.track(timestamp_ns, images)
         self._last_timestamp_ns = timestamp_ns
-
+        if self._slam_enabled and self._tracker.get_loop_closure_poses():
+            # Historical motion labels cannot span a pose-graph coordinate jump.
+            raise RuntimeError("cuVSLAM loop closure changed the map; reset the online task explicitly")
         world_from_rig = estimate.world_from_rig
-        if world_from_rig is None:
+        if world_from_rig is None or (self._slam_enabled and slam_pose is None):
             return VisualOdometryEstimate(timestamp_ns, frame.sequence_id, False, None, None)
-        pose = world_from_rig.pose
+        pose = slam_pose if self._slam_enabled else world_from_rig.pose
         return VisualOdometryEstimate(
             timestamp_ns,
             frame.sequence_id,
@@ -173,6 +183,7 @@ class CuvslamOdometry:
         self._release_tracker()
         self._rig = None
         self._odometry_config = None
+        self._slam_config = None
 
     def _restart(self) -> None:
         self._release_tracker()
@@ -181,11 +192,10 @@ class CuvslamOdometry:
     def _start_tracker(self) -> Any:
         if self._rig is None or self._odometry_config is None:
             raise RuntimeError("CuvslamOdometry is closed")
-        # Disable SLAM; async_sba=False keeps odometry bundle adjustment synchronous.
         return self._cuvslam.Tracker(
             self._rig,
             odom_config=self._odometry_config,
-            slam_config=None,
+            slam_config=self._slam_config,
         )
 
     def _release_tracker(self) -> None:
@@ -226,17 +236,17 @@ def _import_cuvslam() -> Any:
         raise ImportError(_INSTALL_HINT) from error
     missing = [
         name
-        for name in ("Rig", "Camera", "Pose", "ImuCalibration", "ImuMeasurement", "Tracker")
+        for name in ("Rig", "Camera", "Pose", "ImuCalibration", "ImuMeasurement", "pycuvslam", "Tracker")
         if not hasattr(cuvslam, name)
     ]
     tracker = getattr(cuvslam, "Tracker", None)
-    for name in ("OdometryConfig", "OdometryMode"):
+    for name in ("OdometryConfig", "SlamConfig"):
         if not hasattr(tracker, name):
             missing.append(f"Tracker.{name}")
-    modes = getattr(tracker, "OdometryMode", None)
+    modes = getattr(getattr(getattr(cuvslam, "pycuvslam", None), "Odometry", None), "OdometryMode", None)
     for name in ("Multicamera", "Inertial"):
         if not hasattr(modes, name):
-            missing.append(f"Tracker.OdometryMode.{name}")
+            missing.append(f"pycuvslam.Odometry.OdometryMode.{name}")
     if missing:
         raise ImportError(
             f"Installed PyCuVSLAM lacks {missing}; this adapter targets the cuVSLAM 17.0.1 Tracker API"

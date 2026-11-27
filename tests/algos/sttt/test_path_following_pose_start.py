@@ -1,7 +1,11 @@
 """Real pose conversion/alignment with a deterministic visual estimator, no CUDA."""
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import numpy as np
+import pytest
 
 from unilab.algos.torch.sttt.odometry_runtime import create_pose_runtime
 from unilab.algos.torch.sttt.pose_data import ControlInterval, PoseRuntimeConfig
@@ -69,3 +73,52 @@ def test_initial_and_autoreset_frame_reach_alignment_without_truth_or_duplicate_
     finally:
         source.close()
     assert stream.closed
+
+
+@pytest.mark.parametrize("slam_enabled,missing_slam", [(False, False), (True, False), (True, True)])
+def test_sdk_navigation_pose_does_not_substitute_odometry_for_missing_slam(monkeypatch, slam_enabled, missing_slam):
+    from unilab.algos.torch.sttt.visual_odometry import CuvslamOdometry
+    from unilab.base.backend.sensors import StereoCalibration
+
+    odometry_pose = SimpleNamespace(translation=[9., 8., 7.], rotation=[0., 0., 0., 1.])
+    slam_pose = SimpleNamespace(translation=[1., 2., 3.], rotation=[0., 0., 0., 1.])
+
+    class Tracker:
+        OdometryConfig = SlamConfig = SimpleNamespace
+
+        def __init__(self, rig, *, odom_config, slam_config):
+            self.slam_config = slam_config
+
+        def track(self, timestamp_ns, images):
+            return SimpleNamespace(world_from_rig=SimpleNamespace(pose=odometry_pose)), None if missing_slam else slam_pose
+
+        def get_loop_closure_poses(self):
+            return ()
+
+    sdk = SimpleNamespace(
+        Tracker=Tracker, Rig=lambda cameras: SimpleNamespace(cameras=cameras),
+        Camera=SimpleNamespace, Pose=SimpleNamespace, ImuCalibration=SimpleNamespace,
+        ImuMeasurement=SimpleNamespace,
+        pycuvslam=SimpleNamespace(Odometry=SimpleNamespace(OdometryMode=SimpleNamespace(Multicamera=0, Inertial=1))),
+    )
+    monkeypatch.setitem(sys.modules, "cuvslam", sdk)
+    right = np.eye(4)
+    right[0, 3] = .06
+    calibration = StereoCalibration(8, 8, (10., 10.), (4., 4.), np.eye(4), right, np.eye(4), 500.)
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    tracker = CuvslamOdometry(calibration, slam_enabled=slam_enabled)
+    try:
+        result = tracker.track(StereoFrame(0, 123_456, image, image, ()))
+        assert result.timestamp_ns == 123_456
+        if slam_enabled and missing_slam:
+            assert not result.valid and result.position is None and result.quaternion is None
+        else:
+            np.testing.assert_array_equal(result.position, [1., 2., 3.] if slam_enabled else [9., 8., 7.])
+            np.testing.assert_array_equal(result.quaternion, [1., 0., 0., 0.])
+        if slam_enabled:
+            assert tracker._tracker.slam_config.sync_mode and not tracker._tracker.slam_config.gt_align_mode
+            tracker._tracker.get_loop_closure_poses = lambda: (SimpleNamespace(timestamp_ns=123_456),)
+            with pytest.raises(RuntimeError, match="loop closure"):
+                tracker.track(StereoFrame(0, 123_457, image, image, ()))
+    finally:
+        tracker.close()

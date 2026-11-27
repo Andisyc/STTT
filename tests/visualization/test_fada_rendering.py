@@ -71,3 +71,48 @@ def test_non_learning_steps_preserve_legacy_update_count_and_loss(rendering, sta
     view.session.last_update_stats = {"loss": 0.25}
     view.observe_step()
     assert view.status(data).details[2] == "LoRA updates=2 loss=0.25"
+
+
+def test_draws_shared_reference_and_measured_slam_not_robot_truth(rendering):
+    import torch
+
+    from unilab.algos.torch.sttt.path_following.trajectory import MeasuredTrajectory, ReferenceTrajectory, TrajectoryConfig
+    from unilab.algos.torch.sttt.pose_data import PoseRuntimeConfig, PoseRuntimeUpdate, ReceivedPose, TimedPelvisPose
+    from unilab.visualization.fada_rendering import FADADemoRenderConfig
+
+    previous, data = rendering
+    session = previous.session
+    session.env.get_base_pos = lambda: np.zeros((1, 3))
+    session.env.get_base_quat = lambda: np.array([[1., 0., 0., 0.]])
+    session.env.get_foot_pos = lambda: np.zeros((1, 2, 3))
+    config = TrajectoryConfig(length_m=2., samples=8)
+    geometry = ReferenceTrajectory.generate(config, device="cpu", dtype=torch.float64)
+    start = TimedPelvisPose(0, 0, 0, np.eye(4), True, (0, 0))
+    end_matrix = np.eye(4)
+    end_matrix[:2, 3] = [.5, .1]
+    end = TimedPelvisPose(0, 0, 40_000_000, end_matrix, True, (40_000_000, 40_000_000))
+    reference = MeasuredTrajectory(start, config, reference=geometry, dtype=torch.float64)
+    reference.state_at(end)
+    session.controller = SimpleNamespace(
+        config=SimpleNamespace(pose=PoseRuntimeConfig(odometry_source="cuvslam", slam_enabled=True)),
+        reference_geometry=geometry, collector=SimpleNamespace(reference=reference),
+        last_pose_update=PoseRuntimeUpdate(
+            (), "tracking", 0, 0, 0, False,
+            (ReceivedPose(start, 40_000_000), ReceivedPose(end, 40_000_000)),
+        ),
+    )
+    view = FADAPlaybackRendering(
+        session, previous.model, previous.args, FADADemoRenderConfig(enabled=True),
+    )
+    view.observe_step()
+    view.observe_step()  # Repeated display reads cannot manufacture new measurements.
+    np.testing.assert_allclose(view.measured_path[-1], [.5, .1, .03], atol=1e-12)
+    np.testing.assert_allclose(view.reference_route[:, :2], geometry.xy[0].numpy(), atol=1e-12)
+    data.xpos[view.focus_body_id] = [100., 200., 300.]
+    assert view.status(data).details[0] == "Pose: cuVSLAM SLAM | tracking | measurements=2"
+    assert view.status(data).details[1] == "Measured lateral=+0.100m yaw=+0.00deg"
+    scene = mujoco.MjvScene(previous.model, maxgeom=100)
+    view.append_scene(scene, data)
+    measured = [geom for geom in scene.geoms[:scene.ngeom] if geom.rgba[1] > .8]
+    assert len(measured) == 1
+    np.testing.assert_allclose(measured[0].pos, [.25, .05, .03], atol=1e-7)
