@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -166,6 +167,7 @@ def _validate(model: LatentWorldModel, sampler, indices: list[int], *,
 
 def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Path | None = None) -> dict[str, Any]:
     """Fit logged actions to their physical outcomes; resume exact update state."""
+    started_at = perf_counter()
     raw = OmegaConf.to_container(cfg, resolve=True, enum_to_str=True) if isinstance(cfg, DictConfig) else dict(cfg)
     if not isinstance(raw, dict) or set(raw) - {"data", "model", "training", "device", "seed", "output_dir"}:
         raise ValueError("unknown world-model training config fields")
@@ -201,6 +203,10 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     train_dirs, validation_dirs = _directories(data["train_dirs"], root), _directories(data["validation_dirs"], root)
     if set(train_dirs) & set(validation_dirs) or any(a in b.parents or b in a.parents for a in train_dirs for b in validation_dirs):
         raise ValueError("training and validation must be disjoint whole-capture directories")
+    print(json.dumps({"phase": "wm_index_start", "train_captures": len(train_dirs),
+                      "validation_captures": len(validation_dirs), "batch_size": batch_size,
+                      "max_updates": max_updates, "device": raw.get("device", "cpu")}), flush=True)
+    index_started_at = perf_counter()
     contracts = [canonical_contract(read_sequence_metadata(path)) for path in (*train_dirs, *validation_dirs)]
     contract = contracts[0]
     if any(candidate != contract for candidate in contracts[1:]):
@@ -213,6 +219,9 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
     if train_hashes & validation_hashes:
         raise ValueError("training/validation contain copied sequence shards from the same capture")
     sources = train_sources + validation_sources
+    print(json.dumps({"phase": "wm_index_ready", "seconds": perf_counter() - index_started_at,
+                      "train_starts": sampler.num_starts,
+                      "validation_starts": validation_sampler.num_starts}), flush=True)
     validation_seed = seed ^ 0x5DEECE66D
     validation_indices = torch.randint(
         validation_sampler.num_starts, (batch_size * integers["validation_batches"],),
@@ -313,13 +322,33 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
             _restore_rng(random_state, device)
         del saved_best
 
+    first_update = optimizer_steps + 1
+    print(json.dumps({"phase": "wm_train_start", "optimizer_steps": optimizer_steps,
+                      "max_updates": max_updates, "microbatch_size": learner.microbatch_size,
+                      "startup_seconds": perf_counter() - started_at}), flush=True)
     while optimizer_steps < max_updates:
+        step_started_at = perf_counter()
+        if optimizer_steps + 1 == first_update:
+            print(json.dumps({"phase": "wm_sample_start", "optimizer_steps": optimizer_steps}), flush=True)
         batch = sampler.sample(batch_size, device=device)
+        sampled_at = perf_counter()
+        if optimizer_steps + 1 == first_update:
+            print(json.dumps({"phase": "wm_batch_ready", "sample_seconds": sampled_at - step_started_at}), flush=True)
         losses = learner.update(batch)
+        updated_at = perf_counter()
         optimizer_steps = learner.updates
         final = optimizer_steps == max_updates
         improved = False
+        if optimizer_steps == first_update or optimizer_steps % 100 == 0 or final:
+            print(json.dumps({"phase": "wm_train", "optimizer_steps": optimizer_steps,
+                              "max_updates": max_updates, "train": losses,
+                              "sample_seconds": sampled_at - step_started_at,
+                              "update_seconds": updated_at - sampled_at,
+                              "elapsed_seconds": updated_at - started_at}), flush=True)
         if optimizer_steps % integers["validation_every"] == 0 or final:
+            print(json.dumps({"phase": "wm_validation_start", "optimizer_steps": optimizer_steps,
+                              "samples": len(validation_indices)}), flush=True)
+            validation_started_at = perf_counter()
             validation = _validate(model, validation_sampler, validation_indices, batch_size=batch_size,
                                    device=device, seed=validation_seed, loss_config=loss_config)
             train_metrics = {key: value for key, value in losses.items()
@@ -330,8 +359,12 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
                 best_metric, best_step = metric, optimizer_steps
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 improved = True
-            print(json.dumps({"optimizer_steps": optimizer_steps, "validation": validation, "best_prediction_score": best_metric}), flush=True)
+            print(json.dumps({"phase": "wm_validation", "optimizer_steps": optimizer_steps,
+                              "validation": validation, "best_prediction_score": best_metric,
+                              "seconds": perf_counter() - validation_started_at}), flush=True)
         if optimizer_steps % integers["checkpoint_every"] == 0 or final:
+            print(json.dumps({"phase": "wm_checkpoint_start", "optimizer_steps": optimizer_steps}), flush=True)
+            checkpoint_started_at = perf_counter()
             optimizer.zero_grad(set_to_none=True)
             state = {
                 "trainer_version": 4, "run_id": run_id, "optimizer_steps": optimizer_steps, "loss_config": loss_config,
@@ -343,6 +376,8 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
                 "best_state_dict": best_state, **_rng_state(device),
             }
             save_training_checkpoint(last_path, model, contract, run_id=run_id, training_state=state)
+            print(json.dumps({"phase": "wm_checkpoint", "optimizer_steps": optimizer_steps,
+                              "path": str(last_path), "seconds": perf_counter() - checkpoint_started_at}), flush=True)
         if improved:
             export_best(model)
     model.eval()

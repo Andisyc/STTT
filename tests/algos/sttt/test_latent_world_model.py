@@ -329,7 +329,7 @@ def test_online_lora_and_context_ownership_and_resume(tmp_path):
         LatentPathFollowingUpdater.restore(tmp_path / "old-online.pt", factory, expected_contract=contract)
 
 
-def test_public_training_resume_and_whole_capture_split(tmp_path):
+def test_public_training_resume_and_whole_capture_split(tmp_path, capsys):
     _, _, contract, _, _ = parts(tmp_path / "case")
     for name, seed in (("train", 1), ("validation", 2), ("copied", 1)):
         with SequenceDatasetWriter(tmp_path / name, contract) as writer:
@@ -340,6 +340,15 @@ def test_public_training_resume_and_whole_capture_split(tmp_path):
                         "validation_every": 1, "validation_batches": 1, "checkpoint_every": 2},
            "seed": 1, "device": "cpu", "output_dir": str(tmp_path / "continuous")}
     full = train_world_model(cfg)
+    progress = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    phases = [row["phase"] for row in progress]
+    first_update = next(row for row in progress if row["phase"] == "wm_train")
+    assert first_update["optimizer_steps"] == 1
+    assert first_update["sample_seconds"] >= 0 and first_update["update_seconds"] >= 0
+    assert phases.index("wm_index_start") < phases.index("wm_index_ready") < phases.index("wm_train_start")
+    assert phases.index("wm_sample_start") < phases.index("wm_batch_ready") < phases.index("wm_train")
+    assert phases.index("wm_train") < phases.index("wm_validation_start") < phases.index("wm_validation")
+    assert phases.index("wm_checkpoint_start") < phases.index("wm_checkpoint")
     split = deepcopy(cfg)
     split["training"]["max_updates"] = 1
     split["output_dir"] = str(tmp_path / "split")
@@ -487,6 +496,69 @@ def test_sequence_collector_keeps_terminal_risk_and_actual_action(tmp_path):
     assert augmented["transitions"] == 4 and provenance["applied"]
     assert provenance["recipe"]["delay_s"] == .04
     assert any(record["status"] in {"queued", "released", "dropped"} for record in provenance["receipts"])
+
+
+def test_archive_batches_reuse_shards_without_retaining_episodes_or_reordering_rows(tmp_path, monkeypatch):
+    import weakref
+    from time import perf_counter
+
+    from unilab.algos.torch.sttt.world_model.pretraining_data import collate_pretraining_sequences
+
+    _, _, contract, _, _ = parts(tmp_path / "inputs")
+    with SequenceDatasetWriter(tmp_path / "data", contract) as writer:
+        for seed in range(4):
+            raw = windowed_sequence(seed)
+            raw["terminal"][-1], raw["risk"][-1, 0], raw["motion_valid"][-1] = True, 1., False
+            writer.append(raw)
+    sampler = PretrainingSequenceSampler(tmp_path / "data", rollout_windows=2, seed=4, cache_size=1)
+    initial = sampler.state_dict()
+    indices = [1, 5, 9, 13, 3, 7, 11, 15, 1, 5]
+    loaded_indices, references = [], []
+    peak_live = 0
+    load = sampler._load_shard
+
+    def measured_load(index):
+        nonlocal peak_live
+        arrays = load(index)
+        loaded_indices.append(index)
+        references.append(weakref.ref(arrays["actions"]))
+        peak_live = max(peak_live, sum(reference() is not None for reference in references))
+        return arrays
+
+    monkeypatch.setattr(sampler, "_load_shard", measured_load)
+
+    def per_sample_reference():
+        samples = []
+        for index in indices:
+            shard, origin = divmod(index, 4)
+            samples.append((initial["index"][shard]["path"], sampler._load_shard(shard), origin * 2))
+        return collate_pretraining_sequences(samples, contract, rollout_windows=2)
+
+    started = perf_counter()
+    expected = per_sample_reference()
+    reference_seconds, reference_loads, reference_peak = perf_counter() - started, len(loaded_indices), peak_live
+    sampler._cache.clear()
+    loaded_indices.clear()
+    references.clear()
+    peak_live = 0
+    started = perf_counter()
+    actual = sampler.sample_indices(indices)
+    sample_seconds = perf_counter() - started
+    assert sampler.state_dict() == initial
+    assert loaded_indices == [0, 1, 2, 3]
+    assert peak_live <= sampler.cache_size + 1
+    for name, value in vars(expected).items():
+        if isinstance(value, dict):
+            for key, tensor in value.items():
+                torch.testing.assert_close(getattr(actual, name)[key], tensor, rtol=0, atol=0)
+        elif isinstance(value, torch.Tensor):
+            torch.testing.assert_close(getattr(actual, name), value, rtol=0, atol=0)
+        else:
+            assert getattr(actual, name) == value
+    print(json.dumps({"sampler_probe": {"samples": len(indices), "reference_loads": reference_loads,
+                      "grouped_loads": len(loaded_indices), "reference_peak_episodes": reference_peak,
+                      "grouped_peak_episodes": peak_live, "reference_seconds": reference_seconds,
+                      "grouped_seconds": sample_seconds}}))
 
 
 def test_pretraining_crops_warm_history_and_mask_terminal_padding(tmp_path):

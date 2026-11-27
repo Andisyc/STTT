@@ -187,13 +187,22 @@ class PretrainingSequenceSampler:
         if any(isinstance(i, bool) or not isinstance(i, Integral) or not 0 <= i < self.num_starts
                for i in selected):
             raise ValueError("pretraining start indices must be integers in [0, num_starts)")
-        samples = []
-        for selected_index in selected:
+        grouped: dict[int, list[tuple[int, int]]] = {}
+        for row, selected_index in enumerate(selected):
             shard_index = bisect_right(self._ends, int(selected_index))
             first_index = self._ends[shard_index - 1] if shard_index else 0
             origin = (int(selected_index) - first_index) * self.window_steps
-            samples.append((str(self._shards[shard_index].path), self._load_shard(shard_index), origin))
-        return collate_pretraining_sequences(samples, self.contract, rollout_windows=self.rollout_windows, device=device)
+            grouped.setdefault(shard_index, []).append((row, origin))
+
+        def samples():
+            for shard_index, rows in grouped.items():
+                raw = self._load_shard(shard_index)
+                identity = str(self._shards[shard_index].path)
+                for row, origin in rows:
+                    yield row, (identity, raw, origin)
+
+        return _collate_pretraining_sequences(samples(), len(selected), self.contract,
+                                             rollout_windows=self.rollout_windows, device=device)
 
     def _sampling_identity(self) -> dict[str, Any]:
         return {"contract": self.contract, "rollout_windows": self.rollout_windows,
@@ -227,12 +236,19 @@ class PretrainingSequenceSampler:
 def collate_pretraining_sequences(samples, contract: Mapping[str, Any], *, rollout_windows: int,
                                   device: str | torch.device = "cpu") -> PretrainingBatch:
     """Crop real episode prefixes identically for immutable archives and live replay."""
-    if not samples:
+    return _collate_pretraining_sequences(enumerate(samples), len(samples), contract,
+                                         rollout_windows=rollout_windows, device=device)
+
+
+def _collate_pretraining_sequences(samples, batch_size: int, contract: Mapping[str, Any], *,
+                                   rollout_windows: int, device: str | torch.device) -> PretrainingBatch:
+    """Fill final batch rows directly; never retain uncropped episode samples."""
+    if not batch_size:
         raise ValueError("cannot sample an empty pretraining batch")
     windows = _positive_integer(rollout_windows, "rollout_windows")
     window_steps = _positive_integer(contract["data"]["window_steps"], "window_steps")
     history = _positive_integer(contract["data"]["history_length"], "history_length") - 1
-    horizon, batch_size = windows * window_steps, len(samples)
+    horizon = windows * window_steps
     sequence: dict[str, np.ndarray] = {}
     state_spec, transition_spec = _sequence_specs(contract)
     for spec, length in ((state_spec, horizon + 1), (transition_spec, horizon), (_WINDOW, windows)):
@@ -249,8 +265,8 @@ def collate_pretraining_sequences(samples, contract: Mapping[str, Any], *, rollo
     previous_residual = np.zeros((batch_size, 29), dtype=np.float32)
     observation_mask = np.zeros((batch_size, horizon + 1), dtype=np.bool_)
     transition_mask = np.zeros((batch_size, horizon), dtype=np.bool_)
-    origins: list[tuple[str, int]] = []
-    for row, (identity, raw, origin) in enumerate(samples):
+    origins: list[tuple[str, int]] = [("", 0)] * batch_size
+    for row, (identity, raw, origin) in samples:
         steps = len(raw["actions"])
         if type(origin) is not int or not 0 <= origin < steps or origin % window_steps:
             raise ValueError("forecast origin must be an existing episode-local window-grid start")
@@ -291,7 +307,7 @@ def collate_pretraining_sequences(samples, contract: Mapping[str, Any], *, rollo
             sequence["window_end"][row, slot] = int(raw["window_end"][window]) - origin
             sequence["window_delta"][row, slot] = raw["window_delta"][window]
             sequence["window_valid"][row, slot] = raw["window_valid"][window]
-        origins.append((str(identity), origin))
+        origins[row] = (str(identity), origin)
     as_tensor = lambda array: torch.as_tensor(array, device=device)
     return PretrainingBatch(
         history_observations=as_tensor(history_observations),
