@@ -329,17 +329,30 @@ def test_online_lora_and_context_ownership_and_resume(tmp_path):
         LatentPathFollowingUpdater.restore(tmp_path / "old-online.pt", factory, expected_contract=contract)
 
 
-def test_public_training_resume_and_whole_capture_split(tmp_path, capsys):
+def test_public_training_resume_and_whole_capture_split(tmp_path, capsys, monkeypatch):
     _, _, contract, _, _ = parts(tmp_path / "case")
     for name, seed in (("train", 1), ("validation", 2), ("copied", 1)):
         with SequenceDatasetWriter(tmp_path / name, contract) as writer:
-            writer.append(windowed_sequence(seed, steps=6))
+            for offset in (0, 10, 20):
+                writer.append(windowed_sequence(seed + offset, steps=6))
     cfg = {"data": {"train_dirs": [str(tmp_path / "train")], "validation_dirs": [str(tmp_path / "validation")]},
            "model": asdict(model_config()),
-           "training": {"max_updates": 3, "batch_size": 2, "rollout_windows": 2,
+           "training": {"max_updates": 3, "batch_size": 2, "rollout_windows": 2, "cache_size": 1,
                         "validation_every": 1, "validation_batches": 1, "checkpoint_every": 2},
            "seed": 1, "device": "cpu", "output_dir": str(tmp_path / "continuous")}
+    train_paths = {path.resolve() for path in (tmp_path / "train").glob("*.npz")}
+    train_reads = {}
+    original_load = np.load
+
+    def tracked_load(path, *args, **kwargs):
+        if isinstance(path, (str, Path)) and Path(path).resolve() in train_paths:
+            source = Path(path).resolve()
+            train_reads[source] = train_reads.get(source, 0) + 1
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(np, "load", tracked_load)
     full = train_world_model(cfg)
+    assert train_reads == dict.fromkeys(train_paths, 1)
     progress = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
     phases = [row["phase"] for row in progress]
     first_update = next(row for row in progress if row["phase"] == "wm_train")
@@ -352,10 +365,14 @@ def test_public_training_resume_and_whole_capture_split(tmp_path, capsys):
     split = deepcopy(cfg)
     split["training"]["max_updates"] = 1
     split["output_dir"] = str(tmp_path / "split")
+    train_reads.clear()
     first = train_world_model(split)
+    assert train_reads == dict.fromkeys(train_paths, 1)
     split["training"].update(max_updates=3, resume_checkpoint=first["checkpoint_path"])
     split["output_dir"] = str(tmp_path / "resumed")
+    train_reads.clear()
     second = train_world_model(split)
+    assert train_reads == dict.fromkeys(train_paths, 1)
     continuous, resumed = load_world_model(full["checkpoint_path"]), load_world_model(second["checkpoint_path"])
 
     def exact(actual, expected):
@@ -559,6 +576,39 @@ def test_archive_batches_reuse_shards_without_retaining_episodes_or_reordering_r
                       "grouped_loads": len(loaded_indices), "reference_peak_episodes": reference_peak,
                       "grouped_peak_episodes": peak_live, "reference_seconds": reference_seconds,
                       "grouped_seconds": sample_seconds}}))
+
+
+def test_preloaded_replay_keeps_archive_crops_rng_and_resume_without_hot_file_reads(tmp_path, monkeypatch):
+    _, _, contract, _, _ = parts(tmp_path / "inputs")
+    with SequenceDatasetWriter(tmp_path / "data", contract) as writer:
+        for seed in range(4):
+            raw = windowed_sequence(seed)
+            raw["terminal"][-1], raw["risk"][-1, 0], raw["motion_valid"][-1] = True, 1., False
+            writer.append(raw)
+    streamed = PretrainingSequenceSampler(tmp_path / "data", rollout_windows=2, seed=4, cache_size=1)
+    resident = PretrainingSequenceSampler(tmp_path / "data", rollout_windows=2, seed=4, cache_size=1)
+    initial = resident.state_dict()
+    expected = streamed.sample(16)
+    resident.preload()
+    assert resident.state_dict() == initial
+
+    def no_file_reads(*args, **kwargs):
+        raise AssertionError("resident training must not reopen compressed shards")
+
+    monkeypatch.setattr(np, "load", no_file_reads)
+    resident.preload()
+    for _ in range(2):
+        resident.load_state_dict(initial)
+        actual = resident.sample(16)
+        assert resident.state_dict() == streamed.state_dict()
+        for name, value in vars(expected).items():
+            if isinstance(value, dict):
+                for key, tensor in value.items():
+                    torch.testing.assert_close(getattr(actual, name)[key], tensor, rtol=0, atol=0)
+            elif isinstance(value, torch.Tensor):
+                torch.testing.assert_close(getattr(actual, name), value, rtol=0, atol=0)
+            else:
+                assert getattr(actual, name) == value
 
 
 def test_pretraining_crops_warm_history_and_mask_terminal_padding(tmp_path):

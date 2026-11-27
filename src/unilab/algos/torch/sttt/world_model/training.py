@@ -322,6 +322,11 @@ def train_world_model(cfg: DictConfig | Mapping[str, Any], *, root_dir: str | Pa
             _restore_rng(random_state, device)
         del saved_best
 
+    print(json.dumps({"phase": "wm_replay_load_start", "train_starts": sampler.num_starts}), flush=True)
+    replay_started_at = perf_counter()
+    sampler.preload()
+    print(json.dumps({"phase": "wm_replay_ready", "seconds": perf_counter() - replay_started_at}), flush=True)
+
     first_update = optimizer_steps + 1
     print(json.dumps({"phase": "wm_train_start", "optimizer_steps": optimizer_steps,
                       "max_updates": max_updates, "microbatch_size": learner.microbatch_size,

@@ -9,13 +9,16 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from numbers import Integral
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zipfile import ZipFile
 
 import numpy as np
 import torch
 
 from .sequence_data import _BOOL, _INT, _WINDOW, _arrays, _contract, _manifest, _sequence_specs
+
+if TYPE_CHECKING:
+    from .replay import EpisodeReplay
 
 
 @dataclass(frozen=True)
@@ -86,8 +89,9 @@ def _shard_index(path: Path, window_steps: int) -> _Shard:
 class PretrainingSequenceSampler:
     """Sample uniformly over window-grid starts, including padded final tails.
 
-    The index stores only shard metadata; decompressed shards live in a bounded
-    LRU. Validation crops never consume the training generator. Dataset identity
+    The index stores only shard metadata. Default access uses a bounded LRU;
+    explicit preload keeps the selected dataset in EpisodeReplay instead.
+    Validation crops never consume the training generator. Dataset identity
     includes the ordered absolute shard paths and their compressed-file hashes.
     """
 
@@ -109,6 +113,7 @@ class PretrainingSequenceSampler:
         self._shards: list[_Shard] = []
         self._ends: list[int] = []
         self._cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
+        self._replay: EpisodeReplay | None = None
         self._contract_json: str | None = None
         seen: set[Path] = set()
         total = 0
@@ -173,6 +178,19 @@ class PretrainingSequenceSampler:
         self._cache[index] = arrays
         return arrays
 
+    def preload(self) -> None:
+        """Load the indexed training data into the original in-memory replay."""
+        from .replay import EpisodeReplay
+
+        if self._replay is not None:
+            return
+        replay = EpisodeReplay(self.contract, capacity_transitions=sum(shard.steps for shard in self._shards),
+                               rollout_windows=self.rollout_windows)
+        for index, shard in enumerate(self._shards):
+            replay.update_episode(str(shard.path), self._load_shard(index))
+        self._cache.clear()
+        self._replay = replay
+
     def sample(self, batch_size: int, *, device: str | torch.device = "cpu") -> PretrainingBatch:
         batch_size = _positive_integer(batch_size, "batch_size")
         indices = self._rng.integers(self.num_starts, size=batch_size)
@@ -187,6 +205,8 @@ class PretrainingSequenceSampler:
         if any(isinstance(i, bool) or not isinstance(i, Integral) or not 0 <= i < self.num_starts
                for i in selected):
             raise ValueError("pretraining start indices must be integers in [0, num_starts)")
+        if self._replay is not None:
+            return self._replay.sample_indices([int(index) for index in selected], device=device)
         grouped: dict[int, list[tuple[int, int]]] = {}
         for row, selected_index in enumerate(selected):
             shard_index = bisect_right(self._ends, int(selected_index))
