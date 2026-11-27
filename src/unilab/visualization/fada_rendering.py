@@ -64,6 +64,8 @@ class FADAPlaybackRendering:
         self.ctrl_dt = float(session.env.cfg.ctrl_dt)
         self.reset_count = self.update_count = 0
         self.last_loss: float | None = None
+        self.wm_update_count: int | None = None
+        self.planner_update_count: int | None = None
         self.last_reset_time: float | None = None
         self.last_attach_time: float | None = None
         self._fixed_camera: tuple[np.ndarray, float, float, float] | None = None
@@ -143,8 +145,12 @@ class FADAPlaybackRendering:
         """Update display counters exactly once after a successful control step."""
         stats = self.session.last_update_stats
         if stats is not None:
-            self.update_count += 1
-            self.last_loss = float(stats["loss"])
+            if "path_wm_updates" in stats and "path_planner_updates" in stats:
+                self.wm_update_count = int(stats["path_wm_updates"])
+                self.planner_update_count = int(stats["path_planner_updates"])
+            elif "loss" in stats:
+                self.update_count += 1
+                self.last_loss = float(stats["loss"])
         state = self.session.env.state
         if bool(state.terminated[0] or state.truncated[0]):
             self.reset_count += 1
@@ -214,11 +220,18 @@ class FADAPlaybackRendering:
         c, s = math.cos(self.origin_yaw), math.sin(self.origin_yaw)
         yaw = float(np_yaw_from_quat(data.xquat[self.focus_body_id:self.focus_body_id + 1])[0])
         yaw_error = math.degrees(float(np_wrap_to_pi(yaw - self.origin_yaw)))
-        loss = f" loss={self.last_loss:.4g}" if self.last_loss is not None else ""
+        if self.planner_update_count is not None:
+            updates = (
+                f"WM LoRA updates={self.wm_update_count} | "
+                f"Planner LoRA updates={self.planner_update_count}"
+            )
+        else:
+            loss = f" loss={self.last_loss:.4g}" if self.last_loss is not None else ""
+            updates = f"LoRA updates={self.update_count}{loss}"
         details = [
             f"forward={c * delta[0] + s * delta[1]:+.2f}m lateral={-s * delta[0] + c * delta[1]:+.2f}m",
             f"yaw error={yaw_error:+.1f}deg resets={self.reset_count}",
-            f"LoRA updates={self.update_count}{loss}",
+            updates,
         ]
         if self.config.enabled:
             program = getattr(self.session, "command_program", None)
